@@ -1,4 +1,4 @@
-// PART 1 – Imports and basic setup
+// server.js
 import express from "express";
 import cors from "cors";
 import Replicate from "replicate";
@@ -6,79 +6,52 @@ import Replicate from "replicate";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Replicate client (auth comes from Render env var)
+// Replicate client using your token from Render env vars
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 });
 
-// Basic middleware
 app.use(cors());
 app.use(express.json());
 
-// Health check – used by Render + for quick tests
+// Simple health check
 app.get("/health", (req, res) => {
   res.json({ ok: true, service: "Mina Editorial AI" });
 });
 
-// PART 2 – Helper: map platform to aspect ratio for SeaDream
-function pickAspectRatio(platform = "") {
-  const p = String(platform).toLowerCase();
-
-  if (p.includes("tiktok") || p.includes("reel") || p.includes("short")) {
-    return "9:16"; // vertical
-  }
-
-  if (p.includes("youtube")) {
-    return "16:9"; // landscape
-  }
-
-  if (p.includes("square") || p.includes("instagram")) {
-    return "1:1"; // square
-  }
-
-  // default editorial-ish
-  return "4:5";
-}
-
-// PART 3 – Main endpoint: /editorial/generate
+// Main endpoint: generate editorial still-life images
 app.post("/editorial/generate", async (req, res) => {
-  const payload = req.body || {};
-
   const {
     productImageUrl,
     styleImageUrls = [],
     brief,
     tone,
     platform,
-    mode = "image",
+    mode,
     creditsToSpend,
-    customerId
-  } = payload;
+    customerId,
+  } = req.body || {};
 
-  // Minimal validation
-  if (!brief) {
+  if (!brief || !brief.trim()) {
     return res.status(400).json({
       ok: false,
-      error: "Missing 'brief' in request body."
+      error: "BRIEF_REQUIRED",
+      message:
+        "Please provide a brand / project context + what you want Mina to create.",
     });
   }
 
-  const requestId = `req_${Date.now()}`;
-
-  // Build the prompt that we send to SeaDream
+  // Build the prompt we send to SeaDream
   const promptParts = [];
+  promptParts.push(brief.trim());
 
-  if (brief) {
-    promptParts.push(brief);
+  if (tone && tone.trim()) {
+    promptParts.push(`Tone: ${tone.trim()}.`);
   }
 
-  if (tone) {
-    promptParts.push(`Tone: ${tone}.`);
-  }
-
-  if (productImageUrl) {
+  if (productImageUrl && productImageUrl.trim()) {
     promptParts.push(
-      `Use this product image as the main subject reference: ${productImageUrl}.`
+      `Use this product image as the main subject reference: ${productImageUrl.trim()}.`
     );
   }
 
@@ -90,78 +63,79 @@ app.post("/editorial/generate", async (req, res) => {
     );
   }
 
-  const finalPrompt = promptParts.join(" ");
-
-  // For now we only support image mode; later we'll branch for video/Kling
-  if (mode !== "image") {
-    return res.status(400).json({
-      ok: false,
-      error: "Only 'image' mode is supported for now.",
-      requestId
-    });
+  if (platform && platform.trim()) {
+    promptParts.push(
+      `Frame and composition should be optimised for ${platform.trim()} content.`
+    );
   }
 
-  const aspect_ratio = pickAspectRatio(platform);
-  const size = "1K"; // cheaper than 2K while prototyping
+  const finalPrompt = promptParts.join(" ").trim();
 
   try {
-    // PART 4 – Call SeaDream on Replicate
-    const output = await replicate.run(
-      process.env.SEADREAM_MODEL_VERSION || "bytedance/seedream-4",
-      {
-        input: {
-          size,
-          aspect_ratio,
-          prompt: finalPrompt,
-          max_images: 1,
-          enhance_prompt: true
-          // We can wire image_input later when we want hard reference control
+    // Ask SeaDream for up to 3 images
+    const input = {
+      size: "2K",
+      width: 2048,
+      height: 2048,
+      prompt: finalPrompt,
+      max_images: 3,
+      image_input: productImageUrl ? [productImageUrl] : [],
+      aspect_ratio: "4:3",
+      enhance_prompt: true,
+      sequential_image_generation: "disabled",
+    };
+
+    const output = await replicate.run("bytedance/seedream-4", { input });
+
+    // Normalise output into an array of URLs (strings)
+    const rawOutput = Array.isArray(output) ? output : [output];
+
+    const imageUrls = rawOutput
+      .map((item) => {
+        if (typeof item === "string") return item;
+
+        // Some Replicate outputs expose a .url() method
+        if (item && typeof item === "object" && typeof item.url === "function") {
+          try {
+            return item.url();
+          } catch (e) {
+            return String(item);
+          }
         }
-      }
-    );
 
-    // Try to extract an image URL from the output
-    let imageUrl = null;
+        return String(item);
+      })
+      .filter(Boolean);
 
-    if (Array.isArray(output) && output.length > 0) {
-      const first = output[0];
+    const primaryImageUrl = imageUrls[0] || null;
+    const requestId = `req_${Date.now()}`;
 
-      if (typeof first === "string") {
-        // Some models return direct URL strings
-        imageUrl = first;
-      } else if (first && typeof first === "object") {
-        // New Replicate client often returns file-like objects
-        if (typeof first.url === "function") {
-          imageUrl = first.url();
-        } else if (typeof first.url === "string") {
-          imageUrl = first.url;
-        }
-      }
-    }
-
-    // Response back to your Shopify page
     res.json({
       ok: true,
       message: "Mina Editorial image generated via SeaDream.",
       requestId,
       prompt: finalPrompt,
-      imageUrl,
-      rawOutput: output,
-      payload
+      imageUrl: primaryImageUrl,
+      imageUrls,
+      rawOutput,
+      payload: req.body || null,
     });
-  } catch (error) {
-    console.error("Error calling SeaDream / Replicate:", error);
-
+  } catch (err) {
+    console.error("Error calling SeaDream on Replicate", err);
     res.status(500).json({
       ok: false,
-      error: "Failed to generate image with SeaDream",
-      details: error?.message ?? String(error),
-      requestId
+      error: "SEADREAM_ERROR",
+      message: "SeaDream generation failed.",
+      details: err?.message || String(err),
     });
   }
 });
 
-// PART 5 – Start the server
+// Fallback 404
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "NOT_FOUND" });
+});
+
 app.listen(PORT, () => {
   console.log(`Mina Editorial API listening on port ${PORT}`);
 });

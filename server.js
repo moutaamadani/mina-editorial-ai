@@ -1,245 +1,327 @@
-// ===============================
-// PART 1 — Imports & basic setup
-// ===============================
+// =======================
+// PART 1 – Imports & config
+// =======================
 import express from "express";
 import cors from "cors";
 import Replicate from "replicate";
-
-const PORT = process.env.PORT || 3000;
+import OpenAI from "openai";
+import { v4 as uuidv4 } from "uuid";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Allow requests from your Shopify storefront
-app.use(
-  cors({
-    origin: "*", // you can restrict later to your domain
-  })
-);
-
-// Parse JSON bodies (up to 10 MB)
+// Middlewares
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-// Replicate client (SeaDream + Kling use the same token)
+// Replicate client
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 });
 
-// SeaDream (image) + Kling (motion) model slugs
-const SEADREAM_MODEL = "bytedance/seedream-4";
-const KLING_MODEL = "kwaivgi/kling-v2.1";
-
-// ===============================
-// PART 2 — Health check endpoint
-// ===============================
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "Mina Editorial AI" });
+// OpenAI client (ChatGPT)
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-// =====================================================
-// PART 3 — Editorial image endpoint (/editorial/generate)
-//          Uses SeaDream 4 on Replicate
-// =====================================================
+// Model names (can be overridden by env vars)
+const SEADREAM_MODEL =
+  process.env.SEADREAM_MODEL_VERSION || "bytedance/seedream-4";
+const KLING_MODEL =
+  process.env.KLING_MODEL_VERSION || "kwaivgi/kling-v2.1";
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "Mina Editorial AI API",
+    time: new Date().toISOString(),
+  });
+});
+
+// Small helper to safely read strings
+function safeString(value, fallback = "") {
+  if (typeof value !== "string") return fallback;
+  return value.trim();
+}
+
+// =======================
+// PART 2 – GPT helpers
+// =======================
+
+// Build the prompt for SeaDream (image) using GPT
+async function buildEditorialPrompt(payload) {
+  const {
+    productImageUrl,
+    styleImageUrls = [],
+    brief,
+    tone,
+    platform = "tiktok",
+    mode = "image",
+  } = payload;
+
+  const systemMessage = {
+    role: "system",
+    content:
+      "You are Mina, an editorial art director for fashion & beauty. " +
+      "You write ONE clear prompt for a generative image or video model. " +
+      "The model only understands English descriptions, not URLs. " +
+      "Describe subject, environment, lighting, camera, mood, and style. " +
+      "Do NOT include line breaks, lists, or bullet points. One paragraph max.",
+  };
+
+  const userMessage = {
+    role: "user",
+    content: `
+Brand / project context and brief:
+${safeString(brief, "No extra brand context provided.")}
+
+Tone / mood: ${safeString(tone, "not specified")}
+Target platform: ${platform}
+Mode: ${mode}
+
+Main product image (reference only, don't literally write the URL):
+${safeString(productImageUrl, "none")}
+
+Style / mood reference image URLs (reference only):
+${(styleImageUrls || []).join(", ") || "none"}
+
+Write the final prompt I should send to the image model.
+`.trim(),
+  };
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [systemMessage, userMessage],
+    temperature: 0.8,
+    max_tokens: 280,
+  });
+
+  const prompt =
+    completion.choices?.[0]?.message?.content?.trim() ||
+    "Editorial still-life product photo, studio lighting.";
+
+  return prompt;
+}
+
+// Build the prompt for Kling (video) using GPT
+async function buildMotionPrompt(options) {
+  const {
+    motionBrief,
+    tone,
+    platform = "tiktok",
+    lastImageUrl,
+  } = options;
+
+  const systemMessage = {
+    role: "system",
+    content:
+      "You are Mina, an editorial motion director for fashion & beauty. " +
+      "You describe a SHORT looping product motion for a generative video model like Kling. " +
+      "Keep it 1–2 sentences, no line breaks.",
+  };
+
+  const userMessage = {
+    role: "user",
+    content: `
+Static reference frame URL (for you only, don't spell it out in the prompt):
+${safeString(lastImageUrl, "none")}
+
+Desired motion description from the user:
+${safeString(
+  motionBrief,
+  "subtle elegant camera move with a small motion in the scene."
+)}
+
+Tone / feeling: ${safeString(tone, "not specified")}
+Target platform: ${platform}
+
+Write the final video generation prompt.
+`.trim(),
+  };
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [systemMessage, userMessage],
+    temperature: 0.9,
+    max_tokens: 220,
+  });
+
+  const prompt =
+    completion.choices?.[0]?.message?.content?.trim() ||
+    "Short looping editorial product motion with soft camera move.";
+
+  return prompt;
+}
+
+// =======================
+// PART 3 – API routes
+// =======================
+
+// --- Image generation with SeaDream (Mina Editorial) ---
 app.post("/editorial/generate", async (req, res) => {
-  const requestId = `req_${Date.now()}`;
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
 
   try {
-    const {
-      productImageUrl,
-      styleImageUrls = [],
-      brief,
-      tone,
-      platform = "tiktok", // "tiktok", "instagram", "youtube", etc.
-      mode = "image", // later we might support "video"
-      creditsToSpend = 1,
-      customerId,
-    } = req.body || {};
+    const payload = req.body || {};
 
-    // Minimal validation
-    if (!productImageUrl || !brief) {
+    const productImageUrl = safeString(payload.productImageUrl);
+    const styleImageUrls = Array.isArray(payload.styleImageUrls)
+      ? payload.styleImageUrls
+      : [];
+
+    if (!productImageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "MISSING_FIELDS",
-        message: "productImageUrl and brief are required.",
+        error: "MISSING_PRODUCT_IMAGE",
+        message: "productImageUrl is required.",
         requestId,
       });
     }
 
-    // Build the prompt we send to SeaDream
-    const stylePart =
-      styleImageUrls && styleImageUrls.length
-        ? ` Match the mood / lighting / style of these reference images: ${styleImageUrls.join(
-            ", "
-          )}.`
-        : "";
+    // Ask GPT to build the SeaDream prompt
+    const prompt = await buildEditorialPrompt({
+      ...payload,
+      productImageUrl,
+      styleImageUrls,
+      mode: "image",
+    });
 
-    const tonePart = tone
-      ? ` Tone: ${tone}.`
-      : " Tone: bold, poetic, editorial.";
+    // Map platform to aspect ratio
+    const platform = safeString(payload.platform || "tiktok").toLowerCase();
+    const aspectRatio = platform.includes("tiktok") || platform.includes("reel")
+      ? "9:16"
+      : "4:5";
 
-    const platformPart = platform
-      ? ` Frame and composition should be optimised for ${platform} content.`
-      : "";
-
-    const fullPrompt =
-      `${brief}\n\nBrand / project context:\nFalta Studio is a creative agency.` +
-      tonePart +
-      ` Use this product image as the main subject reference: ${productImageUrl}.` +
-      stylePart +
-      platformPart;
-
-    // SeaDream input (based on the official schema)
     const input = {
+      prompt,
+      // SeaDream uses image_input as an array – we pass product + style refs
+      image_input: [productImageUrl, ...styleImageUrls],
+      max_images: payload.maxImages || 1,
       size: "2K",
-      width: 2048,
-      height: 2048,
-      prompt: fullPrompt,
-      max_images: 1,
-      image_input: [], // we are using URL references in the prompt text
-      aspect_ratio: "4:3",
+      aspect_ratio: aspectRatio,
       enhance_prompt: true,
       sequential_image_generation: "disabled",
     };
 
-    const files = await replicate.run(SEADREAM_MODEL, { input });
+    const output = await replicate.run(SEADREAM_MODEL, { input });
 
-    // files is an array of file-like objects
-    const imageUrls = (files || [])
-      .map((file) => {
-        if (!file) return null;
-        if (typeof file === "string") return file;
-        if (typeof file.url === "function") return file.url();
-        if (typeof file.url === "string") return file.url;
-        return null;
-      })
-      .filter(Boolean);
-
-    const imageUrl = imageUrls[0] || null;
-
-    if (!imageUrl) {
-      throw new Error("No image URL returned from SeaDream.");
+    // Replicate usually returns an array of URLs for image models
+    let imageUrls = [];
+    if (Array.isArray(output)) {
+      imageUrls = output.map((item) =>
+        typeof item === "string" ? item : item?.url || item
+      );
+    } else if (typeof output === "string") {
+      imageUrls = [output];
     }
 
     res.json({
       ok: true,
       message: "Mina Editorial image generated via SeaDream.",
       requestId,
-      prompt: fullPrompt,
-      imageUrl,
+      prompt,
+      imageUrl: imageUrls[0] || null,
       imageUrls,
-      rawOutput: imageUrls, // keep it light
-      payload: {
-        productImageUrl,
-        styleImageUrls,
-        brief,
-        tone,
-        platform,
-        mode,
-        creditsToSpend,
-        customerId,
-      },
+      rawOutput: output,
+      payload,
     });
   } catch (err) {
-    console.error("[/editorial/generate] error", err);
+    console.error("Error in /editorial/generate:", err);
     res.status(500).json({
       ok: false,
-      error: "SEADREAM_ERROR",
-      message: "SeaDream generation failed.",
-      details: err?.message,
+      error: "EDITORIAL_GENERATION_ERROR",
+      message: err?.message || "Unexpected error during image generation.",
       requestId,
     });
   }
 });
 
-// =================================================
-// PART 4 — Motion endpoint (/motion/generate)
-//          Uses Kling v2.1 on Replicate
-// =================================================
+// --- Motion / video generation with Kling (Mina Motion) ---
 app.post("/motion/generate", async (req, res) => {
-  const requestId = `req_${Date.now()}`;
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
 
   try {
-    const {
-      imageUrl,          // still image from Mina (SeaDream)
-      motionPrompt,      // how you want it to move
-      platform = "tiktok",
-      durationSeconds = 5, // Kling expects seconds, default 5
-      customerId,
-      sourceRequestId,   // link back to editorial request if you want
-    } = req.body || {};
+    const body = req.body || {};
+    const lastImageUrl = safeString(body.lastImageUrl);
 
-    if (!imageUrl) {
+    // Support both motionPrompt and motionBrief from the front-end
+    const motionBrief =
+      safeString(body.motionBrief) || safeString(body.motionPrompt);
+
+    const tone = safeString(body.tone);
+    const platform = safeString(body.platform || "tiktok");
+    const durationSeconds = Number(body.durationSeconds || 5);
+
+    if (!lastImageUrl) {
       return res.status(400).json({
         ok: false,
-        error: "MISSING_FIELDS",
-        message: "imageUrl is required to generate motion.",
+        error: "MISSING_LAST_IMAGE",
+        message: "lastImageUrl is required to create motion.",
         requestId,
       });
     }
 
-    const basePrompt =
-      (motionPrompt ||
-        "Animate this product shot in a smooth, premium way for social media.") +
-      (platform ? ` The video should be ideal for ${platform} content.` : "");
+    // Ask GPT to build the Kling prompt
+    const prompt = await buildMotionPrompt({
+      motionBrief,
+      tone,
+      platform,
+      lastImageUrl,
+    });
 
-    // Kling v2.1 input shape
     const input = {
       mode: "standard",
-      prompt: basePrompt,
+      prompt,
       duration: durationSeconds,
-      start_image: imageUrl,
+      start_image: lastImageUrl,
       negative_prompt: "",
     };
 
-    const file = await replicate.run(KLING_MODEL, { input });
+    const output = await replicate.run(KLING_MODEL, { input });
 
+    // Normalise possible output shapes to one videoUrl
     let videoUrl = null;
 
-    if (typeof file === "string") {
-      videoUrl = file;
-    } else if (file && typeof file.url === "function") {
-      videoUrl = file.url();
-    } else if (file && typeof file.url === "string") {
-      videoUrl = file.url;
-    }
-
-    if (!videoUrl) {
-      throw new Error("No video URL returned from Kling v2.1");
+    if (typeof output === "string") {
+      videoUrl = output;
+    } else if (Array.isArray(output) && output.length > 0) {
+      const first = output[0];
+      if (typeof first === "string") videoUrl = first;
+      else if (first && typeof first === "object") {
+        videoUrl = first.video || first.url || null;
+      }
+    } else if (output && typeof output === "object") {
+      videoUrl = output.video || output.url || null;
     }
 
     res.json({
       ok: true,
-      message: "Mina Motion video generated via Kling v2.1.",
+      message: "Mina Motion video generated via Kling.",
       requestId,
-      prompt: basePrompt,
-      imageUrl,
+      prompt,
       videoUrl,
-      rawOutput: {
-        hasUrlMethod: typeof file?.url === "function",
-      },
+      rawOutput: output,
       payload: {
-        imageUrl,
-        motionPrompt,
+        lastImageUrl,
+        motionBrief,
+        tone,
         platform,
         durationSeconds,
-        customerId,
-        sourceRequestId,
       },
     });
   } catch (err) {
-    console.error("[/motion/generate] error", err);
+    console.error("Error in /motion/generate:", err);
     res.status(500).json({
       ok: false,
-      error: "KLING_ERROR",
-      message: "Kling motion generation failed.",
-      details: err?.message,
+      error: "MOTION_GENERATION_ERROR",
+      message: err?.message || "Unexpected error during motion generation.",
       requestId,
     });
   }
 });
 
-// ===============================
-// PART 5 — Start server
-// ===============================
+// Start server
 app.listen(PORT, () => {
-  console.log(`Mina Editorial API listening on port ${PORT}`);
+  console.log(`Mina Editorial AI API listening on port ${PORT}`);
 });

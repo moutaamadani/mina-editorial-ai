@@ -31,9 +31,18 @@ const KLING_MODEL =
 
 // In-memory "likes" per customer
 // key = customerId (string)
-// value = array of { resultType, platform, prompt, comment, createdAt }
+// value = array of { resultType, platform, prompt, comment, imageUrl?, videoUrl?, createdAt }
 const likeMemory = new Map();
 const MAX_LIKES_PER_CUSTOMER = 50;
+
+// Style profile cache & history per customer
+// We compute a style profile after MIN_LIKES_FOR_FIRST_PROFILE likes,
+// then refresh every LIKES_PER_PROFILE_REFRESH new likes.
+const styleProfileCache = new Map();   // key: customerId -> { profile, likesCountAtCompute, updatedAt }
+const styleProfileHistory = new Map(); // key: customerId -> [ { profile, likesCountAtCompute, createdAt } ]
+
+const MIN_LIKES_FOR_FIRST_PROFILE = 20;
+const LIKES_PER_PROFILE_REFRESH = 5;
 
 // ---------------- Helpers ----------------
 function safeString(value, fallback = "") {
@@ -52,6 +61,8 @@ function rememberLike(customerIdRaw, entry) {
     platform: entry.platform || "tiktok",
     prompt: entry.prompt || "",
     comment: entry.comment || "",
+    imageUrl: entry.imageUrl || null,
+    videoUrl: entry.videoUrl || null,
     createdAt: entry.createdAt || new Date().toISOString(),
   });
 
@@ -69,7 +80,7 @@ function getLikes(customerIdRaw) {
   return likeMemory.get(customerId) || [];
 }
 
-// Style "history" = liked prompts for this customer
+// Style history used for GPT context (list of liked prompts/comments)
 function getStyleHistory(customerIdRaw) {
   const likes = getLikes(customerIdRaw);
   return likes.map((like) => ({
@@ -79,9 +90,9 @@ function getStyleHistory(customerIdRaw) {
   }));
 }
 
-// Build style profile (keywords + description) from likes
+// Build style profile (keywords + description) from likes, with vision on images
 async function buildStyleProfileFromLikes(customerId, likes) {
-  const recentLikes = likes.slice(-10);
+  const recentLikes = likes.slice(-10); // only last 10 liked generations
   if (!recentLikes.length) {
     return {
       profile: { keywords: [], description: "" },
@@ -91,12 +102,13 @@ async function buildStyleProfileFromLikes(customerId, likes) {
   }
 
   const examplesText = recentLikes
-    .map(
-      (like, idx) =>
-        `#${idx + 1} [${like.resultType} / ${like.platform}]\nPrompt: ${
-          like.prompt || ""
-        }\nUserComment: ${like.comment || "none"}`
-    )
+    .map((like, idx) => {
+      return `#${idx + 1} [${like.resultType} / ${like.platform}]
+Prompt: ${like.prompt || ""}
+UserComment: ${like.comment || "none"}
+HasImage: ${like.imageUrl ? "yes" : "no"}
+HasVideo: ${like.videoUrl ? "yes" : "no"}`;
+    })
     .join("\n\n");
 
   const systemMessage = {
@@ -104,20 +116,26 @@ async function buildStyleProfileFromLikes(customerId, likes) {
     content:
       "You are an assistant that summarizes a user's aesthetic preferences " +
       "for AI-generated editorial product images and motion. " +
-      "You analyze prompts and optional comments and output JSON with short keywords and a style description.",
+      "You will see some liked generations. For each one you may see:\n" +
+      "- result type (image or motion)\n" +
+      "- platform\n" +
+      "- the generation prompt\n" +
+      "- an optional user comment describing what they liked or disliked\n" +
+      "- sometimes the final liked image itself\n\n" +
+      "IMPORTANT:\n" +
+      "- Treat comments as preference signals. If user says they DON'T like something (e.g. 'I like the image but I don't like the light'), do NOT treat that attribute as part of their style. Prefer avoiding repeatedly disliked attributes.\n" +
+      "- For images, use the actual image content (colors, lighting, composition, background complexity, mood) to infer style.\n" +
+      "- For motion entries, you will not see video, only prompts/comments. Use those.\n\n" +
+      "Your task is to infer the consistent positive style across these examples.\n" +
+      "Return strict JSON only with short keywords and a style description.",
   };
 
   const userText = `
 Customer id: ${customerId}
 Below are image/video generations this customer explicitly liked.
 
-For each one you see:
-- result type (image or motion)
-- platform
-- the generation prompt
-- optional user comment about what they liked
-
-Infer the consistent style across these examples (color palette, lighting, composition, motion feel, mood, etc).
+Infer what they CONSISTENTLY LIKE, not what they dislike.
+If comments mention dislikes, subtract those from your style interpretation.
 
 Return STRICT JSON only, no prose, with this shape:
 {
@@ -125,15 +143,37 @@ Return STRICT JSON only, no prose, with this shape:
   "description": "2-3 sentence natural-language description of their style"
 }
 
-Items:
+Text data for last liked generations:
 ${examplesText}
 `.trim();
+
+  // Build vision content from liked images (images only, not videos)
+  const imageParts = [];
+  recentLikes.forEach((like) => {
+    if (like.resultType === "image" && like.imageUrl) {
+      imageParts.push({
+        type: "image_url",
+        image_url: { url: like.imageUrl },
+      });
+    }
+  });
+
+  const userContent =
+    imageParts.length > 0
+      ? [
+          {
+            type: "text",
+            text: userText,
+          },
+          ...imageParts,
+        ]
+      : userText;
 
   const fallbackPrompt = '{"keywords":[],"description":""}';
 
   const result = await runChatWithFallback({
     systemMessage,
-    userContent: userText,
+    userContent,
     fallbackPrompt,
   });
 
@@ -153,6 +193,74 @@ ${examplesText}
     profile,
     usedFallback: result.usedFallback,
     gptError: result.gptError,
+  };
+}
+
+// Get or build cached style profile with thresholds & caching
+async function getOrBuildStyleProfile(customerIdRaw, likes) {
+  const customerId = String(customerIdRaw || "anonymous");
+  const likesCount = likes.length;
+
+  if (likesCount < MIN_LIKES_FOR_FIRST_PROFILE) {
+    return {
+      profile: null,
+      meta: {
+        source: "none",
+        reason: "not_enough_likes",
+        likesCount,
+        minLikesForFirstProfile: MIN_LIKES_FOR_FIRST_PROFILE,
+      },
+    };
+  }
+
+  const cached = styleProfileCache.get(customerId);
+  if (
+    cached &&
+    likesCount < cached.likesCountAtCompute + LIKES_PER_PROFILE_REFRESH
+  ) {
+    return {
+      profile: cached.profile,
+      meta: {
+        source: "cache",
+        likesCount,
+        likesCountAtProfile: cached.likesCountAtCompute,
+        updatedAt: cached.updatedAt,
+        refreshStep: LIKES_PER_PROFILE_REFRESH,
+      },
+    };
+  }
+
+  // Recompute profile from likes
+  const profileRes = await buildStyleProfileFromLikes(customerId, likes);
+  const profile = profileRes.profile;
+  const updatedAt = new Date().toISOString();
+
+  styleProfileCache.set(customerId, {
+    profile,
+    likesCountAtCompute: likesCount,
+    updatedAt,
+  });
+
+  // Append to styleProfileHistory log
+  const historyArr = styleProfileHistory.get(customerId) || [];
+  historyArr.push({
+    profile,
+    likesCountAtCompute: likesCount,
+    createdAt: updatedAt,
+  });
+  styleProfileHistory.set(customerId, historyArr);
+
+  return {
+    profile,
+    meta: {
+      source: "recomputed",
+      likesCount,
+      likesCountAtProfile: likesCount,
+      updatedAt,
+      refreshStep: LIKES_PER_PROFILE_REFRESH,
+      usedFallback: profileRes.usedFallback,
+      gptError: profileRes.gptError,
+    },
   };
 }
 
@@ -177,7 +285,7 @@ async function runChatWithFallback({ systemMessage, userContent, fallbackPrompt 
         systemMessage,
         {
           role: "user",
-          content: userContent, // can be string OR [{type:'text'},{type:'image_url'},...]
+          content: userContent, // string OR [{type:'text'},{type:'image_url'},...]
         },
       ],
       temperature: 0.8,
@@ -278,7 +386,7 @@ The attached images are:
 Write the final prompt I should send to the image model.
 `.trim();
 
-  // Vision content
+  // Vision content: product + style refs
   const imageParts = [];
   if (productImageUrl) {
     imageParts.push({
@@ -450,15 +558,9 @@ app.post("/editorial/generate", async (req, res) => {
     if (minaVisionEnabled && customerId) {
       const likes = getLikes(customerId);
       styleHistory = getStyleHistory(customerId);
-      if (likes.length >= 3) {
-        const profileRes = await buildStyleProfileFromLikes(customerId, likes);
-        styleProfile = profileRes.profile;
-        styleProfileMeta = {
-          usedFallback: profileRes.usedFallback,
-          error: profileRes.gptError,
-          likesCount: likes.length,
-        };
-      }
+      const profileRes = await getOrBuildStyleProfile(customerId, likes);
+      styleProfile = profileRes.profile;
+      styleProfileMeta = profileRes.meta;
     }
 
     const promptResult = await buildEditorialPrompt({
@@ -529,7 +631,7 @@ app.post("/editorial/generate", async (req, res) => {
       gpt: {
         usedFallback: promptResult.usedFallback,
         error: promptResult.gptError,
-        styleProfile: styleProfile,
+        styleProfile,
         styleProfileMeta,
       },
     });
@@ -585,15 +687,9 @@ app.post("/motion/generate", async (req, res) => {
     if (minaVisionEnabled && customerId) {
       const likes = getLikes(customerId);
       styleHistory = getStyleHistory(customerId);
-      if (likes.length >= 3) {
-        const profileRes = await buildStyleProfileFromLikes(customerId, likes);
-        styleProfile = profileRes.profile;
-        styleProfileMeta = {
-          usedFallback: profileRes.usedFallback,
-          error: profileRes.gptError,
-          likesCount: likes.length,
-        };
-      }
+      const profileRes = await getOrBuildStyleProfile(customerId, likes);
+      styleProfile = profileRes.profile;
+      styleProfileMeta = profileRes.meta;
     }
 
     const motionResult = await buildMotionPrompt({
@@ -687,6 +783,8 @@ app.post("/feedback/like", (req, res) => {
     const platform = safeString(body.platform || "tiktok").toLowerCase();
     const prompt = safeString(body.prompt);
     const comment = safeString(body.comment);
+    const imageUrl = safeString(body.imageUrl || "");
+    const videoUrl = safeString(body.videoUrl || "");
 
     if (!prompt) {
       return res.status(400).json({
@@ -702,6 +800,8 @@ app.post("/feedback/like", (req, res) => {
       platform,
       prompt,
       comment,
+      imageUrl: imageUrl || null,
+      videoUrl: videoUrl || null,
     });
 
     const totalLikes = getLikes(customerId).length;

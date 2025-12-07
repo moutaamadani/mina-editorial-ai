@@ -1633,6 +1633,34 @@ app.get("/api/credits/:customerId", (req, res) => {
   }
 });
 
+// =======================
+// Credits debug endpoint
+// =======================
+app.get("/api/credits/:customerId", (req, res) => {
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
+
+  try {
+    const customerId = req.params.customerId;
+    // This uses the main credits store we defined in PART 3b
+    const rec = getCreditsRecord(customerId);
+
+    return res.json({
+      ok: true,
+      requestId,
+      customerId,
+      balance: rec.balance,
+      history: rec.history,
+    });
+  } catch (err) {
+    console.error("Error in /api/credits/:customerId:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "CREDITS_ERROR",
+      message: err?.message || "Failed to load credits",
+      requestId,
+    });
+  }
+});
 
 // =======================
 // Start server

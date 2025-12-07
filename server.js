@@ -781,6 +781,13 @@ app.get("/health", (req, res) => {
     time: new Date().toISOString(),
   });
 });
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "Mina Editorial AI API",
+    hint: "Use /health, /editorial/generate, /motion/generate, or /api/credits/:customerId",
+  });
+});
 
 // ---- Credits: balance ----
 app.get("/credits/balance", (req, res) => {

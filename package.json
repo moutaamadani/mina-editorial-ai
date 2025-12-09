@@ -1,3 +1,4 @@
+// FILE: package.json
 {
   "name": "mina-editorial-ai",
   "version": "1.0.0",
@@ -11,6 +12,10 @@
     "express": "^4.21.1",
     "replicate": "^0.32.0",
     "openai": "^4.73.0",
-    "uuid": "^9.0.1"
+    "uuid": "^9.0.1",
+    "@prisma/client": "^6.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.0.0"
   }
 }

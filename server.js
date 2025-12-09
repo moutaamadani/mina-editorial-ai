@@ -10,18 +10,10 @@ import { v4 as uuidv4 } from "uuid";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-interface AdminSummary {
-  totalCustomers: number;
-  totalCredits: number;
-  autoTopupOn: number;
-}
+// NOTE: We removed TypeScript interfaces here to keep this file pure JS.
 
-interface AdminCustomer {
-  customerId: string;
-  balance: number;
-}
-
-const ADMIN_SECRET_STORAGE_KEY = "minaAdminSecretV1";
+// Admin auth helper
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 function ensureAdmin(req, res) {
   if (!ADMIN_SECRET) {
@@ -106,7 +98,9 @@ const STYLE_PRESETS = {
       description:
         "Clean marble surfaces, soft bathroom lighting, hints of steam and water. Intimate close-ups that feel like a self-care ritual moment.",
     },
-    heroImageUrls: ["https://cdn.example.com/mina/styles/bathroom-ritual-1.jpg"],
+    heroImageUrls: [
+      "https://cdn.example.com/mina/styles/bathroom-ritual-1.jpg",
+    ],
   },
   // Add more presets later.
 };
@@ -132,10 +126,11 @@ const generations = new Map(); // generationId -> { id, type, sessionId, custome
 const feedbacks = new Map(); // feedbackId -> { ... }
 
 // =======================
-// PART 3b – Credits / coupons (in-memory)
+// PART 3b – Credits / coupons (in-memory + Prisma)
 // =======================
 
 const credits = new Map(); // customerId -> { balance, history: [{ delta, reason, source, at }] }
+
 // Prisma / Postgres integration for credits persistence
 let prisma = null;
 
@@ -192,7 +187,6 @@ initDatabase();
 // How many credits each operation costs
 const IMAGE_CREDITS_COST = Number(process.env.IMAGE_CREDITS_COST || 1);
 const MOTION_CREDITS_COST = Number(process.env.MOTION_CREDITS_COST || 5);
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 // Free credits ON FIRST USE, for testing. Set to 0 in production.
 const DEFAULT_FREE_CREDITS = Number(process.env.DEFAULT_FREE_CREDITS || 50);
@@ -225,7 +219,6 @@ function getCreditsRecord(customerIdRaw) {
   return rec;
 }
 
-
 function addCreditsInternal(customerIdRaw, delta, reason, source) {
   const customerId = String(customerIdRaw || "anonymous");
   const rec = getCreditsRecord(customerId);
@@ -243,8 +236,12 @@ function addCreditsInternal(customerIdRaw, delta, reason, source) {
 
   return rec;
 }
-// --- Billing & auto top-up settings ---
 
+// =======================
+// PART 3c – Billing & auto top-up settings
+// =======================
+
+// GET billing settings
 app.get("/billing/settings", async (req, res) => {
   try {
     const customerIdRaw = req.query.customerId;
@@ -284,6 +281,8 @@ app.get("/billing/settings", async (req, res) => {
     res.status(500).json({ error: "Failed to load billing settings" });
   }
 });
+
+// POST billing settings
 app.post("/billing/settings", async (req, res) => {
   try {
     const { customerId, enabled, monthlyLimitPacks } = req.body || {};
@@ -325,7 +324,11 @@ app.post("/billing/settings", async (req, res) => {
     res.status(500).json({ error: "Failed to save billing settings" });
   }
 });
-// ---------------- Helpers ----------------
+
+// =======================
+// PART 3d – Small helpers
+// =======================
+
 function safeString(value, fallback = "") {
   if (value === null || value === undefined) return fallback;
   if (typeof value !== "string") return String(value);
@@ -945,7 +948,7 @@ The attached image is the still to animate. Propose one natural-language motion 
 }
 
 // =======================
-// PART 6 – Routes
+// PART 6 – Core routes (health, credits, editorial, motion, feedback)
 // =======================
 
 // Health
@@ -961,7 +964,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Mina Editorial AI API",
-    hint: "Use /health, /editorial/generate, /motion/generate, /api/credits/:customerId",
+    hint: "Use /health, /editorial/generate, /motion/generate, /credits/balance",
   });
 });
 
@@ -1034,34 +1037,34 @@ app.post("/credits/add", (req, res) => {
     });
   }
 });
-      // --- Admin API ---
-      
-      app.get("/admin/summary", async (req, res) => {
-        if (!ensureAdmin(req, res)) return;
-      
-        try {
-          if (!prisma) {
-            return res.status(503).json({ error: "Database not available" });
-          }
-      
-          const totalCustomers = await prisma.customerCredit.count();
-          const sumResult = await prisma.customerCredit.aggregate({
-            _sum: { balance: true },
-          });
-          const autoTopupOn = await prisma.autoTopupSetting.count({
-            where: { enabled: true },
-          });
-      
-          res.json({
-            totalCustomers,
-            totalCredits: sumResult._sum.balance || 0,
-            autoTopupOn,
-          });
-        } catch (err) {
-          console.error("GET /admin/summary error", err);
-          res.status(500).json({ error: "Failed to load admin summary" });
-        }
-      });
+
+// --- Admin API (summary & credits customers/adjust) ---
+app.get("/admin/summary", async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+
+  try {
+    if (!prisma) {
+      return res.status(503).json({ error: "Database not available" });
+    }
+
+    const totalCustomers = await prisma.customerCredit.count();
+    const sumResult = await prisma.customerCredit.aggregate({
+      _sum: { balance: true },
+    });
+    const autoTopupOn = await prisma.autoTopupSetting.count({
+      where: { enabled: true },
+    });
+
+    res.json({
+      totalCustomers,
+      totalCredits: sumResult._sum.balance || 0,
+      autoTopupOn,
+    });
+  } catch (err) {
+    console.error("GET /admin/summary error", err);
+    res.status(500).json({ error: "Failed to load admin summary" });
+  }
+});
 
 app.get("/admin/customers", async (req, res) => {
   if (!ensureAdmin(req, res)) return;
@@ -1730,18 +1733,14 @@ const CREDIT_SKUS = {
 /**
  * Shopify Admin will POST the full order JSON to:
  *   /api/credits/shopify-order?secret=YOUR_SECRET
- *
- * We:
- *  - verify the query secret
- *  - sum credits for any line_items whose sku is in CREDIT_SKUS
- *  - add those credits to that customerId using the SAME credits store
- *    that Mina uses for image/motion (/credits/balance, etc.).
  */
 app.post("/api/credits/shopify-order", async (req, res) => {
   try {
-    // 1) Simple shared-secret check via query param
     const secretFromQuery = req.query.secret;
-    if (!secretFromQuery || secretFromQuery !== process.env.SHOPIFY_ORDER_WEBHOOK_SECRET) {
+    if (
+      !secretFromQuery ||
+      secretFromQuery !== process.env.SHOPIFY_ORDER_WEBHOOK_SECRET
+    ) {
       return res.status(401).json({
         ok: false,
         error: "UNAUTHORIZED",
@@ -1783,7 +1782,9 @@ app.post("/api/credits/shopify-order", async (req, res) => {
     }
 
     if (creditsToAdd <= 0) {
-      console.log("[SHOPIFY_WEBHOOK] Order has no credit SKUs. Doing nothing.");
+      console.log(
+        "[SHOPIFY_WEBHOOK] Order has no credit SKUs. Doing nothing."
+      );
       return res.json({
         ok: true,
         message: "No credit products found in order.",
@@ -1791,7 +1792,6 @@ app.post("/api/credits/shopify-order", async (req, res) => {
       });
     }
 
-    // IMPORTANT: use the SAME credits store Mina uses everywhere else
     const updated = addCreditsInternal(
       customerId,
       creditsToAdd,
@@ -1817,7 +1817,7 @@ app.post("/api/credits/shopify-order", async (req, res) => {
 });
 
 // =========================
-// PART 8 – Debug credits endpoint (same store as Mina)
+// PART 8 – Debug credits endpoint
 // =========================
 
 app.get("/api/credits/:customerId", (req, res) => {
@@ -1933,7 +1933,7 @@ app.get("/history/admin/overview", (req, res) => {
 });
 
 // =======================
-// Start server
+// PART 10 – Start server
 // =======================
 
 app.listen(PORT, () => {

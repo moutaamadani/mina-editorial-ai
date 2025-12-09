@@ -107,6 +107,58 @@ const feedbacks = new Map(); // feedbackId -> { ... }
 // =======================
 
 const credits = new Map(); // customerId -> { balance, history: [{ delta, reason, source, at }] }
+// Prisma / Postgres integration for credits persistence
+let prisma = null;
+
+async function hydrateCreditsFromDb() {
+  if (!prisma) return;
+  try {
+    const rows = await prisma.customerCredit.findMany();
+    for (const row of rows) {
+      credits.set(row.customerId, {
+        balance: row.balance,
+        history: [],
+      });
+    }
+    console.log(`Hydrated ${rows.length} credit records from database.`);
+  } catch (err) {
+    console.error("Failed to hydrate credits from DB:", err);
+  }
+}
+
+async function persistCreditsBalance(customerId, balance) {
+  if (!prisma) return;
+  try {
+    await prisma.customerCredit.upsert({
+      where: { customerId },
+      update: { balance },
+      create: { customerId, balance },
+    });
+  } catch (err) {
+    console.error("Failed to persist credits balance", customerId, err);
+  }
+}
+
+async function initDatabase() {
+  if (!process.env.DATABASE_URL) {
+    console.log("DATABASE_URL not set; using in-memory credits only.");
+    return;
+  }
+  try {
+    const { PrismaClient } = await import("@prisma/client");
+    prisma = new PrismaClient();
+    await hydrateCreditsFromDb();
+    console.log("Database initialized.");
+  } catch (err) {
+    console.error(
+      "Failed to initialize database, using in-memory credits only.",
+      err
+    );
+    prisma = null;
+  }
+}
+
+initDatabase();
 
 // How many credits each operation costs
 const IMAGE_CREDITS_COST = Number(process.env.IMAGE_CREDITS_COST || 1);
@@ -117,12 +169,14 @@ const DEFAULT_FREE_CREDITS = Number(process.env.DEFAULT_FREE_CREDITS || 50);
 
 function getCreditsRecord(customerIdRaw) {
   const customerId = String(customerIdRaw || "anonymous");
+
   let rec = credits.get(customerId);
   if (!rec) {
     rec = {
       balance: 0,
       history: [],
     };
+
     if (DEFAULT_FREE_CREDITS > 0) {
       rec.balance = DEFAULT_FREE_CREDITS;
       rec.history.push({
@@ -132,14 +186,20 @@ function getCreditsRecord(customerIdRaw) {
         at: new Date().toISOString(),
       });
     }
+
     credits.set(customerId, rec);
+    // save starting balance to DB
+    persistCreditsBalance(customerId, rec.balance);
   }
+
   return rec;
 }
+
 
 function addCreditsInternal(customerIdRaw, delta, reason, source) {
   const customerId = String(customerIdRaw || "anonymous");
   const rec = getCreditsRecord(customerId);
+
   rec.balance += delta;
   rec.history.push({
     delta,
@@ -147,8 +207,13 @@ function addCreditsInternal(customerIdRaw, delta, reason, source) {
     source: source || "api",
     at: new Date().toISOString(),
   });
+
+  // save new balance to DB
+  persistCreditsBalance(customerId, rec.balance);
+
   return rec;
 }
+
 
 // ---------------- Helpers ----------------
 function safeString(value, fallback = "") {

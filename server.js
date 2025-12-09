@@ -10,6 +10,19 @@ import { v4 as uuidv4 } from "uuid";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+interface AdminSummary {
+  totalCustomers: number;
+  totalCredits: number;
+  autoTopupOn: number;
+}
+
+interface AdminCustomer {
+  customerId: string;
+  balance: number;
+}
+
+const ADMIN_SECRET_STORAGE_KEY = "minaAdminSecretV1";
+
 function ensureAdmin(req, res) {
   if (!ADMIN_SECRET) {
     console.warn("ADMIN_SECRET is not set; denying admin access");

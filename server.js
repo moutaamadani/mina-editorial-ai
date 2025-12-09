@@ -163,6 +163,162 @@ async function persistCreditsBalance(customerId, balance) {
   }
 }
 
+// ---------------------------------------------
+// History hydration + persistence (sessions, generations, feedback)
+// ---------------------------------------------
+
+async function hydrateHistoryFromDb() {
+  if (!prisma) return;
+  try {
+    const [sessionRows, generationRows, feedbackRows] = await Promise.all([
+      prisma.session.findMany(),
+      prisma.generation.findMany(),
+      prisma.feedback.findMany(),
+    ]);
+
+    sessions.clear();
+    generations.clear();
+    feedbacks.clear();
+
+    for (const row of sessionRows) {
+      sessions.set(row.id, {
+        id: row.id,
+        customerId: row.customerId,
+        platform: row.platform,
+        title: row.title,
+        createdAt:
+          row.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      });
+    }
+
+    for (const row of generationRows) {
+      generations.set(row.id, {
+        id: row.id,
+        type: row.type,
+        sessionId: row.sessionId || "",
+        customerId: row.customerId,
+        platform: row.platform,
+        prompt: row.prompt,
+        outputUrl: row.outputUrl,
+        createdAt:
+          row.createdAt?.toISOString?.() ?? new Date().toISOString(),
+        meta: row.meta || null,
+      });
+    }
+
+    for (const row of feedbackRows) {
+      feedbacks.set(row.id, {
+        id: row.id,
+        sessionId: row.sessionId || "",
+        generationId: row.generationId || "",
+        customerId: row.customerId,
+        resultType: row.resultType,
+        platform: row.platform,
+        prompt: row.prompt,
+        comment: row.comment,
+        imageUrl: row.imageUrl || "",
+        videoUrl: row.videoUrl || "",
+        createdAt:
+          row.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      });
+    }
+
+    console.log(
+      `[init] Hydrated ${sessionRows.length} sessions, ${generationRows.length} generations, ${feedbackRows.length} feedbacks from DB.`,
+    );
+  } catch (err) {
+    console.error("[init] Failed to hydrate history from DB", err);
+  }
+}
+
+async function persistSession(session) {
+  if (!prisma) return;
+  try {
+    await prisma.session.upsert({
+      where: { id: session.id },
+      update: {
+        customerId: session.customerId,
+        platform: session.platform,
+        title: session.title,
+      },
+      create: {
+        id: session.id,
+        customerId: session.customerId,
+        platform: session.platform,
+        title: session.title,
+      },
+    });
+  } catch (err) {
+    console.error("[db] Failed to persist session", session.id, err);
+  }
+}
+
+async function persistGeneration(gen) {
+  if (!prisma) return;
+  try {
+    await prisma.generation.upsert({
+      where: { id: gen.id },
+      update: {
+        type: gen.type,
+        sessionId: gen.sessionId || null,
+        customerId: gen.customerId,
+        platform: gen.platform,
+        prompt: gen.prompt,
+        outputUrl: gen.outputUrl,
+        meta: gen.meta ?? undefined,
+      },
+      create: {
+        id: gen.id,
+        type: gen.type,
+        sessionId: gen.sessionId || null,
+        customerId: gen.customerId,
+        platform: gen.platform,
+        prompt: gen.prompt,
+        outputUrl: gen.outputUrl,
+        meta: gen.meta ?? undefined,
+      },
+    });
+  } catch (err) {
+    console.error("[db] Failed to persist generation", gen.id, err);
+  }
+}
+
+async function persistFeedback(feedback) {
+  if (!prisma) return;
+  try {
+    await prisma.feedback.upsert({
+      where: { id: feedback.id },
+      update: {
+        sessionId: feedback.sessionId || null,
+        generationId: feedback.generationId || null,
+        customerId: feedback.customerId,
+        resultType: feedback.resultType,
+        platform: feedback.platform,
+        prompt: feedback.prompt,
+        comment: feedback.comment,
+        imageUrl: feedback.imageUrl || null,
+        videoUrl: feedback.videoUrl || null,
+      },
+      create: {
+        id: feedback.id,
+        sessionId: feedback.sessionId || null,
+        generationId: feedback.generationId || null,
+        customerId: feedback.customerId,
+        resultType: feedback.resultType,
+        platform: feedback.platform,
+        prompt: feedback.prompt,
+        comment: feedback.comment,
+        imageUrl: feedback.imageUrl || null,
+        videoUrl: feedback.videoUrl || null,
+      },
+    });
+  } catch (err) {
+    console.error("[db] Failed to persist feedback", feedback.id, err);
+  }
+}
+
+
+
 async function initDatabase() {
   if (!process.env.DATABASE_URL) {
     console.log("DATABASE_URL not set; using in-memory credits only.");

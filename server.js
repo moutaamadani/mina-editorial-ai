@@ -163,6 +163,7 @@ initDatabase();
 // How many credits each operation costs
 const IMAGE_CREDITS_COST = Number(process.env.IMAGE_CREDITS_COST || 1);
 const MOTION_CREDITS_COST = Number(process.env.MOTION_CREDITS_COST || 5);
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 // Free credits ON FIRST USE, for testing. Set to 0 in production.
 const DEFAULT_FREE_CREDITS = Number(process.env.DEFAULT_FREE_CREDITS || 50);

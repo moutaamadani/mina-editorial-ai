@@ -328,6 +328,8 @@ async function initDatabase() {
     const { PrismaClient } = await import("@prisma/client");
     prisma = new PrismaClient();
     await hydrateCreditsFromDb();
+    await hydrateHistoryFromDb();
+
     console.log("Database initialized.");
   } catch (err) {
     console.error(

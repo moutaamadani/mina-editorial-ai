@@ -43,6 +43,11 @@ const replicate = new Replicate({
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+// Shopify admin (used for total users counter on login)
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_ACCESS_TOKEN =
+  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "";
+const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users";
 
 // Models
 const SEADREAM_MODEL =

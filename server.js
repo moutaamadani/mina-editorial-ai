@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MINA_BASELINE_USERS = 3651; // offset we add on top of DB users
 
 // NOTE: We removed TypeScript interfaces here to keep this file pure JS.
 
@@ -317,8 +318,6 @@ async function persistFeedback(feedback) {
   }
 }
 
-
-
 async function initDatabase() {
   if (!process.env.DATABASE_URL) {
     console.log("DATABASE_URL not set; using in-memory credits only.");
@@ -584,7 +583,6 @@ function createSession({ customerId, platform, title }) {
   return session;
 }
 
-
 function ensureSession(sessionIdRaw, customerId, platform) {
   const platformNorm = safeString(platform || "tiktok").toLowerCase();
   const incomingId = safeString(sessionIdRaw || "");
@@ -596,196 +594,6 @@ function ensureSession(sessionIdRaw, customerId, platform) {
     platform: platformNorm,
     title: "Mina session",
   });
-}
-// Shopify config (shared for login sync + stats)
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
-const SHOPIFY_ADMIN_ACCESS_TOKEN =
-  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ADMIN_TOKEN || "";
-const SHOPIFY_ADMIN_TOKEN = SHOPIFY_ADMIN_ACCESS_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
-const SHOPIFY_WELCOME_MATCHA_VARIANT_ID =
-  process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "";
-const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users";
-
-
-function isShopifyConfiguredForLogin() {
-  return (
-    SHOPIFY_STORE_DOMAIN &&
-    SHOPIFY_ADMIN_TOKEN &&
-    SHOPIFY_API_VERSION &&
-    SHOPIFY_WELCOME_MATCHA_VARIANT_ID
-  );
-}
-
-
-function getShopifyBaseUrl() {
-  return `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`;
-}
-
-async function shopifyRequest(path, init = {}) {
-  if (!isShopifyConfiguredForLogin()) {
-    throw new Error("Shopify API for login sync is not fully configured");
-  }
-
-  const url = `${getShopifyBaseUrl()}${path}`;
-  const headers = {
-    "Content-Type": "application/json",
-    "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    ...(init.headers || {}),
-  };
-
-  const res = await fetch(url, { ...init, headers });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.error(
-      "[SHOPIFY] Error",
-      res.status,
-      res.statusText,
-      text?.slice(0, 400)
-    );
-    throw new Error(`Shopify API error ${res.status}`);
-  }
-
-  return res.json();
-}
-
-async function ensureMinaCustomerAndWelcomeOrder(emailRaw) {
-  const email = (emailRaw || "").trim().toLowerCase();
-  if (!email) {
-    throw new Error("Missing email for Shopify sync");
-  }
-
-  if (!isShopifyConfiguredForLogin()) {
-    console.log("[SHOPIFY] Login sync disabled (env not set)");
-    return {
-      customerId: null,
-      createdCustomer: false,
-      createdOrder: false,
-      reason: "not_configured",
-    };
-  }
-
-  console.log("[SHOPIFY] Sync start for", email);
-
-  // 1) Find customer by email
-  const searchJson = await shopifyRequest(
-    `/customers/search.json?query=${encodeURIComponent(`email:${email}`)}`
-  );
-  const existingCustomers = searchJson.customers || [];
-  let customer = existingCustomers[0] || null;
-  let createdCustomer = false;
-
-  // 2) Create customer if missing
-  if (!customer) {
-    const createJson = await shopifyRequest("/customers.json", {
-      method: "POST",
-      body: JSON.stringify({
-        customer: {
-          email,
-          verified_email: true,
-          tags: "Mina_users",
-          note: "Created from Mina login",
-        },
-      }),
-    });
-    customer = createJson.customer;
-    createdCustomer = true;
-    console.log("[SHOPIFY] Created Mina customer", customer.id);
-  }
-
-  const customerId = customer.id;
-
-  // 3) Ensure Mina_users tag
-  try {
-    const existingTags = (customer.tags || "")
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-
-    if (!existingTags.includes("Mina_users")) {
-      existingTags.push("Mina_users");
-      const updateJson = await shopifyRequest(
-        `/customers/${customerId}.json`,
-        {
-          method: "PUT",
-          body: JSON.stringify({
-            customer: {
-              id: customerId,
-              tags: existingTags.join(", "),
-            },
-          }),
-        }
-      );
-      customer = updateJson.customer;
-      console.log("[SHOPIFY] Added Mina_users tag to", customerId);
-    }
-  } catch (err) {
-    console.warn(
-      "[SHOPIFY] Failed to update Mina_users tag for",
-      customerId,
-      err
-    );
-  }
-
-  // 4) Ensure Welcome matcha order exists once
-  let createdOrder = false;
-  const variantId = String(SHOPIFY_WELCOME_MATCHA_VARIANT_ID);
-
-  try {
-    const ordersJson = await shopifyRequest(
-      `/orders.json?status=any&email=${encodeURIComponent(
-        email
-      )}&fields=id,line_items&limit=50`
-    );
-
-    const alreadyHasWelcome = (ordersJson.orders || []).some((order) =>
-      (order.line_items || []).some(
-        (li) => String(li.variant_id) === variantId
-      )
-    );
-
-    if (!alreadyHasWelcome) {
-      await shopifyRequest("/orders.json", {
-        method: "POST",
-        body: JSON.stringify({
-          order: {
-            email,
-            customer: { id: customerId },
-            line_items: [
-              {
-                variant_id: Number(variantId),
-                quantity: 1,
-              },
-            ],
-            financial_status: "paid",
-            tags: "mina-welcome-matcha",
-            note: "Free Welcome matcha created automatically by Mina login.",
-            send_receipt: false,
-            send_fulfillment_receipt: false,
-          },
-        }),
-      });
-      createdOrder = true;
-      console.log(
-        "[SHOPIFY] Created Welcome matcha order for",
-        customerId
-      );
-    } else {
-      console.log(
-        "[SHOPIFY] Welcome matcha already exists for",
-        customerId
-      );
-    }
-  } catch (err) {
-    console.warn(
-      "[SHOPIFY] Failed to ensure Welcome matcha order for",
-      customerId,
-      err
-    );
-  }
-
-  return { customerId, createdCustomer, createdOrder };
 }
 
 // =======================
@@ -1302,100 +1110,59 @@ The attached image is the still to animate. Propose one natural-language motion 
   };
 }
 
-
 // =======================
-// PART 6 – Core routes (health, stats, credits, editorial, motion, feedback)
+// PART 6 – Core routes (health, credits, editorial, motion, feedback)
 // =======================
 
 // Health
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
   res.json({
-    status: "ok",
-    service: "mina-editorial-ai-api",
+    ok: true,
+    service: "Mina Editorial AI API",
     time: new Date().toISOString(),
   });
 });
 
-app.get("/", (_req, res) => {
-  res.send("Mina Editorial AI API is healthy.");
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "Mina Editorial AI API",
+    time: new Date().toISOString(),
+  });
 });
 
 // public stats → total users on login screen
 app.get("/public/stats/total-users", async (_req, res) => {
   const requestId = `stats_${Date.now()}`;
 
-  // config guard – only run if Shopify is correctly set
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+  // If Prisma/DB is not available, don't fake numbers
+  if (!prisma) {
     return res.json({
       ok: false,
       requestId,
-      source: "not_configured",
+      source: "no_db",
       totalUsers: null,
     });
   }
 
   try {
-    const endpoint = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-10/graphql.json`;
-    const query = `
-      query MinaUsersCount($query: String) {
-        customersCount(query: $query) {
-          count
-        }
-      }
-    `;
+    // Each row in customerCredit corresponds to one customerId
+    const dbCount = await prisma.customerCredit.count();
 
-    const shopifyRes = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      },
-      body: JSON.stringify({
-        query,
-        // IMPORTANT: plain string, no backticks, no slashes
-        variables: { query: "tag:" + SHOPIFY_MINA_TAG },
-      }),
-    });
+    const total = dbCount + MINA_BASELINE_USERS;
 
-    if (!shopifyRes.ok) {
-      console.error(
-        "[mina] shopify customersCount http error",
-        shopifyRes.status,
-        await shopifyRes.text()
-      );
-      return res.json({
-        ok: false,
-        requestId,
-        source: "shopify_error",
-        totalUsers: null,
-      });
-    }
-
-    const json = await shopifyRes.json();
-    const count = json?.data?.customersCount?.count;
-
-    if (typeof count === "number") {
-      return res.json({
-        ok: true,
-        requestId,
-        source: "shopify",
-        totalUsers: count,
-      });
-    }
-
-    console.error("[mina] unexpected shopify customersCount payload", json);
     return res.json({
-      ok: false,
+      ok: true,
       requestId,
-      source: "bad_payload",
-      totalUsers: null,
+      source: "db",
+      totalUsers: total,
     });
   } catch (err) {
-    console.error("[mina] shopify customersCount failed", err);
+    console.error("[mina] total-users db error", err);
     return res.json({
       ok: false,
       requestId,
-      source: "exception",
+      source: "db_error",
       totalUsers: null,
     });
   }
@@ -1403,8 +1170,6 @@ app.get("/public/stats/total-users", async (_req, res) => {
 
 // ---- Credits: balance ----
 app.get("/credits/balance", async (req, res) => {
-
-
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   try {
     const customerIdRaw = req.query.customerId || "anonymous";
@@ -1441,7 +1206,8 @@ app.post("/credits/add", (req, res) => {
       body.customerId !== null && body.customerId !== undefined
         ? String(body.customerId)
         : "anonymous";
-    const amount = Number(body.amount || 0);
+    const amount =
+      typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
     const reason = safeString(body.reason || "manual-topup");
     const source = safeString(body.source || "api");
 
@@ -1639,7 +1405,6 @@ app.post("/editorial/generate", async (req, res) => {
     const session = ensureSession(body.sessionId, customerId, platform);
     const sessionId = session.id;
 
-    // Style profile logic
     let styleHistory = [];
     let userStyleProfile = null;
     let finalStyleProfile = null;
@@ -1752,7 +1517,7 @@ app.post("/editorial/generate", async (req, res) => {
       sessionId,
       customerId,
       platform,
-      prompt,
+      prompt: prompt || "",
       outputUrl: imageUrl,
       createdAt: new Date().toISOString(),
       meta: {
@@ -1762,6 +1527,7 @@ app.post("/editorial/generate", async (req, res) => {
         stylePresetKey,
         productImageUrl,
         styleImageUrls,
+        aspectRatio,
       },
     };
 
@@ -1803,7 +1569,6 @@ app.post("/editorial/generate", async (req, res) => {
     });
   }
 });
-
 
 // ---- Motion suggestion (for textarea) ----
 app.post("/motion/suggest", async (req, res) => {
@@ -2016,7 +1781,7 @@ app.post("/motion/generate", async (req, res) => {
       }
     }
 
-       // Spend credits AFTER successful generation
+    // Spend credits AFTER successful generation
     creditsRecord.balance -= motionCost;
     creditsRecord.history.push({
       delta: -motionCost,
@@ -2026,8 +1791,7 @@ app.post("/motion/generate", async (req, res) => {
     });
     persistCreditsBalance(customerId, creditsRecord.balance);
 
-
-        // Save motion generation in memory + DB
+    // Save motion generation in memory + DB
     const generationId = `gen_${uuidv4()}`;
 
     const generationRecord = {
@@ -2054,7 +1818,6 @@ app.post("/motion/generate", async (req, res) => {
     if (prisma) {
       void persistGeneration(generationRecord);
     }
-
 
     res.json({
       ok: true,
@@ -2135,7 +1898,6 @@ app.post("/feedback/like", (req, res) => {
     });
 
     // Save feedback in in-memory DB
-   
     const feedbackId = `fb_${uuidv4()}`;
     const feedback = {
       id: feedbackId,
@@ -2158,7 +1920,6 @@ app.post("/feedback/like", (req, res) => {
     }
 
     const totalLikes = getLikes(customerId).length;
-
 
     res.json({
       ok: true,
@@ -2281,47 +2042,6 @@ app.post("/api/credits/shopify-order", async (req, res) => {
       ok: false,
       error: "INTERNAL_ERROR",
       message: "Failed to process Shopify order webhook",
-    });
-  }
-});
-// =========================
-// PART 7B – Shopify login sync endpoint
-// =========================
-
-app.post("/auth/shopify-sync", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const email = body.email;
-
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_EMAIL",
-        message: "Email is required for Shopify sync.",
-      });
-    }
-
-    if (!isShopifyConfiguredForLogin()) {
-      return res.json({
-        ok: false,
-        error: "NOT_CONFIGURED",
-        message:
-          "Shopify login sync is not configured on the server (env vars missing).",
-      });
-    }
-
-    const result = await ensureMinaCustomerAndWelcomeOrder(email);
-
-    return res.json({
-      ok: true,
-      ...result,
-    });
-  } catch (err) {
-    console.error("Error in /auth/shopify-sync", err);
-    return res.status(500).json({
-      ok: false,
-      error: "INTERNAL_ERROR",
-      message: "Failed to sync Shopify customer",
     });
   }
 });

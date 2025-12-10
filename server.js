@@ -1639,6 +1639,7 @@ app.post("/editorial/generate", async (req, res) => {
     const session = ensureSession(body.sessionId, customerId, platform);
     const sessionId = session.id;
 
+    // Style profile logic
     let styleHistory = [];
     let userStyleProfile = null;
     let finalStyleProfile = null;
@@ -1732,46 +1733,43 @@ app.post("/editorial/generate", async (req, res) => {
 
     const imageUrl = imageUrls[0] || null;
 
-        // Spend credits AFTER successful generation
-    creditsRecord.balance -= motionCost;
+    // Spend credits AFTER successful generation
+    creditsRecord.balance -= imageCost;
     creditsRecord.history.push({
-      delta: -motionCost,
-      reason: "motion-generate",
+      delta: -imageCost,
+      reason: "image-generate",
       source: "api",
       at: new Date().toISOString(),
     });
     persistCreditsBalance(customerId, creditsRecord.balance);
 
-    // Save motion generation in memory + DB
+    // Save image generation in memory + DB
     const generationId = `gen_${uuidv4()}`;
 
     const generationRecord = {
       id: generationId,
-      type: "motion",
+      type: "image",
       sessionId,
       customerId,
       platform,
-      prompt: motionDescription || "",
-      outputUrl: videoUrl,
+      prompt,
+      outputUrl: imageUrl,
       createdAt: new Date().toISOString(),
       meta: {
         tone,
         platform,
         minaVisionEnabled,
         stylePresetKey,
-        lastImageUrl,
-        durationSeconds,
+        productImageUrl,
+        styleImageUrls,
       },
     };
 
-    
-        generations.set(generationId, generationRecord);
-    
-        if (prisma) {
-          void persistGeneration(generationRecord);
-        }
+    generations.set(generationId, generationRecord);
 
-
+    if (prisma) {
+      void persistGeneration(generationRecord);
+    }
 
     res.json({
       ok: true,
@@ -1805,6 +1803,7 @@ app.post("/editorial/generate", async (req, res) => {
     });
   }
 });
+
 
 // ---- Motion suggestion (for textarea) ----
 app.post("/motion/suggest", async (req, res) => {

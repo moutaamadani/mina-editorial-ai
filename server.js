@@ -597,6 +597,191 @@ function ensureSession(sessionIdRaw, customerId, platform) {
     title: "Mina session",
   });
 }
+// Shopify login sync (Mina_users tag + Welcome matcha)
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
+const SHOPIFY_WELCOME_MATCHA_VARIANT_ID =
+  process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "";
+
+function isShopifyConfiguredForLogin() {
+  return (
+    SHOPIFY_STORE_DOMAIN &&
+    SHOPIFY_ADMIN_TOKEN &&
+    SHOPIFY_API_VERSION &&
+    SHOPIFY_WELCOME_MATCHA_VARIANT_ID
+  );
+}
+
+function getShopifyBaseUrl() {
+  return `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`;
+}
+
+async function shopifyRequest(path, init = {}) {
+  if (!isShopifyConfiguredForLogin()) {
+    throw new Error("Shopify API for login sync is not fully configured");
+  }
+
+  const url = `${getShopifyBaseUrl()}${path}`;
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    ...(init.headers || {}),
+  };
+
+  const res = await fetch(url, { ...init, headers });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error(
+      "[SHOPIFY] Error",
+      res.status,
+      res.statusText,
+      text?.slice(0, 400)
+    );
+    throw new Error(`Shopify API error ${res.status}`);
+  }
+
+  return res.json();
+}
+
+async function ensureMinaCustomerAndWelcomeOrder(emailRaw) {
+  const email = (emailRaw || "").trim().toLowerCase();
+  if (!email) {
+    throw new Error("Missing email for Shopify sync");
+  }
+
+  if (!isShopifyConfiguredForLogin()) {
+    console.log("[SHOPIFY] Login sync disabled (env not set)");
+    return {
+      customerId: null,
+      createdCustomer: false,
+      createdOrder: false,
+      reason: "not_configured",
+    };
+  }
+
+  console.log("[SHOPIFY] Sync start for", email);
+
+  // 1) Find customer by email
+  const searchJson = await shopifyRequest(
+    `/customers/search.json?query=${encodeURIComponent(`email:${email}`)}`
+  );
+  const existingCustomers = searchJson.customers || [];
+  let customer = existingCustomers[0] || null;
+  let createdCustomer = false;
+
+  // 2) Create customer if missing
+  if (!customer) {
+    const createJson = await shopifyRequest("/customers.json", {
+      method: "POST",
+      body: JSON.stringify({
+        customer: {
+          email,
+          verified_email: true,
+          tags: "Mina_users",
+          note: "Created from Mina login",
+        },
+      }),
+    });
+    customer = createJson.customer;
+    createdCustomer = true;
+    console.log("[SHOPIFY] Created Mina customer", customer.id);
+  }
+
+  const customerId = customer.id;
+
+  // 3) Ensure Mina_users tag
+  try {
+    const existingTags = (customer.tags || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    if (!existingTags.includes("Mina_users")) {
+      existingTags.push("Mina_users");
+      const updateJson = await shopifyRequest(
+        `/customers/${customerId}.json`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            customer: {
+              id: customerId,
+              tags: existingTags.join(", "),
+            },
+          }),
+        }
+      );
+      customer = updateJson.customer;
+      console.log("[SHOPIFY] Added Mina_users tag to", customerId);
+    }
+  } catch (err) {
+    console.warn(
+      "[SHOPIFY] Failed to update Mina_users tag for",
+      customerId,
+      err
+    );
+  }
+
+  // 4) Ensure Welcome matcha order exists once
+  let createdOrder = false;
+  const variantId = String(SHOPIFY_WELCOME_MATCHA_VARIANT_ID);
+
+  try {
+    const ordersJson = await shopifyRequest(
+      `/orders.json?status=any&email=${encodeURIComponent(
+        email
+      )}&fields=id,line_items&limit=50`
+    );
+
+    const alreadyHasWelcome = (ordersJson.orders || []).some((order) =>
+      (order.line_items || []).some(
+        (li) => String(li.variant_id) === variantId
+      )
+    );
+
+    if (!alreadyHasWelcome) {
+      await shopifyRequest("/orders.json", {
+        method: "POST",
+        body: JSON.stringify({
+          order: {
+            email,
+            customer: { id: customerId },
+            line_items: [
+              {
+                variant_id: Number(variantId),
+                quantity: 1,
+              },
+            ],
+            financial_status: "paid",
+            tags: "mina-welcome-matcha",
+            note: "Free Welcome matcha created automatically by Mina login.",
+            send_receipt: false,
+            send_fulfillment_receipt: false,
+          },
+        }),
+      });
+      createdOrder = true;
+      console.log(
+        "[SHOPIFY] Created Welcome matcha order for",
+        customerId
+      );
+    } else {
+      console.log(
+        "[SHOPIFY] Welcome matcha already exists for",
+        customerId
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "[SHOPIFY] Failed to ensure Welcome matcha order for",
+      customerId,
+      err
+    );
+  }
+
+  return { customerId, createdCustomer, createdOrder };
+}
 
 // =======================
 // PART 4 – Style profiles via GPT
@@ -2012,6 +2197,47 @@ app.post("/api/credits/shopify-order", async (req, res) => {
       ok: false,
       error: "INTERNAL_ERROR",
       message: "Failed to process Shopify order webhook",
+    });
+  }
+});
+// =========================
+// PART 7B – Shopify login sync endpoint
+// =========================
+
+app.post("/auth/shopify-sync", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = body.email;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_EMAIL",
+        message: "Email is required for Shopify sync.",
+      });
+    }
+
+    if (!isShopifyConfiguredForLogin()) {
+      return res.json({
+        ok: false,
+        error: "NOT_CONFIGURED",
+        message:
+          "Shopify login sync is not configured on the server (env vars missing).",
+      });
+    }
+
+    const result = await ensureMinaCustomerAndWelcomeOrder(email);
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    console.error("Error in /auth/shopify-sync", err);
+    return res.status(500).json({
+      ok: false,
+      error: "INTERNAL_ERROR",
+      message: "Failed to sync Shopify customer",
     });
   }
 });

@@ -604,10 +604,16 @@ function ensureSession(sessionIdRaw, customerId, platform) {
 }
 // Shopify login sync (Mina_users tag + Welcome matcha)
 
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+// Shopify config (shared for login sync + stats)
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_TOKEN =
+  process.env.SHOPIFY_ADMIN_TOKEN ||
+  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN ||
+  "";
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 const SHOPIFY_WELCOME_MATCHA_VARIANT_ID =
   process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "";
+const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users";
 
 function isShopifyConfiguredForLogin() {
   return (
@@ -617,6 +623,7 @@ function isShopifyConfiguredForLogin() {
     SHOPIFY_WELCOME_MATCHA_VARIANT_ID
   );
 }
+
 
 function getShopifyBaseUrl() {
   return `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`;
@@ -1324,75 +1331,86 @@ app.get("/", (_req, res) => {
 app.get("/public/stats/total-users", async (_req, res) => {
   const requestId = `stats_${Date.now()}`;
 
-  // 1) try shopify `customersCount` for tag Mina_users
-  if (SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_ACCESS_TOKEN) {
-    try {
-      const endpoint = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-10/graphql.json`;
-      const query = `
-        query MinaUsersCount($query: String) {
-          customersCount(query: $query) {
-            count
-          }
-        }
-      `;
-
-      const shopifyRes = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-        },
-        body: JSON.stringify({
-          query,
-          variables: { query: `tag:${SHOPIFY_MINA_TAG}` },
-        }),
-      });
-
-      if (shopifyRes.ok) {
-        const json = await shopifyRes.json();
-        const count = json?.data?.customersCount?.count;
-
-        if (typeof count === "number") {
-          return res.json({
-            ok: true,
-            requestId,
-            source: "shopify",
-            totalUsers: count,
-          });
-        }
-
-        console.error("[mina] unexpected shopify customersCount payload", json);
-      } else {
-        console.error(
-          "[mina] shopify customersCount http error",
-          shopifyRes.status,
-          await shopifyRes.text()
-        );
-      }
-    } catch (err) {
-      console.error("[mina] shopify customersCount failed", err);
-    }
+  // config guard – only run if Shopify is correctly set
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_ACCESS_TOKEN) {
+    return res.json({
+      ok: false,
+      requestId,
+      source: "not_configured",
+      totalUsers: null,
+    });
   }
 
-  // 2) fallback = how many customers we know in our own db
-  let fallback = 0;
   try {
-    // if you later add prisma.customerCredit etc you can swap here
-    fallback = 0;
-  } catch (err) {
-    console.error("[mina] fallback total users failed", err);
-  }
+    const endpoint = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-10/graphql.json`;
+    const query = `
+      query MinaUsersCount($query: String) {
+        customersCount(query: $query) {
+          count
+        }
+      }
+    `;
 
-  return res.json({
-    ok: true,
-    requestId,
-    source: SHOPIFY_STORE_DOMAIN ? "fallback" : "local",
-    totalUsers: fallback,
-  });
+    const shopifyRes = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      },
+      body: JSON.stringify({
+        query,
+        // IMPORTANT: plain string, no backticks, no slashes
+        variables: { query: "tag:" + SHOPIFY_MINA_TAG },
+      }),
+    });
+
+    if (!shopifyRes.ok) {
+      console.error(
+        "[mina] shopify customersCount http error",
+        shopifyRes.status,
+        await shopifyRes.text()
+      );
+      return res.json({
+        ok: false,
+        requestId,
+        source: "shopify_error",
+        totalUsers: null,
+      });
+    }
+
+    const json = await shopifyRes.json();
+    const count = json?.data?.customersCount?.count;
+
+    if (typeof count === "number") {
+      return res.json({
+        ok: true,
+        requestId,
+        source: "shopify",
+        totalUsers: count,
+      });
+    }
+
+    console.error("[mina] unexpected shopify customersCount payload", json);
+    return res.json({
+      ok: false,
+      requestId,
+      source: "bad_payload",
+      totalUsers: null,
+    });
+  } catch (err) {
+    console.error("[mina] shopify customersCount failed", err);
+    return res.json({
+      ok: false,
+      requestId,
+      source: "exception",
+      totalUsers: null,
+    });
+  }
 });
 
 // ---- Credits: balance ----
 app.get("/credits/balance", async (req, res) => {
+
 
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   try {

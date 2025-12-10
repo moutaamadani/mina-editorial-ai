@@ -43,11 +43,6 @@ const replicate = new Replicate({
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-// Shopify admin (used for total users counter on login)
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
-const SHOPIFY_ADMIN_ACCESS_TOKEN =
-  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "";
-const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users";
 
 // Models
 const SEADREAM_MODEL =
@@ -602,18 +597,16 @@ function ensureSession(sessionIdRaw, customerId, platform) {
     title: "Mina session",
   });
 }
-// Shopify login sync (Mina_users tag + Welcome matcha)
-
 // Shopify config (shared for login sync + stats)
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
-const SHOPIFY_ADMIN_TOKEN =
-  process.env.SHOPIFY_ADMIN_TOKEN ||
-  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN ||
-  "";
+const SHOPIFY_ADMIN_ACCESS_TOKEN =
+  process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ADMIN_TOKEN || "";
+const SHOPIFY_ADMIN_TOKEN = SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 const SHOPIFY_WELCOME_MATCHA_VARIANT_ID =
   process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "";
 const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users";
+
 
 function isShopifyConfiguredForLogin() {
   return (

@@ -2196,6 +2196,50 @@ app.get("/history/admin/overview", (req, res) => {
     });
   }
 });
+/**
+
+* Upload from frontend (expects JSON: { dataUrl, kind })
+* kind can be: "uploads" | "products" | "logos" etc
+  */
+  app.post("/api/r2/upload", async (req, res) => {
+  try {
+  const { dataUrl, kind = "uploads" } = req.body || {};
+  const { buffer, contentType, ext } = parseDataUrl(dataUrl);
+
+  const key = makeKey({ kind, ext });
+  await putBufferToR2({ key, buffer, contentType });
+
+  const url = publicUrlForKey(key);
+
+  // OPTIONAL DB SAVE (only if you have a model for it)
+  // await prisma.asset.create({ data: { kind, key, url, contentType, bytes: buffer.length } });
+
+  res.json({ ok: true, key, url, contentType, bytes: buffer.length });
+  } catch (err) {
+  res.status(400).json({ ok: false, error: err?.message || "upload_failed" });
+  }
+  });
+
+/**
+
+* Store a remote image into R2 (perfect for Replicate/OpenAI output URLs)
+* Expects JSON: { url, kind }
+  */
+  app.post("/api/r2/store-remote", async (req, res) => {
+  try {
+  const { url, kind = "generations" } = req.body || {};
+  if (!url) throw new Error("Missing url");
+
+  const out = await storeRemoteImageToR2({ url, kind });
+
+  // OPTIONAL DB SAVE
+  // await prisma.asset.create({ data: { kind, key: out.key, url: out.url, contentType: out.contentType, bytes: out.bytes } });
+
+  res.json({ ok: true, ...out });
+  } catch (err) {
+  res.status(400).json({ ok: false, error: err?.message || "store_remote_failed" });
+  }
+  });
 
 // =======================
 // PART 10 – Start server

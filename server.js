@@ -6,6 +6,7 @@ import cors from "cors";
 import Replicate from "replicate";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
+import { parseDataUrl, makeKey, putBufferToR2, publicUrlForKey, storeRemoteImageToR2 } from "./r2.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;

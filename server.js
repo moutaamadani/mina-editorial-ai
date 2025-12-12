@@ -2249,99 +2249,6 @@ app.get("/history/admin/overview", (req, res) => {
     });
   }
 });
-/**
-
-* Upload from frontend (expects JSON: { dataUrl, kind })
-* kind can be: "uploads" | "products" | "logos" etc
-  */
-  app.post("/api/r2/upload", async (req, res) => {
-  try {
-  const { dataUrl, kind = "uploads" } = req.body || {};
-  const { buffer, contentType, ext } = parseDataUrl(dataUrl);
-
-  const key = makeKey({ kind, ext });
-  await putBufferToR2({ key, buffer, contentType });
-
-  const url = publicUrlForKey(key);
-
-  // OPTIONAL DB SAVE (only if you have a model for it)
-  // await prisma.asset.create({ data: { kind, key, url, contentType, bytes: buffer.length } });
-
-  res.json({ ok: true, key, url, contentType, bytes: buffer.length });
-  } catch (err) {
-  res.status(400).json({ ok: false, error: err?.message || "upload_failed" });
-  }
-  });
-
-/**
-
-* Store a remote image into R2 (perfect for Replicate/OpenAI output URLs)
-* Expects JSON: { url, kind }
-  */
-  app.post("/api/r2/store-remote", async (req, res) => {
-  try {
-  const { url, kind = "generations" } = req.body || {};
-  if (!url) throw new Error("Missing url");
-
-  const out = await storeRemoteImageToR2({ url, kind });
-
-  // OPTIONAL DB SAVE
-  // await prisma.asset.create({ data: { kind, key: out.key, url: out.url, contentType: out.contentType, bytes: out.bytes } });
-
-  res.json({ ok: true, ...out });
-  } catch (err) {
-  res.status(400).json({ ok: false, error: err?.message || "store_remote_failed" });
-  }
-  });
-
-// ============================
-// 3B) Upload endpoint (frontend -> R2)
-// ============================
-app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: "NO_FILE" });
-    }
-
-    // optional fields you can send from frontend
-    const customerId = (req.body?.customerId || "anon").toString();
-    const folder = (req.body?.folder || "uploads").toString();
-
-    const extGuess =
-      req.file.mimetype?.includes("png")
-        ? "png"
-        : req.file.mimetype?.includes("jpeg")
-        ? "jpg"
-        : req.file.mimetype?.includes("webp")
-        ? "webp"
-        : req.file.mimetype?.includes("gif")
-        ? "gif"
-        : "";
-
-    const base = safeName(req.file.originalname || "upload");
-    const uuid = crypto.randomUUID();
-    const key = `${folder}/${customerId}/${Date.now()}-${uuid}-${base}${
-      extGuess && !base.toLowerCase().endsWith(`.${extGuess}`) ? `.${extGuess}` : ""
-    }`;
-
-    const url = await r2PutAndSignGet({
-      key,
-      body: req.file.buffer,
-      contentType: req.file.mimetype,
-    });
-
-    return res.json({
-      ok: true,
-      key,
-      url, // signed GET url
-      contentType: req.file.mimetype,
-      size: req.file.size,
-    });
-  } catch (err) {
-    console.error("POST /upload error:", err);
-    return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
-  }
-});
 
 // ============================
 // 3B) Store remote generation (Replicate/OpenAI result URL -> R2)
@@ -2412,6 +2319,150 @@ app.post("/store-remote-generation", async (req, res) => {
   } catch (err) {
     console.error("POST /store-remote-generation error:", err);
     return res.status(500).json({ ok: false, error: "STORE_REMOTE_FAILED" });
+  }
+});
+// =========================
+// PART X – R2 Signed Uploads (ADD-ONLY, does not replace your existing routes)
+// =========================
+//
+// Why: your current /api/r2/upload returns publicUrlForKey(key) which can be empty
+// when the bucket is private. These new endpoints always return a SIGNED URL.
+//
+// New endpoints:
+// 1) POST /api/r2/upload-signed
+// 2) POST /api/r2/store-remote-signed
+// 3) GET  /debug/r2
+
+function safeFolderName(name = "uploads") {
+  return String(name).replace(/[^a-zA-Z0-9/_-]/g, "_");
+}
+
+function guessExtFromContentType(contentType = "") {
+  const ct = String(contentType).toLowerCase();
+  if (ct.includes("png")) return "png";
+  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
+  if (ct.includes("webp")) return "webp";
+  if (ct.includes("gif")) return "gif";
+  if (ct.includes("mp4")) return "mp4";
+  return "";
+}
+
+app.get("/debug/r2", (_req, res) => {
+  const missing = [];
+  if (!process.env.R2_ACCOUNT_ID) missing.push("R2_ACCOUNT_ID");
+  if (!process.env.R2_ACCESS_KEY_ID) missing.push("R2_ACCESS_KEY_ID");
+  if (!process.env.R2_SECRET_ACCESS_KEY) missing.push("R2_SECRET_ACCESS_KEY");
+  if (!process.env.R2_BUCKET) missing.push("R2_BUCKET");
+
+  res.json({
+    ok: missing.length === 0,
+    missing,
+    hasEndpointOverride: !!process.env.R2_ENDPOINT,
+    nodeVersion: process.version,
+  });
+});
+
+// 1) Upload a dataUrl -> R2 and return SIGNED url
+app.post("/api/r2/upload-signed", async (req, res) => {
+  try {
+    const { dataUrl, kind = "uploads", customerId = "anon", filename = "" } =
+      req.body || {};
+
+    if (!dataUrl) {
+      return res.status(400).json({ ok: false, error: "MISSING_DATAURL" });
+    }
+
+    const { buffer, contentType, ext } = parseDataUrl(dataUrl);
+
+    const folder = safeFolderName(kind);
+    const cid = String(customerId || "anon");
+    const base = safeName(filename || "upload");
+    const uuid = crypto.randomUUID();
+
+    // ext from dataUrl parser OR content-type guess
+    const extGuess = ext || guessExtFromContentType(contentType);
+    const key = `${folder}/${cid}/${Date.now()}-${uuid}-${base}${
+      extGuess && !base.toLowerCase().endsWith(`.${extGuess}`)
+        ? `.${extGuess}`
+        : ""
+    }`;
+
+    const signedUrl = await r2PutAndSignGet({
+      key,
+      body: buffer,
+      contentType,
+    });
+
+    return res.json({
+      ok: true,
+      key,
+      url: signedUrl, // ✅ always signed
+      contentType,
+      bytes: buffer.length,
+    });
+  } catch (err) {
+    console.error("POST /api/r2/upload-signed error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "UPLOAD_SIGNED_FAILED",
+      message: err?.message || "Unexpected error",
+    });
+  }
+});
+
+// 2) Store a remote URL -> R2 and return SIGNED url
+app.post("/api/r2/store-remote-signed", async (req, res) => {
+  try {
+    const { url, kind = "generations", customerId = "anon" } = req.body || {};
+    if (!url) {
+      return res.status(400).json({ ok: false, error: "MISSING_URL" });
+    }
+
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: "REMOTE_FETCH_FAILED",
+        status: resp.status,
+      });
+    }
+
+    const contentType =
+      resp.headers.get("content-type") || "application/octet-stream";
+
+    const arrayBuf = await resp.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+
+    const folder = safeFolderName(kind);
+    const cid = String(customerId || "anon");
+    const uuid = crypto.randomUUID();
+    const extGuess = guessExtFromContentType(contentType);
+
+    const key = `${folder}/${cid}/${Date.now()}-${uuid}${
+      extGuess ? `.${extGuess}` : ""
+    }`;
+
+    const signedUrl = await r2PutAndSignGet({
+      key,
+      body: buf,
+      contentType,
+    });
+
+    return res.json({
+      ok: true,
+      key,
+      url: signedUrl, // ✅ always signed
+      contentType,
+      size: buf.length,
+      sourceUrl: url,
+    });
+  } catch (err) {
+    console.error("POST /api/r2/store-remote-signed error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "STORE_REMOTE_SIGNED_FAILED",
+      message: err?.message || "Unexpected error",
+    });
   }
 });
 

@@ -538,19 +538,29 @@ app.post("/billing/settings", async (req, res) => {
   }
 });
 // =========================
-// R2 Upload + Store Remote
+// R2 Upload + Store Remote  (SIGNED URL ALWAYS)
 // =========================
 
 app.post("/api/r2/upload", async (req, res) => {
   try {
-    const { dataUrl, kind = "uploads" } = req.body || {};
+    const { dataUrl, kind = "uploads", customerId = "anon", filename = "" } = req.body || {};
+    if (!dataUrl) throw new Error("Missing dataUrl");
+
     const { buffer, contentType, ext } = parseDataUrl(dataUrl);
 
-    const key = makeKey({ kind, ext });
-    await putBufferToR2({ key, buffer, contentType });
+    const cid = String(customerId || "anon");
+    const safeFile = safeName(filename || "upload");
+    const uuid = crypto.randomUUID();
 
-    const url = publicUrlForKey(key);
-    res.json({ ok: true, key, url, contentType, bytes: buffer.length });
+    const key = `${String(kind)}/${cid}/${Date.now()}-${uuid}-${safeFile}.${ext}`;
+
+    const signedUrl = await r2PutAndSignGet({
+      key,
+      body: buffer,
+      contentType,
+    });
+
+    res.json({ ok: true, key, url: signedUrl, contentType, bytes: buffer.length });
   } catch (err) {
     res.status(400).json({ ok: false, error: err?.message || "upload_failed" });
   }
@@ -558,17 +568,48 @@ app.post("/api/r2/upload", async (req, res) => {
 
 app.post("/api/r2/store-remote", async (req, res) => {
   try {
-    const { url, kind = "generations" } = req.body || {};
+    const { url, kind = "generations", customerId = "anon" } = req.body || {};
     if (!url) throw new Error("Missing url");
 
-    const out = await storeRemoteImageToR2({ url, kind });
-    res.json({ ok: true, ...out });
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`Failed to download remote: ${resp.status}`);
+
+    const contentType = resp.headers.get("content-type") || "application/octet-stream";
+    const arrayBuf = await resp.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+
+    const ext =
+      contentType.includes("png") ? "png" :
+      contentType.includes("jpeg") ? "jpg" :
+      contentType.includes("webp") ? "webp" :
+      contentType.includes("gif") ? "gif" :
+      contentType.includes("mp4") ? "mp4" :
+      "bin";
+
+    const cid = String(customerId || "anon");
+    const uuid = crypto.randomUUID();
+
+    const key = `${String(kind)}/${cid}/${Date.now()}-${uuid}.${ext}`;
+
+    const signedUrl = await r2PutAndSignGet({
+      key,
+      body: buf,
+      contentType,
+    });
+
+    res.json({
+      ok: true,
+      key,
+      url: signedUrl,
+      contentType,
+      bytes: buf.length,
+      sourceUrl: url,
+    });
   } catch (err) {
-    res
-      .status(400)
-      .json({ ok: false, error: err?.message || "store_remote_failed" });
+    res.status(400).json({ ok: false, error: err?.message || "store_remote_failed" });
   }
 });
+
 
 // =======================
 // PART 3d – Small helpers

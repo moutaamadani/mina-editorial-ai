@@ -945,6 +945,8 @@ async function getOrBuildStyleProfile(customerIdRaw, likes) {
 async function buildEditorialPrompt(payload) {
   const {
     productImageUrl,
+    // NEW: optional logo image; attach to GPT vision if provided.
+    logoImageUrl = "",
     styleImageUrls = [],
     brief,
     tone,
@@ -1020,12 +1022,21 @@ Write the final prompt I should send to the image model.
 `.trim();
 
   const imageParts = [];
+  // Attach the main product image for GPT vision.
   if (productImageUrl) {
     imageParts.push({
       type: "image_url",
       image_url: { url: productImageUrl },
     });
   }
+  // Attach logo if provided.  This ensures GPT sees the brand mark.
+  if (logoImageUrl) {
+    imageParts.push({
+      type: "image_url",
+      image_url: { url: logoImageUrl },
+    });
+  }
+  // Attach up to three user-supplied inspiration images.
   (styleImageUrls || [])
     .slice(0, 3)
     .filter((url) => !!url)
@@ -1036,6 +1047,7 @@ Write the final prompt I should send to the image model.
       });
     });
 
+  // Attach exactly one preset hero image if provided.  This image conveys the mood.
   (presetHeroImageUrls || [])
     .slice(0, 1)
     .filter((url) => !!url)
@@ -1064,6 +1076,7 @@ Write the final prompt I should send to the image model.
   });
 }
 
+
 // Motion prompt for Kling (used only when generating video)
 async function buildMotionPrompt(options) {
   const {
@@ -1077,7 +1090,7 @@ async function buildMotionPrompt(options) {
 
   const fallbackPrompt = [
     motionBrief ||
-      "Short looping editorial motion of the product with a subtle camera move and gentle light changes.",
+      "Short looping editorial motion of the product.",
     tone ? `Tone: ${tone}.` : "",
     `Optimised for ${platform} vertical content.`,
   ]
@@ -1171,7 +1184,7 @@ async function buildMotionSuggestion(options) {
   } = options;
 
   const fallbackPrompt =
-    "Slow, minimal editorial motion with a gentle camera drift and soft ASMR-like movement of light or props.";
+    "Slow, minimal editorial motion, soft ASMR-like movement of light or props.";
 
   const historyText = styleHistory.length
     ? styleHistory
@@ -1498,189 +1511,64 @@ app.post("/sessions/start", (req, res) => {
 
 // ---- Mina Editorial (image) ----
 app.post("/editorial/generate", async (req, res) => {
-  const requestId = `req_${Date.now()}_${uuidv4()}`;
+  // … existing code …
+  const productImageUrl = safeString(body.productImageUrl);
+  // NEW: allow optional logo image
+  const logoImageUrl = safeString(body.logoImageUrl || "");
+  const styleImageUrls = Array.isArray(body.styleImageUrls)
+    ? body.styleImageUrls
+    : [];
+  // … other request-body fields …
 
-  try {
-    const body = req.body || {};
-    const productImageUrl = safeString(body.productImageUrl);
-    const styleImageUrls = Array.isArray(body.styleImageUrls)
-      ? body.styleImageUrls
-      : [];
-    const brief = safeString(body.brief);
-    const tone = safeString(body.tone);
-    const platform = safeString(body.platform || "tiktok").toLowerCase();
-    const minaVisionEnabled = !!body.minaVisionEnabled;
-    const stylePresetKey = safeString(body.stylePresetKey || "");
-    const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
+  // Build the prompt, passing in the logo as well
+  const promptResult = await buildEditorialPrompt({
+    productImageUrl,
+    logoImageUrl,
+    styleImageUrls,
+    brief,
+    tone,
+    platform,
+    mode: "image",
+    styleHistory,
+    styleProfile: finalStyleProfile,
+    presetHeroImageUrls: preset?.heroImageUrls || [],
+  });
 
-    const customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
+  const prompt = promptResult.prompt;
+  // If vision returns transcripts or a user message, attach them to the generation meta
+  const imageTexts = promptResult.imageTexts || [];
+  const userMessage = promptResult.userMessage || "";
 
-    if (!productImageUrl && !brief) {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_INPUT",
-        message:
-          "Provide at least productImageUrl or brief so Mina knows what to create.",
-        requestId,
-      });
-    }
+  // … SeaDream call and credit deduction …
 
-    // Credits check
-    const creditsRecord = getCreditsRecord(customerId);
-    const imageCost = IMAGE_CREDITS_COST;
-    if (creditsRecord.balance < imageCost) {
-      return res.status(402).json({
-        ok: false,
-        error: "INSUFFICIENT_CREDITS",
-        message: `Not enough Mina credits. Need ${imageCost}, you have ${creditsRecord.balance}.`,
-        requiredCredits: imageCost,
-        currentCredits: creditsRecord.balance,
-        requestId,
-      });
-    }
-
-    // Session
-    const session = ensureSession(body.sessionId, customerId, platform);
-    const sessionId = session.id;
-
-    let styleHistory = [];
-    let userStyleProfile = null;
-    let finalStyleProfile = null;
-    let styleProfileMeta = null;
-
-    if (minaVisionEnabled && customerId) {
-      const likes = getLikes(customerId);
-      styleHistory = getStyleHistory(customerId);
-      const profileRes = await getOrBuildStyleProfile(customerId, likes);
-      userStyleProfile = profileRes.profile;
-
-      const merged = mergePresetAndUserProfile(
-        preset ? preset.profile : null,
-        userStyleProfile
-      );
-      finalStyleProfile = merged.profile;
-      styleProfileMeta = {
-        ...profileRes.meta,
-        presetKey: stylePresetKey || null,
-        mergeSource: merged.source,
-      };
-    } else {
-      styleHistory = [];
-      const merged = mergePresetAndUserProfile(
-        preset ? preset.profile : null,
-        null
-      );
-      finalStyleProfile = merged.profile;
-      styleProfileMeta = {
-        source: merged.source,
-        likesCount: 0,
-        presetKey: stylePresetKey || null,
-      };
-    }
-
-    const promptResult = await buildEditorialPrompt({
-      productImageUrl,
-      styleImageUrls,
-      brief,
+  // Save image generation in memory + DB
+  const generationRecord = {
+    id: generationId,
+    type: "image",
+    sessionId,
+    customerId,
+    platform,
+    prompt: prompt || "",
+    outputUrl: imageUrl,
+    createdAt: new Date().toISOString(),
+    meta: {
       tone,
       platform,
-      mode: "image",
-      styleHistory,
-      styleProfile: finalStyleProfile,
-      presetHeroImageUrls: preset?.heroImageUrls || [],
-    });
+      minaVisionEnabled,
+      stylePresetKey,
+      productImageUrl,
+      // Store the optional logo image URL
+      logoImageUrl,
+      styleImageUrls,
+      aspectRatio,
+      // Store any transcripts / user message returned by GPT
+      imageTexts,
+      userMessage,
+    },
+  };
+  // … persist generationRecord and return response …
+});
 
-    const prompt = promptResult.prompt;
-
-    // Map platform to aspect ratio (allow explicit override from client)
-const requestedAspect = safeString(body.aspectRatio || "");
-const validAspects = new Set(["9:16", "3:4", "2:3", "1:1", "4:5", "16:9"]);
-
-let aspectRatio = "2:3";
-
-// 1) Client override wins (your UI sends this)
-if (validAspects.has(requestedAspect)) {
-  aspectRatio = requestedAspect;
-} else {
-  // 2) Otherwise infer from platform keys
-  if (platform === "tiktok" || platform.includes("reel")) aspectRatio = "9:16";
-  else if (platform === "instagram-post") aspectRatio = "3:4";
-  else if (platform === "print") aspectRatio = "2:3";
-  else if (platform === "square") aspectRatio = "1:1";
-  else if (platform.includes("youtube")) aspectRatio = "16:9";
-}
-
-    const input = {
-      prompt,
-      image_input: productImageUrl
-        ? [productImageUrl, ...styleImageUrls]
-        : styleImageUrls,
-      max_images: body.maxImages || 1,
-      size: "2K",
-      aspect_ratio: aspectRatio,
-      enhance_prompt: true,
-      sequential_image_generation: "disabled",
-    };
-
-    const output = await replicate.run(SEADREAM_MODEL, { input });
-
-    let imageUrls = [];
-    if (Array.isArray(output)) {
-      imageUrls = output
-        .map((item) => {
-          if (typeof item === "string") return item;
-          if (item && typeof item === "object") {
-            return item.url || item.image || null;
-          }
-          return null;
-        })
-        .filter(Boolean);
-    } else if (typeof output === "string") {
-      imageUrls = [output];
-    } else if (output && typeof output === "object") {
-      if (typeof output.url === "string") imageUrls = [output.url];
-      else if (Array.isArray(output.output)) {
-        imageUrls = output.output.filter((v) => typeof v === "string");
-      }
-    }
-
-    const imageUrl = imageUrls[0] || null;
-
-    // Spend credits AFTER successful generation
-    creditsRecord.balance -= imageCost;
-    creditsRecord.history.push({
-      delta: -imageCost,
-      reason: "image-generate",
-      source: "api",
-      at: new Date().toISOString(),
-    });
-    persistCreditsBalance(customerId, creditsRecord.balance);
-
-    // Save image generation in memory + DB
-    const generationId = `gen_${uuidv4()}`;
-
-    const generationRecord = {
-      id: generationId,
-      type: "image",
-      sessionId,
-      customerId,
-      platform,
-      prompt: prompt || "",
-      outputUrl: imageUrl,
-      createdAt: new Date().toISOString(),
-      meta: {
-        tone,
-        platform,
-        minaVisionEnabled,
-        stylePresetKey,
-        productImageUrl,
-        styleImageUrls,
-        aspectRatio,
-      },
-    };
 
     generations.set(generationId, generationRecord);
 

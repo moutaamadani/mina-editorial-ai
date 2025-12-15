@@ -2306,20 +2306,21 @@ app.post("/editorial/generate", async (req, res) => {
       else if (platform.includes("youtube")) aspectRatio = "16:9";
     }
 
+        // Replicate run (SeaDream) — uses runtime config (cfg) loaded earlier in this route
+    const seadreamModel = cfg?.models?.seadream || SEADREAM_MODEL;
+
     const input = {
       prompt,
       image_input: productImageUrl ? [productImageUrl, ...styleImageUrls] : styleImageUrls,
       max_images: body.maxImages || 1,
-      size: "2K",
+      size: cfg?.replicate?.seadream?.size || "2K",
       aspect_ratio: aspectRatio,
-      enhance_prompt: false,
-      sequential_image_generation: "disabled",
+      enhance_prompt: cfg?.replicate?.seadream?.enhance_prompt ?? true,
+      sequential_image_generation: cfg?.replicate?.seadream?.sequential_image_generation || "disabled",
     };
 
-      const cfg = await getRuntimeConfig();
-      const seadreamModel = cfg?.models?.seadream || SEADREAM_MODEL;
-    
-      const output = await replicate.run(seadreamModel, { input });
+    const output = await replicate.run(seadreamModel, { input });
+
 
     let imageUrls = [];
     if (Array.isArray(output)) {

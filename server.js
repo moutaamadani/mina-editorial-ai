@@ -83,6 +83,15 @@ function normalizeSessionUuid(sessionIdRaw) {
   return s;
 }
 
+function isHttpUrl(u) {
+  try {
+    const url = new URL(String(u));
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 // ======================================================
 // R2 setup (Cloudflare R2 = S3 compatible)
 // ======================================================
@@ -1248,10 +1257,18 @@ async function buildMotionSuggestion(options) {
     platform = "tiktok",
     styleHistory = [],
     styleProfile = null,
+
+    // ✅ NEW
+    userDraft = "", // typed text from textarea (optional)
+    extraImageUrls = [], // product/logo/inspiration (optional)
+    presetHeroImageUrls = [], // optional (if you want)
   } = options;
 
+  const cleanedDraft = safeString(userDraft, "").trim();
+
   const fallbackPrompt =
-    "Slow, minimal editorial motion, soft ASMR-like movement of light or props.";
+    cleanedDraft ||
+    "Slow, minimal motion, soft, ASMR movement, satisfying video";
 
   const historyText = styleHistory.length
     ? styleHistory
@@ -1268,16 +1285,19 @@ async function buildMotionSuggestion(options) {
     role: "system",
     content:
       "You are Mina, an editorial motion director for luxury still-life. " +
-      "Given a reference image and style preferences, propose ONE short motion idea the user will see in a textarea. " +
-      "The motion should feel editorial, minimal, ASMR-like: think subtle camera moves, soft breeze, melting, slow drips, gentle shadows.\n\n" +
+      "Given images + style preferences, propose ONE short motion idea the user will see in a textarea.\n\n" +
       "Constraints:\n" +
       "- Return exactly ONE sentence, no bullet points, no quotes.\n" +
       "- Max ~220 characters.\n" +
-      "- Do NOT mention 'TikTok' or 'platform', just describe the motion.",
+      "- Do NOT mention 'TikTok' or 'platform', just describe the motion, in easy english, and clear scene composition.\n\n" +
+      "If the user already wrote a draft, improve it while keeping the same intent.",
   };
 
   const userText = `
 We want a motion idea for an editorial product shot.
+
+User draft (if any):
+${cleanedDraft ? cleanedDraft : "none"}
 
 Tone / feeling: ${safeString(tone, "not specified")}
 Target platform: ${platform}
@@ -1289,11 +1309,32 @@ Style profile:
 Keywords: ${profileKeywords || "none"}
 Description: ${profileDescription}
 
-The attached image is the still to animate. Propose one natural-language motion idea sentence.
+Attached images:
+- The first image is the still frame to animate (most important).
+- Additional images (if present) are product/logo/style references to match the brand vibe.
+
+Task:
+Write one single-sentence motion idea. If a user draft exists, rewrite it tighter and more editorial.
 `.trim();
 
   const imageParts = [];
-  if (referenceImageUrl) imageParts.push({ type: "image_url", image_url: { url: referenceImageUrl } });
+
+  // ✅ main reference still
+  if (referenceImageUrl) {
+    imageParts.push({ type: "image_url", image_url: { url: referenceImageUrl } });
+  }
+
+  // ✅ optional extra images (product/logo/inspiration)
+  (extraImageUrls || [])
+    .filter((u) => isHttpUrl(u))
+    .slice(0, 4)
+    .forEach((url) => imageParts.push({ type: "image_url", image_url: { url } }));
+
+  // ✅ optional preset hero image (if you want it to influence motion too)
+  (presetHeroImageUrls || [])
+    .filter((u) => isHttpUrl(u))
+    .slice(0, 1)
+    .forEach((url) => imageParts.push({ type: "image_url", image_url: { url } }));
 
   const userContent =
     imageParts.length > 0 ? [{ type: "text", text: userText }, ...imageParts] : userText;
@@ -1310,6 +1351,7 @@ The attached image is the still to animate. Propose one natural-language motion 
     gptError: result.gptError,
   };
 }
+
 
 // ======================================================
 // Sessions (in-memory helper only; authoritative data is Supabase)
@@ -2135,6 +2177,18 @@ app.post("/motion/suggest", async (req, res) => {
     const minaVisionEnabled = !!body.minaVisionEnabled;
     const stylePresetKey = safeString(body.stylePresetKey || "");
     const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
+    const userDraft = safeString(body.text || body.motionBrief || body.motionDescription || "");
+    
+    // Optional extra context images (if your frontend sends them)
+    const productImageUrl = safeString(body.productImageUrl || "");
+    const logoImageUrl = safeString(body.logoImageUrl || "");
+    const styleImageUrls = Array.isArray(body.styleImageUrls) ? body.styleImageUrls : [];
+    
+    const extraImageUrls = [
+      productImageUrl,
+      logoImageUrl,
+      ...styleImageUrls,
+    ].map((u) => safeString(u, "")).filter((u) => isHttpUrl(u));
 
     customerId =
       body.customerId !== null && body.customerId !== undefined
@@ -2180,12 +2234,18 @@ app.post("/motion/suggest", async (req, res) => {
     }
 
     const suggestionRes = await buildMotionSuggestion({
-      referenceImageUrl,
-      tone,
-      platform,
-      styleHistory,
-      styleProfile: finalStyleProfile,
+    referenceImageUrl,
+    tone,
+    platform,
+    styleHistory,
+    styleProfile: finalStyleProfile,
+  
+    // ✅ NEW
+    userDraft,
+    extraImageUrls,
+    presetHeroImageUrls: preset?.heroImageUrls || [],
     });
+
 
     const latencyMs = Date.now() - startedAt;
 

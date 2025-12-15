@@ -239,12 +239,12 @@ const DEFAULT_RUNTIME_CONFIG = {
   },
   replicate: {
     seadream: {
-      size: "2K",
+      size: "4K",
       enhance_prompt: true,
       sequential_image_generation: "disabled",
     },
     kling: {
-      mode: "standard",
+      mode: "pro",
       negative_prompt: "",
     },
   },
@@ -473,7 +473,7 @@ const RUNTIME_CONFIG_SCHEMA = [
   { path: "replicate.seadream.enhance_prompt", type: "boolean", description: "SeaDream enhance_prompt flag." },
   { path: "replicate.seadream.sequential_image_generation", type: "string", description: "SeaDream sequential generation mode." },
 
-  { path: "replicate.kling.mode", type: "string", description: "Kling mode (standard, etc.)." },
+  { path: "replicate.kling.mode", type: "string", description: "Kling mode (pro, etc.)." },
   { path: "replicate.kling.negative_prompt", type: "string", description: "Kling negative prompt." },
 
   { path: "gpt.editorial.temperature", type: "number", description: "GPT temperature for editorial prompt writing." },
@@ -2898,7 +2898,7 @@ app.post("/motion/generate", async (req, res) => {
         const klingModel = cfg?.models?.kling || KLING_MODEL;
 
     const input = {
-      mode: cfg?.replicate?.kling?.mode || "standard",
+      mode: cfg?.replicate?.kling?.mode || "pro",
       prompt,
       duration: durationSeconds,
       start_image: lastImageUrl,

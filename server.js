@@ -1,4 +1,4 @@
-//mina-editorial-ai/server.js
+//server.js
 // =======================
 // PART 1 – Imports & setup
 // =======================
@@ -91,52 +91,6 @@ function ensureAdmin(req, res) {
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
-// =======================
-// SUPABASE (admin) setup
-// =======================
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-
-const supabaseAdmin =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-        auth: { persistSession: false, autoRefreshToken: false },
-      })
-    : null;
-
-// =======================
-// SHOPIFY (Admin API) setup
-// =======================
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || ""; // e.g. "faltastudio.myshopify.com"
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
-
-function extractShopifyNumericId(gid = "") {
-  // "gid://shopify/Customer/1234567890" -> "1234567890"
-  const m = String(gid).match(/Customer\/(\d+)/);
-  return m ? m[1] : null;
-}
-
-async function shopifyGraphQL(query, variables) {
-  const url = `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json();
-  if (!resp.ok) {
-    throw new Error(`Shopify error ${resp.status}: ${JSON.stringify(json)}`);
-  }
-  if (json.errors?.length) {
-    throw new Error(`Shopify GQL errors: ${JSON.stringify(json.errors)}`);
-  }
-  return json.data;
-}
 
 
 // Replicate (SeaDream + Kling)
@@ -1521,95 +1475,6 @@ app.get("/admin/customers", async (req, res) => {
   } catch (err) {
     console.error("GET /admin/customers error", err);
     res.status(500).json({ error: "Failed to load admin customers" });
-  }
-});
-// =======================
-// AUTH → Shopify sync (creates/tags customer so they appear in Mina_users segment)
-// =======================
-app.post("/auth/shopify-sync", async (req, res) => {
-  try {
-    const { email, userId } = req.body || {};
-    const cleanEmail = String(email || "").trim().toLowerCase();
-    const cleanUserId = userId ? String(userId) : null;
-
-    if (!cleanEmail) return res.status(400).json({ ok: false, error: "missing_email" });
-    if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN) {
-      return res.status(500).json({ ok: false, error: "shopify_not_configured" });
-    }
-    if (!supabaseAdmin) {
-      return res.status(500).json({ ok: false, error: "supabase_not_configured" });
-    }
-
-    // 1) Find customer by email
-    const findQ = `
-      query FindCustomer($q: String!) {
-        customers(first: 1, query: $q) {
-          edges { node { id email tags } }
-        }
-      }
-    `;
-    const found = await shopifyGraphQL(findQ, { q: `email:${cleanEmail}` });
-    const node = found?.customers?.edges?.[0]?.node || null;
-
-    let customerGid = node?.id || null;
-
-    // 2) Create if missing
-    if (!customerGid) {
-      const createM = `
-        mutation CreateCustomer($input: CustomerInput!) {
-          customerCreate(input: $input) {
-            customer { id email }
-            userErrors { field message }
-          }
-        }
-      `;
-      const created = await shopifyGraphQL(createM, {
-        input: {
-          email: cleanEmail,
-          tags: ["Mina_users"],
-        },
-      });
-
-      const errs = created?.customerCreate?.userErrors || [];
-      if (errs.length) throw new Error(`customerCreate: ${JSON.stringify(errs)}`);
-
-      customerGid = created?.customerCreate?.customer?.id || null;
-    } else {
-      // 3) Ensure tag exists
-      const tagsAddM = `
-        mutation AddTags($id: ID!, $tags: [String!]!) {
-          tagsAdd(id: $id, tags: $tags) {
-            node { id }
-            userErrors { field message }
-          }
-        }
-      `;
-      const tagged = await shopifyGraphQL(tagsAddM, { id: customerGid, tags: ["Mina_users"] });
-      const errs = tagged?.tagsAdd?.userErrors || [];
-      if (errs.length) throw new Error(`tagsAdd: ${JSON.stringify(errs)}`);
-    }
-
-    const shopifyCustomerId = extractShopifyNumericId(customerGid);
-    if (!shopifyCustomerId) throw new Error("Could not extract Shopify customer id");
-
-    // 4) Upsert into Supabase customers table
-    const upsertPayload = {
-      shopify_customer_id: shopifyCustomerId,
-      email: cleanEmail,
-      last_active: new Date().toISOString(),
-      ...(cleanUserId ? { user_id: cleanUserId } : {}),
-    };
-
-    const { error } = await supabaseAdmin
-      .from("customers")
-      .upsert(upsertPayload, { onConflict: "shopify_customer_id" });
-
-    if (error) throw new Error(`Supabase upsert customers failed: ${error.message}`);
-
-    return res.json({ ok: true, shopifyCustomerId });
-  } catch (err) {
-    console.error("POST /auth/shopify-sync error:", err);
-    return res.status(500).json({ ok: false, error: "sync_failed", message: err?.message || String(err) });
   }
 });
 

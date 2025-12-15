@@ -112,6 +112,54 @@ const upload = multer({
 function safeName(name = "file") {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
+// =======================
+// GPT I/O capture helpers (store what we send to OpenAI + what we get back)
+// =======================
+function truncateStr(s, max = 4000) {
+  if (typeof s !== "string") return "";
+  if (s.length <= max) return s;
+  return s.slice(0, max) + `…[truncated ${s.length - max} chars]`;
+}
+
+// userContent is sometimes a string, sometimes an array of {type:"text"} + {type:"image_url"}
+function summarizeUserContent(userContent) {
+  if (typeof userContent === "string") {
+    return { userText: truncateStr(userContent, 6000), imageUrls: [], imagesCount: 0 };
+  }
+
+  const parts = Array.isArray(userContent) ? userContent : [];
+  const texts = [];
+  const imageUrls = [];
+
+  for (const p of parts) {
+    if (!p || typeof p !== "object") continue;
+    if (p.type === "text" && typeof p.text === "string") texts.push(p.text);
+    if (p.type === "image_url" && p.image_url && typeof p.image_url.url === "string") {
+      imageUrls.push(p.image_url.url);
+    }
+  }
+
+  return {
+    userText: truncateStr(texts.join("\n\n"), 6000),
+    imageUrls: imageUrls.slice(0, 8), // keep it small
+    imagesCount: imageUrls.length,
+  };
+}
+
+function makeGptIOInput({ model, systemMessage, userContent, temperature, maxTokens }) {
+  const sys = typeof systemMessage?.content === "string" ? systemMessage.content : "";
+  const { userText, imageUrls, imagesCount } = summarizeUserContent(userContent);
+
+  return {
+    model: model || null,
+    temperature: typeof temperature === "number" ? temperature : null,
+    maxTokens: typeof maxTokens === "number" ? maxTokens : null,
+    system: truncateStr(sys, 6000),
+    userText,
+    imageUrls,
+    imagesCount,
+  };
+}
 
 async function r2PutAndSignGet({ key, body, contentType }) {
   await r2.send(
@@ -784,31 +832,58 @@ function mergePresetAndUserProfile(presetProfile, userProfile) {
   }
 }
 
-async function runChatWithFallback({ systemMessage, userContent, fallbackPrompt }) {
+async function runChatWithFallback({
+  systemMessage,
+  userContent,
+  fallbackPrompt,
+  model = "gpt-4.1-mini",
+  temperature = 0.9,
+  maxTokens = 400,
+}) {
+  const gptIn = makeGptIOInput({ model, systemMessage, userContent, temperature, maxTokens });
+
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model,
       messages: [systemMessage, { role: "user", content: userContent }],
-      temperature: 0.8,
-      max_tokens: 280,
+      temperature,
+      max_tokens: maxTokens,
     });
 
-    const prompt = completion.choices?.[0]?.message?.content?.trim();
-    if (!prompt) throw new Error("Empty GPT response");
+    const text = completion.choices?.[0]?.message?.content?.trim();
+    if (!text) throw new Error("Empty GPT response");
 
-    return { prompt, usedFallback: false, gptError: null };
-  } catch (err) {
-    console.error("OpenAI error, falling back:", err?.status, err?.message);
     return {
-      prompt: fallbackPrompt,
+      prompt: text,
+      usedFallback: false,
+      gptError: null,
+      gptModel: model,
+      gptIO: {
+        in: gptIn,
+        out: { text: truncateStr(text, 8000) },
+      },
+    };
+  } catch (err) {
+    const outText = fallbackPrompt || "";
+    return {
+      prompt: outText,
       usedFallback: true,
       gptError: {
         status: err?.status || null,
         message: err?.message || String(err),
       },
+      gptModel: model,
+      gptIO: {
+        in: gptIn,
+        out: {
+          text: truncateStr(outText, 8000),
+          error: { status: err?.status || null, message: err?.message || String(err) },
+        },
+      },
     };
   }
 }
+
 
 // Build style profile from likes (with vision if images exist)
 async function buildStyleProfileFromLikes(customerId, likes) {
@@ -1038,7 +1113,7 @@ Write the final prompt I should send to the image model.
 Also, after the prompt, output JSON with 'imageTexts' and 'userMessage'.
 `.trim();
 
-  const imageParts = [];
+    const imageParts = [];
   if (productImageUrl) imageParts.push({ type: "image_url", image_url: { url: productImageUrl } });
   if (logoImageUrl) imageParts.push({ type: "image_url", image_url: { url: logoImageUrl } });
 
@@ -1055,47 +1130,45 @@ Also, after the prompt, output JSON with 'imageTexts' and 'userMessage'.
   const userContent =
     imageParts.length > 0 ? [{ type: "text", text: userText }, ...imageParts] : userText;
 
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [systemMessage, { role: "user", content: userContent }],
-      temperature: 0.8,
-      max_tokens: 420,
-    });
+  // ✅ Use the shared helper so we capture GPT input/output
+  const result = await runChatWithFallback({
+    systemMessage,
+    userContent,
+    fallbackPrompt,
+    model: "gpt-4.1-mini",
+    temperature: 0.8,
+    maxTokens: 420,
+  });
 
-    const response = completion.choices?.[0]?.message?.content?.trim() || "";
-    const firstBrace = response.indexOf("{");
-    let prompt = response;
-    let meta = { imageTexts: [], userMessage: "" };
+  const response = (result.prompt || "").trim();
+  const firstBrace = response.indexOf("{");
+  let prompt = response;
+  let meta = { imageTexts: [], userMessage: "" };
 
-    if (firstBrace >= 0) {
-      prompt = response.slice(0, firstBrace).trim();
-      const jsonString = response.slice(firstBrace);
-      try {
-        const parsed = JSON.parse(jsonString);
-        if (Array.isArray(parsed.imageTexts)) meta.imageTexts = parsed.imageTexts;
-        if (typeof parsed.userMessage === "string") meta.userMessage = parsed.userMessage;
-      } catch (_) {}
-    }
-
-    return {
-      prompt,
-      usedFallback: false,
-      gptError: null,
-      imageTexts: meta.imageTexts,
-      userMessage: meta.userMessage,
-    };
-  } catch (err) {
-    console.error("buildEditorialPrompt GPT error:", err?.message);
-    return {
-      prompt: fallbackPrompt,
-      usedFallback: true,
-      gptError: { status: err?.status || null, message: err?.message || String(err) },
-      imageTexts: [],
-      userMessage: "",
-    };
+  if (firstBrace >= 0) {
+    prompt = response.slice(0, firstBrace).trim();
+    const jsonString = response.slice(firstBrace);
+    try {
+      const parsed = JSON.parse(jsonString);
+      if (Array.isArray(parsed.imageTexts)) meta.imageTexts = parsed.imageTexts;
+      if (typeof parsed.userMessage === "string") meta.userMessage = parsed.userMessage;
+    } catch (_) {}
   }
+
+  return {
+    prompt,
+    usedFallback: result.usedFallback,
+    gptError: result.gptError,
+    imageTexts: meta.imageTexts,
+    userMessage: meta.userMessage,
+
+    // ✅ HERE IS THE IMPORTANT PART:
+    gptModel: result.gptModel,
+    gptIO: result.gptIO, // { in: {...}, out: {...} }
+  };
 }
+
+
 
 async function buildMotionPrompt(options) {
   const {

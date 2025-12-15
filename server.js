@@ -198,6 +198,300 @@ function getRequestMeta(req) {
     method: req.method,
   };
 }
+// ======================================================
+// Runtime Config (stored in Supabase, applied live)
+// ======================================================
+
+// ✅ Base GPT system prompts (your current hardcoded text) — used as DEFAULTS
+const BASE_GPT_SYSTEM_EDITORIAL =
+  "You are Mina, an editorial art director for fashion & beauty." +
+  " You will see one product image, an optional logo, and up to several style reference images." +
+  " You write ONE clear prompt for a generative image model." +
+  " Describe subject, environment, lighting, camera, mood, and style." +
+  " Do NOT include line breaks, lists, or bullet points. One paragraph max." +
+  " After the prompt, return JSON with two fields: 'imageTexts' (array of captions for each image uploaded)" +
+  " and 'userMessage' (a friendly remark about one or more of the images).";
+
+const BASE_GPT_SYSTEM_MOTION_PROMPT =
+  "You are Mina, an editorial motion director for fashion & beauty. " +
+  "You will see a reference still frame. " +
+  "You describe a SHORT looping product motion for a generative video model like Kling. " +
+  "Keep it 1–2 sentences, no line breaks.";
+
+const BASE_GPT_SYSTEM_MOTION_SUGGEST =
+  "You are Mina, an editorial motion director for luxury still-life. " +
+  "Given images + style preferences, propose ONE short motion idea the user will see in a textarea.\n\n" +
+  "Constraints:\n" +
+  "- Return exactly ONE sentence, no bullet points, no quotes.\n" +
+  "- Max ~220 characters.\n" +
+  "- Do NOT mention 'TikTok' or 'platform', just describe the motion, in easy english, and clear scene composition.\n\n" +
+  "If the user already wrote a draft, improve it while keeping the same intent.";
+
+const DEFAULT_RUNTIME_CONFIG = {
+  models: {
+    seadream: process.env.SEADREAM_MODEL_VERSION || "bytedance/seedream-4",
+    kling: process.env.KLING_MODEL_VERSION || "kwaivgi/kling-v2.1",
+    gpt: "gpt-4.1-mini",
+  },
+  credits: {
+    imageCost: Number(process.env.IMAGE_CREDITS_COST || 1),
+    motionCost: Number(process.env.MOTION_CREDITS_COST || 5),
+  },
+  replicate: {
+    seadream: {
+      size: "2K",
+      enhance_prompt: true,
+      sequential_image_generation: "disabled",
+    },
+    kling: {
+      mode: "standard",
+      negative_prompt: "",
+    },
+  },
+  gpt: {
+    editorial: {
+      temperature: 0.8,
+      max_tokens: 420,
+
+      // ✅ You will SEE this text in dashboard (default = your hardcoded prompt)
+      system_text: BASE_GPT_SYSTEM_EDITORIAL,
+
+      // ✅ safe extra text appended to the user message (optional)
+      user_extra: "",
+    },
+    motion_prompt: {
+      temperature: 0.8,
+      max_tokens: 280,
+      system_text: BASE_GPT_SYSTEM_MOTION_PROMPT,
+      user_extra: "",
+    },
+    motion_suggest: {
+      temperature: 0.8,
+      max_tokens: 260,
+      system_text: BASE_GPT_SYSTEM_MOTION_SUGGEST,
+      user_extra: "",
+    },
+  },
+};
+
+// Simple deep merge (no deps)
+function deepMerge(base, override) {
+  if (!override || typeof override !== "object") return base;
+  const out = Array.isArray(base) ? [...base] : { ...(base || {}) };
+
+  for (const [k, v] of Object.entries(override)) {
+    if (
+      v &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      base &&
+      typeof base[k] === "object" &&
+      !Array.isArray(base[k])
+    ) {
+      out[k] = deepMerge(base[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+// setDeep(obj, "a.b.c", value)
+function setDeep(obj, path, value) {
+  const parts = String(path || "").split(".").filter(Boolean);
+  if (!parts.length) return obj;
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (!cur[p] || typeof cur[p] !== "object") cur[p] = {};
+    cur = cur[p];
+  }
+  cur[parts[parts.length - 1]] = value;
+  return obj;
+}
+
+// unsetDeep(obj, "a.b.c")  -> deletes that key from the override object
+function unsetDeep(obj, path) {
+  const parts = String(path || "").split(".").filter(Boolean);
+  if (!parts.length) return obj;
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (!cur[p] || typeof cur[p] !== "object") return obj;
+    cur = cur[p];
+  }
+  const last = parts[parts.length - 1];
+  if (cur && typeof cur === "object") delete cur[last];
+  return obj;
+}
+
+// Optional: guardrails so dashboard can’t break prod easily
+function normalizeRuntimeConfig(cfg) {
+  const safe = deepMerge(DEFAULT_RUNTIME_CONFIG, cfg || {});
+
+  const clamp = (n, a, b, fallback) =>
+    Number.isFinite(Number(n)) ? Math.max(a, Math.min(b, Number(n))) : fallback;
+
+  safe.credits.imageCost = clamp(
+    safe.credits.imageCost,
+    0,
+    100,
+    DEFAULT_RUNTIME_CONFIG.credits.imageCost
+  );
+  safe.credits.motionCost = clamp(
+    safe.credits.motionCost,
+    0,
+    100,
+    DEFAULT_RUNTIME_CONFIG.credits.motionCost
+  );
+
+  safe.gpt.editorial.temperature = clamp(
+    safe.gpt.editorial.temperature,
+    0,
+    2,
+    DEFAULT_RUNTIME_CONFIG.gpt.editorial.temperature
+  );
+  safe.gpt.motion_prompt.temperature = clamp(
+    safe.gpt.motion_prompt.temperature,
+    0,
+    2,
+    DEFAULT_RUNTIME_CONFIG.gpt.motion_prompt.temperature
+  );
+  safe.gpt.motion_suggest.temperature = clamp(
+    safe.gpt.motion_suggest.temperature,
+    0,
+    2,
+    DEFAULT_RUNTIME_CONFIG.gpt.motion_suggest.temperature
+  );
+
+  safe.gpt.editorial.max_tokens = clamp(
+    safe.gpt.editorial.max_tokens,
+    50,
+    2000,
+    DEFAULT_RUNTIME_CONFIG.gpt.editorial.max_tokens
+  );
+  safe.gpt.motion_prompt.max_tokens = clamp(
+    safe.gpt.motion_prompt.max_tokens,
+    50,
+    2000,
+    DEFAULT_RUNTIME_CONFIG.gpt.motion_prompt.max_tokens
+  );
+  safe.gpt.motion_suggest.max_tokens = clamp(
+    safe.gpt.motion_suggest.max_tokens,
+    50,
+    2000,
+    DEFAULT_RUNTIME_CONFIG.gpt.motion_suggest.max_tokens
+  );
+
+  // ensure strings
+  safe.gpt.editorial.system_text = safeString(
+    safe.gpt.editorial.system_text,
+    BASE_GPT_SYSTEM_EDITORIAL
+  );
+  safe.gpt.editorial.user_extra = safeString(safe.gpt.editorial.user_extra, "");
+
+  safe.gpt.motion_prompt.system_text = safeString(
+    safe.gpt.motion_prompt.system_text,
+    BASE_GPT_SYSTEM_MOTION_PROMPT
+  );
+  safe.gpt.motion_prompt.user_extra = safeString(safe.gpt.motion_prompt.user_extra, "");
+
+  safe.gpt.motion_suggest.system_text = safeString(
+    safe.gpt.motion_suggest.system_text,
+    BASE_GPT_SYSTEM_MOTION_SUGGEST
+  );
+  safe.gpt.motion_suggest.user_extra = safeString(safe.gpt.motion_suggest.user_extra, "");
+
+  return safe;
+}
+
+async function sbGetRuntimeOverride() {
+  if (!supabaseAdmin) return null;
+  const { data, error } = await supabaseAdmin
+    .from("app_config")
+    .select("value,updated_at,updated_by")
+    .eq("key", "runtime")
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function sbSetRuntimeOverride(nextOverride, updatedBy = null) {
+  if (!supabaseAdmin) throw new Error("Supabase not configured");
+  const payload = {
+    key: "runtime",
+    value: nextOverride || {},
+    updated_at: nowIso(),
+    updated_by: updatedBy ? String(updatedBy) : null,
+  };
+  const { error } = await supabaseAdmin
+    .from("app_config")
+    .upsert(payload, { onConflict: "key" });
+  if (error) throw error;
+}
+
+// In-memory cache so we don’t hit DB every request
+const runtimeConfigCache = {
+  effective: normalizeRuntimeConfig(null),
+  override: {},
+  updatedAt: null,
+  fetchedAt: 0,
+};
+
+const RUNTIME_CONFIG_TTL_MS = Number(process.env.RUNTIME_CONFIG_TTL_MS || 5000);
+
+async function getRuntimeConfig() {
+  if (!sbEnabled()) return runtimeConfigCache.effective;
+
+  const now = Date.now();
+  if (now - runtimeConfigCache.fetchedAt < RUNTIME_CONFIG_TTL_MS) {
+    return runtimeConfigCache.effective;
+  }
+
+  const row = await sbGetRuntimeOverride();
+  const override = row?.value && typeof row.value === "object" ? row.value : {};
+  const effective = normalizeRuntimeConfig(override);
+
+  runtimeConfigCache.effective = effective;
+  runtimeConfigCache.override = override;
+  runtimeConfigCache.updatedAt = row?.updated_at || null;
+  runtimeConfigCache.fetchedAt = now;
+
+  return effective;
+}
+
+// For dashboard “what does this field do?”
+const RUNTIME_CONFIG_SCHEMA = [
+  { path: "models.seadream", type: "string", description: "Replicate model/version for image generation (SeaDream)." },
+  { path: "models.kling", type: "string", description: "Replicate model/version for video generation (Kling)." },
+  { path: "models.gpt", type: "string", description: "OpenAI model used for prompt writing & suggestion." },
+
+  { path: "credits.imageCost", type: "number", description: "Credits spent per image generation." },
+  { path: "credits.motionCost", type: "number", description: "Credits spent per motion generation." },
+
+  { path: "replicate.seadream.size", type: "string", description: "SeaDream output size (ex: 2K)." },
+  { path: "replicate.seadream.enhance_prompt", type: "boolean", description: "SeaDream enhance_prompt flag." },
+  { path: "replicate.seadream.sequential_image_generation", type: "string", description: "SeaDream sequential generation mode." },
+
+  { path: "replicate.kling.mode", type: "string", description: "Kling mode (standard, etc.)." },
+  { path: "replicate.kling.negative_prompt", type: "string", description: "Kling negative prompt." },
+
+  { path: "gpt.editorial.temperature", type: "number", description: "GPT temperature for editorial prompt writing." },
+  { path: "gpt.editorial.max_tokens", type: "number", description: "GPT max_tokens for editorial prompt writing." },
+  { path: "gpt.editorial.system_text", type: "string", description: "FULL system prompt for editorial (editable in admin)." },
+  { path: "gpt.editorial.user_extra", type: "string", description: "Extra text appended to editorial user instructions." },
+
+  { path: "gpt.motion_prompt.temperature", type: "number", description: "GPT temperature for motion prompt writing." },
+  { path: "gpt.motion_prompt.max_tokens", type: "number", description: "GPT max_tokens for motion prompt writing." },
+  { path: "gpt.motion_prompt.system_text", type: "string", description: "FULL system prompt for motion prompt (editable in admin)." },
+  { path: "gpt.motion_prompt.user_extra", type: "string", description: "Extra text appended to motion prompt user instructions." },
+
+  { path: "gpt.motion_suggest.temperature", type: "number", description: "GPT temperature for motion suggestion (textarea)." },
+  { path: "gpt.motion_suggest.max_tokens", type: "number", description: "GPT max_tokens for motion suggestion (textarea)." },
+  { path: "gpt.motion_suggest.system_text", type: "string", description: "FULL system prompt for motion suggest (editable in admin)." },
+  { path: "gpt.motion_suggest.user_extra", type: "string", description: "Extra text appended to motion suggest user instructions." },
+];
+
 
 // ======================================================
 // Admin audit helpers (kept as-is)
@@ -1051,6 +1345,9 @@ async function getOrBuildStyleProfile(customerIdRaw, likes) {
 // Prompt builders (kept from your version)
 // ======================================================
 async function buildEditorialPrompt(payload) {
+  const cfg = await getRuntimeConfig();
+  const g = cfg?.gpt?.editorial || {};
+
   const {
     productImageUrl,
     logoImageUrl = "",
@@ -1084,19 +1381,13 @@ async function buildEditorialPrompt(payload) {
   const profileKeywords =
     styleProfile && Array.isArray(styleProfile.keywords) ? styleProfile.keywords.join(", ") : "";
 
+  // ✅ system prompt comes from runtime config (default = your current hardcoded)
   const systemMessage = {
     role: "system",
-    content:
-      "You are Mina, an editorial art director for fashion & beauty." +
-      " You will see one product image, an optional logo, and up to several style reference images." +
-      " You write ONE clear prompt for a generative image model." +
-      " Describe subject, environment, lighting, camera, mood, and style." +
-      " Do NOT include line breaks, lists, or bullet points. One paragraph max." +
-      " After the prompt, return JSON with two fields: 'imageTexts' (array of captions for each image uploaded)" +
-      " and 'userMessage' (a friendly remark about one or more of the images).",
+    content: safeString(g.system_text, BASE_GPT_SYSTEM_EDITORIAL),
   };
 
-  const userText = `
+  const baseUserText = `
 You are creating a new ${mode} for Mina.
 
 Current request brief:
@@ -1122,7 +1413,10 @@ Write the final prompt I should send to the image model.
 Also, after the prompt, output JSON with 'imageTexts' and 'userMessage'.
 `.trim();
 
-    const imageParts = [];
+  // ✅ safe extra text you can edit in admin
+  const userText = g.user_extra ? `${baseUserText}\n\nExtra instructions:\n${g.user_extra}` : baseUserText;
+
+  const imageParts = [];
   if (productImageUrl) imageParts.push({ type: "image_url", image_url: { url: productImageUrl } });
   if (logoImageUrl) imageParts.push({ type: "image_url", image_url: { url: logoImageUrl } });
 
@@ -1139,14 +1433,13 @@ Also, after the prompt, output JSON with 'imageTexts' and 'userMessage'.
   const userContent =
     imageParts.length > 0 ? [{ type: "text", text: userText }, ...imageParts] : userText;
 
-  // ✅ Use the shared helper so we capture GPT input/output
   const result = await runChatWithFallback({
     systemMessage,
     userContent,
     fallbackPrompt,
-    model: "gpt-4.1-mini",
-    temperature: 0.8,
-    maxTokens: 420,
+    model: cfg?.models?.gpt || "gpt-4.1-mini",
+    temperature: typeof g.temperature === "number" ? g.temperature : 0.8,
+    maxTokens: Number.isFinite(g.max_tokens) ? g.max_tokens : 420,
   });
 
   const response = (result.prompt || "").trim();
@@ -1170,16 +1463,16 @@ Also, after the prompt, output JSON with 'imageTexts' and 'userMessage'.
     gptError: result.gptError,
     imageTexts: meta.imageTexts,
     userMessage: meta.userMessage,
-
-    // ✅ HERE IS THE IMPORTANT PART:
     gptModel: result.gptModel,
-    gptIO: result.gptIO, // { in: {...}, out: {...} }
+    gptIO: result.gptIO,
   };
 }
 
 
-
 async function buildMotionPrompt(options) {
+  const cfg = await getRuntimeConfig();
+  const g = cfg?.gpt?.motion_prompt || {};
+
   const {
     motionBrief,
     tone,
@@ -1210,14 +1503,10 @@ async function buildMotionPrompt(options) {
 
   const systemMessage = {
     role: "system",
-    content:
-      "You are Mina, an editorial motion director for fashion & beauty. " +
-      "You will see a reference still frame. " +
-      "You describe a SHORT looping product motion for a generative video model like Kling. " +
-      "Keep it 1–2 sentences, no line breaks.",
+    content: safeString(g.system_text, BASE_GPT_SYSTEM_MOTION_PROMPT),
   };
 
-  const userText = `
+  const baseUserText = `
 You are creating a short motion loop based on the attached still frame.
 
 Desired motion description from the user:
@@ -1233,9 +1522,11 @@ Combined style profile (from presets and/or user-liked generations):
 Keywords: ${profileKeywords || "none"}
 Description: ${profileDescription}
 
-The attached image is the reference frame to animate. Do NOT mention URLs. 
+The attached image is the reference frame to animate. Do NOT mention URLs.
 Write the final video generation prompt.
 `.trim();
+
+  const userText = g.user_extra ? `${baseUserText}\n\nExtra instructions:\n${g.user_extra}` : baseUserText;
 
   const imageParts = [];
   if (lastImageUrl) imageParts.push({ type: "image_url", image_url: { url: lastImageUrl } });
@@ -1247,28 +1538,32 @@ Write the final video generation prompt.
     systemMessage,
     userContent,
     fallbackPrompt,
+    model: cfg?.models?.gpt || "gpt-4.1-mini",
+    temperature: typeof g.temperature === "number" ? g.temperature : 0.8,
+    maxTokens: Number.isFinite(g.max_tokens) ? g.max_tokens : 280,
   });
 }
 
+
 async function buildMotionSuggestion(options) {
+  const cfg = await getRuntimeConfig();
+  const g = cfg?.gpt?.motion_suggest || {};
+
   const {
     referenceImageUrl,
     tone,
     platform = "tiktok",
     styleHistory = [],
     styleProfile = null,
-
-    // ✅ NEW
-    userDraft = "", // typed text from textarea (optional)
-    extraImageUrls = [], // product/logo/inspiration (optional)
-    presetHeroImageUrls = [], // optional (if you want)
+    userDraft = "",
+    extraImageUrls = [],
+    presetHeroImageUrls = [],
   } = options;
 
   const cleanedDraft = safeString(userDraft, "").trim();
 
   const fallbackPrompt =
-    cleanedDraft ||
-    "Slow, minimal motion, soft, ASMR movement, satisfying video";
+    cleanedDraft || "Slow, minimal motion, soft, ASMR movement, satisfying video";
 
   const historyText = styleHistory.length
     ? styleHistory
@@ -1283,17 +1578,10 @@ async function buildMotionSuggestion(options) {
 
   const systemMessage = {
     role: "system",
-    content:
-      "You are Mina, an editorial motion director for luxury still-life. " +
-      "Given images + style preferences, propose ONE short motion idea the user will see in a textarea.\n\n" +
-      "Constraints:\n" +
-      "- Return exactly ONE sentence, no bullet points, no quotes.\n" +
-      "- Max ~220 characters.\n" +
-      "- Do NOT mention 'TikTok' or 'platform', just describe the motion, in easy english, and clear scene composition.\n\n" +
-      "If the user already wrote a draft, improve it while keeping the same intent.",
+    content: safeString(g.system_text, BASE_GPT_SYSTEM_MOTION_SUGGEST),
   };
 
-  const userText = `
+  const baseUserText = `
 We want a motion idea for an editorial product shot.
 
 User draft (if any):
@@ -1317,20 +1605,19 @@ Task:
 Write one single-sentence motion idea. If a user draft exists, rewrite it tighter and more editorial.
 `.trim();
 
+  const userText = g.user_extra ? `${baseUserText}\n\nExtra instructions:\n${g.user_extra}` : baseUserText;
+
   const imageParts = [];
 
-  // ✅ main reference still
   if (referenceImageUrl) {
     imageParts.push({ type: "image_url", image_url: { url: referenceImageUrl } });
   }
 
-  // ✅ optional extra images (product/logo/inspiration)
   (extraImageUrls || [])
     .filter((u) => isHttpUrl(u))
     .slice(0, 4)
     .forEach((url) => imageParts.push({ type: "image_url", image_url: { url } }));
 
-  // ✅ optional preset hero image (if you want it to influence motion too)
   (presetHeroImageUrls || [])
     .filter((u) => isHttpUrl(u))
     .slice(0, 1)
@@ -1343,6 +1630,9 @@ Write one single-sentence motion idea. If a user draft exists, rewrite it tighte
     systemMessage,
     userContent,
     fallbackPrompt,
+    model: cfg?.models?.gpt || "gpt-4.1-mini",
+    temperature: typeof g.temperature === "number" ? g.temperature : 0.8,
+    maxTokens: Number.isFinite(g.max_tokens) ? g.max_tokens : 260,
   });
 
   return {
@@ -1351,6 +1641,7 @@ Write one single-sentence motion idea. If a user draft exists, rewrite it tighte
     gptError: result.gptError,
   };
 }
+
 
 
 // ======================================================
@@ -1700,6 +1991,87 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to adjust credits" });
   }
 });
+// =======================
+// Admin: Runtime Config (live)
+// =======================
+app.get("/admin/config/runtime", requireAdmin, async (_req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(503).json({ error: "Supabase not available" });
+
+    const effective = await getRuntimeConfig();
+    const row = await sbGetRuntimeOverride();
+
+    res.json({
+      ok: true,
+      defaults: DEFAULT_RUNTIME_CONFIG,
+      override: row?.value || {},
+      effective,
+      meta: {
+        updatedAt: row?.updated_at || null,
+        updatedBy: row?.updated_by || null,
+        ttlMs: RUNTIME_CONFIG_TTL_MS,
+      },
+      schema: RUNTIME_CONFIG_SCHEMA,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "CONFIG_READ_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// Replace the whole override JSON
+app.post("/admin/config/runtime", requireAdmin, async (req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(503).json({ error: "Supabase not available" });
+
+    const { override } = req.body || {};
+    if (!override || typeof override !== "object") {
+      return res.status(400).json({ ok: false, error: "INVALID_OVERRIDE", message: "override must be a JSON object" });
+    }
+
+    await sbSetRuntimeOverride(override, req.user?.email || req.user?.userId || "admin");
+
+    // refresh cache immediately
+    runtimeConfigCache.fetchedAt = 0;
+    const effective = await getRuntimeConfig();
+
+    res.json({ ok: true, effective });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "CONFIG_SAVE_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// Set one field by path: { path: "gpt.editorial.temperature", value: 0.6 }
+// Unset one field (delete from override) so it falls back to DEFAULT
+app.post("/admin/config/runtime/unset", requireAdmin, async (req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(503).json({ error: "Supabase not available" });
+
+    const { path } = req.body || {};
+    const p = safeString(path);
+    if (!p) return res.status(400).json({ ok: false, error: "MISSING_PATH" });
+
+    const row = await sbGetRuntimeOverride();
+    const current = (row?.value && typeof row.value === "object") ? row.value : {};
+    const next = unsetDeep({ ...current }, p);
+
+    await sbSetRuntimeOverride(next, req.user?.email || req.user?.userId || "admin");
+
+    runtimeConfigCache.fetchedAt = 0;
+    const effective = await getRuntimeConfig();
+
+    res.json({ ok: true, override: next, effective });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "CONFIG_UNSET_FAILED", message: e?.message || String(e) });
+  }
+});
+
+
+// Force reload (optional button in dashboard)
+app.post("/admin/config/runtime/reload", requireAdmin, async (_req, res) => {
+  runtimeConfigCache.fetchedAt = 0;
+  const effective = await getRuntimeConfig();
+  res.json({ ok: true, effective });
+});
 
 // =======================
 // Session start (Supabase-only)
@@ -1820,7 +2192,8 @@ app.post("/editorial/generate", async (req, res) => {
     });
 
     // Credits check (Supabase)
-    const imageCost = IMAGE_CREDITS_COST;
+    const cfg = await getRuntimeConfig();
+    const imageCost = Number(cfg?.credits?.imageCost ?? IMAGE_CREDITS_COST);
     const creditsInfo = await sbGetCredits({
       customerId,
       reqUserId: req?.user?.userId,
@@ -1939,11 +2312,14 @@ app.post("/editorial/generate", async (req, res) => {
       max_images: body.maxImages || 1,
       size: "2K",
       aspect_ratio: aspectRatio,
-      enhance_prompt: true,
+      enhance_prompt: false,
       sequential_image_generation: "disabled",
     };
 
-    const output = await replicate.run(SEADREAM_MODEL, { input });
+      const cfg = await getRuntimeConfig();
+      const seadreamModel = cfg?.models?.seadream || SEADREAM_MODEL;
+    
+      const output = await replicate.run(seadreamModel, { input });
 
     let imageUrls = [];
     if (Array.isArray(output)) {
@@ -2421,7 +2797,9 @@ app.post("/motion/generate", async (req, res) => {
     });
 
     // Credits check (Supabase)
-    const motionCost = MOTION_CREDITS_COST;
+    // Credits check (Supabase)
+    const cfg = await getRuntimeConfig();
+    const motionCost = Number(cfg?.credits?.motionCost ?? MOTION_CREDITS_COST);
     const creditsInfo = await sbGetCredits({
       customerId,
       reqUserId: req?.user?.userId,
@@ -2516,15 +2894,18 @@ app.post("/motion/generate", async (req, res) => {
       generation_id: generationId,
     });
 
+        const klingModel = cfg?.models?.kling || KLING_MODEL;
+
     const input = {
-      mode: "standard",
+      mode: cfg?.replicate?.kling?.mode || "standard",
       prompt,
       duration: durationSeconds,
       start_image: lastImageUrl,
-      negative_prompt: "",
+      negative_prompt: cfg?.replicate?.kling?.negative_prompt || "",
     };
 
-    const output = await replicate.run(KLING_MODEL, { input });
+    const output = await replicate.run(klingModel, { input });
+
 
     let videoUrl = null;
     if (typeof output === "string") {

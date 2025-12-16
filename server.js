@@ -12,10 +12,18 @@ import crypto from "node:crypto";
 import multer from "multer";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createClient } from "@supabase/supabase-js";
+import {
+  megaEnsureCustomer,
+  megaWriteSessionEvent,
+  megaWriteGenerationEvent,
+  megaWriteFeedbackEvent,
+  megaWriteCreditTxnEvent,
+  megaParityCounts,
+} from "./mega-db.js";
 
 import { parseDataUrl } from "./r2.js";
 
-import { logAdminAction, upsertGenerationRow, upsertSessionRow } from "./supabase.js";
+import { logAdminAction } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
 
 const app = express();
@@ -206,20 +214,82 @@ function r2PublicUrlForKeyLocal(key) {
   return "";
 }
 
-function isOurAssetUrl(u) {
+function hasAwsSignatureParams(urlObj) {
+  for (const [k] of urlObj.searchParams.entries()) {
+    const key = String(k || "").toLowerCase();
+    if (key.startsWith("x-amz-") || key.includes("signature") || key.includes("expires")) return true;
+  }
+  return false;
+}
+
+// Extract the object key from R2 URLs (bucket subdomain or path-style)
+function extractR2KeyFromUrl(u) {
   try {
     const url = new URL(String(u));
     const host = url.hostname.toLowerCase();
+    let path = url.pathname || "";
+    if (path.startsWith("/")) path = path.slice(1);
 
-    if (R2_PUBLIC_BASE_URL) {
-      const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
-      if (host === baseHost) return true;
+    // If path style: /<bucket>/<key>
+    if (R2_BUCKET) {
+      const first = path.split("/")[0];
+      if (first === R2_BUCKET) {
+        path = path.split("/").slice(1).join("/");
+      }
     }
 
-    if (host.endsWith("r2.cloudflarestorage.com")) return true;
-    return false;
+    // If bucket subdomain: <bucket>.<account>.r2.cloudflarestorage.com/<key>
+    // then pathname is already the key
+    if (host.endsWith("r2.cloudflarestorage.com")) {
+      return path || "";
+    }
+
+    // If already on custom public domain: /<key>
+    if (R2_PUBLIC_BASE_URL) {
+      const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
+      if (host === baseHost) return path || "";
+    }
+
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+// ✅ True only if URL is already PERMANENT public (your custom domain, and not signed)
+function isPermanentPublicAssetUrl(u) {
+  try {
+    const url = new URL(String(u));
+    if (!R2_PUBLIC_BASE_URL) return false;
+    const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
+    if (url.hostname.toLowerCase() !== baseHost) return false;
+    if (hasAwsSignatureParams(url)) return false;
+    return true;
   } catch {
     return false;
+  }
+}
+
+// ✅ Convert signed R2 URLs -> permanent public URL when possible
+function toPermanentPublicAssetUrl(u) {
+  try {
+    if (!R2_PUBLIC_BASE_URL) return "";
+    const url = new URL(String(u));
+
+    // Already permanent
+    if (isPermanentPublicAssetUrl(u)) return String(u);
+
+    // If it's R2 but signed, build the public URL from the key
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith("r2.cloudflarestorage.com") || hasAwsSignatureParams(url)) {
+      const key = extractR2KeyFromUrl(u);
+      if (!key) return "";
+      return `${R2_PUBLIC_BASE_URL}/${encodeKeyForUrl(key)}`;
+    }
+
+    return "";
+  } catch {
+    return "";
   }
 }
 
@@ -713,117 +783,60 @@ function auditAiEvent(req, action, status, detail = {}) {
 
 function persistSessionHash(req, token, userId, email) {
   if (!token) return;
-  const meta = req ? getRequestMeta(req) : {};
-  void upsertSessionRow({
-    userId,
-    email,
-    token,
-    ip: meta.ip,
-    userAgent: meta.userAgent,
-  });
 }
 
 // ======================================================
 // Supabase business persistence helpers
 // ======================================================
 
-// Create customer row on first contact (+ optional welcome credits txn)
-const DEFAULT_FREE_CREDITS = Number(process.env.DEFAULT_FREE_CREDITS || 50);
-
-async function sbGetCustomer(customerId) {
-  if (!supabaseAdmin) return null;
-  const id = safeShopifyId(customerId);
-
-  const { data, error } = await supabaseAdmin
-    .from("customers")
-    .select("shopify_customer_id,user_id,email,credits,expires_at,last_active,disabled,created_at,updated_at,meta")
-    .eq("shopify_customer_id", id)
-    .maybeSingle();
-
-  if (error) throw error;
-  return data || null;
-}
-
 async function sbInsertCreditTxn({ customerId, delta, reason, source, refType = null, refId = null }) {
-  if (!supabaseAdmin) return;
+  if (!supabaseAdmin) return { balance: null, passId: null };
 
-  const txn = {
-    id: crypto.randomUUID(), // uuid column
-    shopify_customer_id: safeShopifyId(customerId),
-    delta: Number(delta || 0),
-    reason: String(reason || "adjustment"),
-    source: String(source || "api"),
-    ref_type: refType ? String(refType) : null,
-    ref_id: refId ? String(refId) : null,
-    created_at: nowIso(),
-  };
+  const { passId, credits = 0, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
+    customerId,
+    userId: null,
+    email: null,
+    legacyCredits: null,
+  });
 
-  const { error } = await supabaseAdmin.from("credit_transactions").insert(txn);
-  if (error) throw error;
+  const nextBalance = credits + Number(delta || 0);
+
+  await megaWriteCreditTxnEvent(supabaseAdmin, {
+    customerId: shopifyCustomerId || customerId,
+    id: crypto.randomUUID(),
+    delta,
+    reason,
+    source,
+    refType,
+    refId,
+    createdAt: nowIso(),
+    nextBalance,
+  });
+
+  return { balance: nextBalance, passId };
 }
 
 async function sbEnsureCustomer({ customerId, userId, email }) {
   if (!supabaseAdmin) return null;
 
   const id = safeShopifyId(customerId);
-  let row = await sbGetCustomer(id);
+  const { passId, credits = 0, shopifyCustomerId, meta } = await megaEnsureCustomer(supabaseAdmin, {
+    customerId: id,
+    userId: userId || null,
+    email: email || null,
+    legacyCredits: null,
+  });
 
-  if (!row) {
-    const ts = nowIso();
-    const startingCredits = DEFAULT_FREE_CREDITS > 0 ? DEFAULT_FREE_CREDITS : 0;
-
-    const payload = {
-      shopify_customer_id: id,
-      user_id: userId || null,
-      email: email || null,
-      credits: startingCredits,
-      last_active: ts,
-      created_at: ts,
-      updated_at: ts,
-      meta: {},
-      disabled: false,
-    };
-
-    const { data, error } = await supabaseAdmin
-      .from("customers")
-      .insert(payload)
-      .select("shopify_customer_id,user_id,email,credits,expires_at,last_active,disabled,created_at,updated_at,meta")
-      .single();
-
-    if (error) throw error;
-    row = data;
-
-    // Insert welcome transaction (mirrors old behavior)
-    if (startingCredits > 0) {
-      try {
-        await sbInsertCreditTxn({
-          customerId: id,
-          delta: startingCredits,
-          reason: "auto-welcome",
-          source: "system",
-          refType: "welcome",
-          refId: null,
-        });
-      } catch (e) {
-        // Don’t break customer creation on txn failure
-        console.error("[supabase] welcome txn insert failed:", e?.message || e);
-      }
-    }
-  } else {
-    // touch last_active / attach email/user_id if newly known
-    const updates = { last_active: nowIso(), updated_at: nowIso() };
-    if (userId && !row.user_id) updates.user_id = userId;
-    if (email && !row.email) updates.email = email;
-
-    const { error } = await supabaseAdmin.from("customers").update(updates).eq("shopify_customer_id", id);
-    if (error) throw error;
-  }
-
-  return row;
+  return {
+    shopify_customer_id: shopifyCustomerId || id,
+    credits,
+    meta: meta || {},
+    passId: passId || null,
+  };
 }
 
 async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
-  if (!supabaseAdmin) return { balance: null, historyLength: null, source: "no-sb" };
+  if (!supabaseAdmin) return { balance: null, historyLength: null, source: "no-sb", passId: null };
 
   const cust = await sbEnsureCustomer({
     customerId,
@@ -831,22 +844,23 @@ async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
     email: reqEmail || null,
   });
 
-  // count txns
   const { count, error: countErr } = await supabaseAdmin
-    .from("credit_transactions")
-    .select("id", { count: "exact", head: true })
-    .eq("shopify_customer_id", cust.shopify_customer_id);
+    .from("mega_generations")
+    .select("mg_id", { count: "exact", head: true })
+    .eq("mg_record_type", "credit_transaction")
+    .eq("mg_shopify_customer_id", cust.shopify_customer_id);
 
   return {
     balance: cust.credits ?? 0,
     historyLength: countErr ? null : (count ?? 0),
-    source: "supabase",
+    source: "mega",
+    passId: cust?.passId || null,
   };
 }
 
 // WARNING: not fully atomic under concurrency (fine for low traffic)
 async function sbAdjustCredits({ customerId, delta, reason, source, refType, refId, reqUserId, reqEmail }) {
-  if (!supabaseAdmin) return { ok: false, balance: null, source: "no-sb" };
+  if (!supabaseAdmin) return { ok: false, balance: null, source: "no-sb", passId: null };
 
   const cust = await sbEnsureCustomer({
     customerId,
@@ -855,33 +869,27 @@ async function sbAdjustCredits({ customerId, delta, reason, source, refType, ref
   });
 
   const nextBalance = (cust.credits ?? 0) + Number(delta || 0);
-  const updates = {
-    credits: nextBalance,
-    last_active: nowIso(),
-    updated_at: nowIso(),
-  };
 
-  if (reqUserId) updates.user_id = reqUserId;
-  if (reqEmail) updates.email = reqEmail;
-
-  const { error } = await supabaseAdmin.from("customers").update(updates).eq("shopify_customer_id", cust.shopify_customer_id);
-  if (error) throw error;
-
-  // Insert transaction (best effort)
   try {
-    await sbInsertCreditTxn({
+    await megaWriteCreditTxnEvent(supabaseAdmin, {
       customerId: cust.shopify_customer_id,
+      userId: reqUserId || null,
+      email: reqEmail || null,
+      id: refId || crypto.randomUUID(),
       delta,
       reason,
       source,
       refType,
       refId,
+      createdAt: nowIso(),
+      nextBalance,
     });
   } catch (e) {
-    console.error("[supabase] credit txn insert failed:", e?.message || e);
+    console.error("[mega] credits sync failed:", e?.message || e);
+    throw e;
   }
 
-  return { ok: true, balance: nextBalance, source: "supabase" };
+  return { ok: true, balance: nextBalance, source: "mega", passId: cust?.passId || null };
 }
 
 async function sbUpsertAppSession({ id, customerId, platform, title, createdAt }) {
@@ -898,32 +906,24 @@ async function sbUpsertAppSession({ id, customerId, platform, title, createdAt }
     created_at: createdAt || nowIso(),
   };
 
-  const { error } = await supabaseAdmin.from("sessions").upsert(payload, { onConflict: "id" });
-  if (error) throw error;
+  await megaWriteSessionEvent(supabaseAdmin, {
+    customerId: payload.shopify_customer_id,
+    sessionId: payload.id,
+    platform: payload.platform,
+    title: payload.title,
+    createdAt: payload.created_at,
+  });
 }
 
 async function sbUpsertGenerationBusiness(gen) {
   if (!supabaseAdmin) return;
 
-  // generations.id is text in your schema (so "gen_<uuid>" is OK)
-  const payload = {
-    id: String(gen.id),
-    type: String(gen.type || "image"),
-    session_id: gen.sessionId ? String(gen.sessionId) : null,
-    customer_id: gen.customerId ? String(gen.customerId) : null,
-    platform: gen.platform ? String(gen.platform) : null,
-    prompt: gen.prompt ? String(gen.prompt) : "",
-    output_url: gen.outputUrl ? String(gen.outputUrl) : null,
-    meta: gen.meta ?? null,
-    created_at: gen.createdAt || nowIso(),
-    updated_at: nowIso(),
-    shopify_customer_id: gen.customerId ? String(gen.customerId) : null,
-    provider: gen.meta?.provider ? String(gen.meta.provider) : (gen.provider ? String(gen.provider) : null),
-    output_key: gen.outputKey ? String(gen.outputKey) : null,
-  };
-
-  const { error } = await supabaseAdmin.from("generations").upsert(payload, { onConflict: "id" });
-  if (error) throw error;
+  await megaWriteGenerationEvent(supabaseAdmin, {
+    customerId: gen.customerId,
+    userId: gen.meta?.userId || null,
+    email: gen.meta?.email || null,
+    generation: gen,
+  });
 }
 
 async function sbUpsertFeedbackBusiness(fb) {
@@ -938,59 +938,56 @@ async function sbUpsertFeedbackBusiness(fb) {
     console.warn("[feedback] dropping invalid sessionId:", fb.sessionId);
   }
 
-  const payload = {
-    id: fid,
-    shopify_customer_id: safeShopifyId(fb.customerId),
-    session_id: sessionUuid && isUuid(sessionUuid) ? sessionUuid : null,
-    generation_id: fb.generationId ? String(fb.generationId) : null,
-    result_type: String(fb.resultType || "image"),
-    platform: fb.platform ? String(fb.platform) : null,
-    prompt: String(fb.prompt || ""),
-    comment: fb.comment ? String(fb.comment) : null,
-    image_url: fb.imageUrl ? String(fb.imageUrl) : null,
-    video_url: fb.videoUrl ? String(fb.videoUrl) : null,
-    created_at: fb.createdAt || nowIso(),
-  };
-
-  const { error } = await supabaseAdmin.from("feedback").upsert(payload, { onConflict: "id" });
-  if (error) throw error;
+  await megaWriteFeedbackEvent(supabaseAdmin, {
+    customerId: fb.customerId,
+    feedback: fb,
+  });
 }
 
 async function sbGetLikesForCustomer(customerId, limit = 50) {
   if (!supabaseAdmin) return [];
 
   const { data, error } = await supabaseAdmin
-    .from("feedback")
-    .select("result_type,platform,prompt,comment,image_url,video_url,created_at")
-    .eq("shopify_customer_id", safeShopifyId(customerId))
-    .order("created_at", { ascending: true })
+    .from("mega_generations")
+    .select("mg_result_type,mg_platform,mg_prompt,mg_comment,mg_image_url,mg_video_url,mg_created_at")
+    .eq("mg_record_type", "feedback")
+    .eq("mg_shopify_customer_id", safeShopifyId(customerId))
+    .order("mg_created_at", { ascending: true })
     .limit(Math.max(1, Math.min(200, Number(limit || 50))));
 
   if (error) throw error;
 
   return (data || []).map((r) => ({
-    resultType: r.result_type || "image",
-    platform: r.platform || "tiktok",
-    prompt: r.prompt || "",
-    comment: r.comment || "",
-    imageUrl: r.image_url || null,
-    videoUrl: r.video_url || null,
-    createdAt: r.created_at || nowIso(),
+    resultType: r.mg_result_type || "image",
+    platform: r.mg_platform || "tiktok",
+    prompt: r.mg_prompt || "",
+    comment: r.mg_comment || "",
+    imageUrl: r.mg_image_url || null,
+    videoUrl: r.mg_video_url || null,
+    createdAt: r.mg_created_at || nowIso(),
   }));
 }
 
 async function sbGetBillingSettings(customerId) {
-  if (!supabaseAdmin) return { enabled: false, monthlyLimitPacks: 0, source: "no-db" };
+  if (!supabaseAdmin) return { enabled: false, monthlyLimitPacks: 0, source: "no-db", passId: null };
 
   const cust = await sbEnsureCustomer({ customerId, userId: null, email: null });
-  const meta = cust?.meta || {};
+  const { data, error } = await supabaseAdmin
+    .from("mega_customers")
+    .select("mg_meta")
+    .eq("mg_pass_id", cust.passId)
+    .maybeSingle();
+
+  if (error) throw error;
+  const meta = data?.mg_meta || {};
   const autoTopup = meta.autoTopup || {};
   return {
     enabled: Boolean(autoTopup.enabled),
     monthlyLimitPacks: Number.isFinite(autoTopup.monthlyLimitPacks)
       ? Math.max(0, Math.floor(autoTopup.monthlyLimitPacks))
       : 0,
-    source: "customers.meta",
+    source: "mega_customers.meta",
+    passId: cust?.passId || null,
   };
 }
 
@@ -998,7 +995,16 @@ async function sbSetBillingSettings(customerId, enabled, monthlyLimitPacks) {
   if (!supabaseAdmin) throw new Error("Supabase not configured");
 
   const cust = await sbEnsureCustomer({ customerId, userId: null, email: null });
-  const meta = cust?.meta || {};
+
+  const { data, error } = await supabaseAdmin
+    .from("mega_customers")
+    .select("mg_meta")
+    .eq("mg_pass_id", cust.passId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const meta = data?.mg_meta || {};
 
   const nextMeta = {
     ...meta,
@@ -1010,21 +1016,25 @@ async function sbSetBillingSettings(customerId, enabled, monthlyLimitPacks) {
     },
   };
 
-  const { error } = await supabaseAdmin
-    .from("customers")
-    .update({ meta: nextMeta, updated_at: nowIso() })
-    .eq("shopify_customer_id", cust.shopify_customer_id);
+  const { error: updateErr } = await supabaseAdmin
+    .from("mega_customers")
+    .update({ mg_meta: nextMeta, mg_updated_at: nowIso() })
+    .eq("mg_pass_id", cust.passId);
 
-  if (error) throw error;
+  if (updateErr) throw updateErr;
 
-  return { enabled: nextMeta.autoTopup.enabled, monthlyLimitPacks: nextMeta.autoTopup.monthlyLimitPacks };
+  return {
+    enabled: nextMeta.autoTopup.enabled,
+    monthlyLimitPacks: nextMeta.autoTopup.monthlyLimitPacks,
+    passId: cust?.passId || null,
+  };
 }
 
 async function sbCountCustomers() {
   if (!supabaseAdmin) return null;
   const { count, error } = await supabaseAdmin
-    .from("customers")
-    .select("shopify_customer_id", { count: "exact", head: true });
+    .from("mega_customers")
+    .select("mg_pass_id", { count: "exact", head: true });
   if (error) throw error;
   return count ?? 0;
 }
@@ -1032,12 +1042,20 @@ async function sbCountCustomers() {
 async function sbListCustomers(limit = 500) {
   if (!supabaseAdmin) return [];
   const { data, error } = await supabaseAdmin
-    .from("customers")
-    .select("shopify_customer_id,email,credits,last_active,created_at,updated_at,disabled")
-    .order("shopify_customer_id", { ascending: true })
+    .from("mega_customers")
+    .select("mg_shopify_customer_id,mg_email,mg_credits,mg_last_active,mg_created_at,mg_updated_at,mg_disabled")
+    .order("mg_shopify_customer_id", { ascending: true })
     .limit(Math.max(1, Math.min(1000, Number(limit || 500))));
   if (error) throw error;
-  return data || [];
+  return (data || []).map((r) => ({
+    shopify_customer_id: r.mg_shopify_customer_id,
+    email: r.mg_email,
+    credits: r.mg_credits,
+    last_active: r.mg_last_active,
+    created_at: r.mg_created_at,
+    updated_at: r.mg_updated_at,
+    disabled: r.mg_disabled,
+  }));
 }
 
 async function sbGetCustomerHistory(customerId) {
@@ -1047,27 +1065,30 @@ async function sbGetCustomerHistory(customerId) {
 
   const [custRes, gensRes, fbRes, txRes] = await Promise.all([
     supabaseAdmin
-      .from("customers")
-      .select("shopify_customer_id,credits")
-      .eq("shopify_customer_id", cid)
+      .from("mega_customers")
+      .select("mg_shopify_customer_id,mg_credits")
+      .eq("mg_shopify_customer_id", cid)
       .maybeSingle(),
     supabaseAdmin
-      .from("generations")
+      .from("mega_generations")
       .select("*")
-      .eq("shopify_customer_id", cid)
-      .order("created_at", { ascending: false })
+      .eq("mg_shopify_customer_id", cid)
+      .eq("mg_record_type", "generation")
+      .order("mg_created_at", { ascending: false })
       .limit(500),
     supabaseAdmin
-      .from("feedback")
+      .from("mega_generations")
       .select("*")
-      .eq("shopify_customer_id", cid)
-      .order("created_at", { ascending: false })
+      .eq("mg_shopify_customer_id", cid)
+      .eq("mg_record_type", "feedback")
+      .order("mg_created_at", { ascending: false })
       .limit(500),
     supabaseAdmin
-      .from("credit_transactions")
+      .from("mega_generations")
       .select("*")
-      .eq("shopify_customer_id", cid)
-      .order("created_at", { ascending: false })
+      .eq("mg_shopify_customer_id", cid)
+      .eq("mg_record_type", "credit_transaction")
+      .order("mg_created_at", { ascending: false })
       .limit(500),
   ]);
 
@@ -1079,7 +1100,7 @@ async function sbGetCustomerHistory(customerId) {
   return {
     customerId: cid,
     credits: {
-      balance: custRes.data?.credits ?? 0,
+      balance: custRes.data?.mg_credits ?? 0,
       history: txRes.data || [],
     },
     generations: gensRes.data || [],
@@ -1090,17 +1111,18 @@ async function sbGetCustomerHistory(customerId) {
 async function sbGetAdminOverview() {
   if (!supabaseAdmin) return null;
 
-  const [gensRes, fbRes] = await Promise.all([
-    supabaseAdmin.from("generations").select("*").order("created_at", { ascending: false }).limit(500),
-    supabaseAdmin.from("feedback").select("*").order("created_at", { ascending: false }).limit(500),
-  ]);
+  const { data, error } = await supabaseAdmin
+    .from("mega_generations")
+    .select("*")
+    .in("mg_record_type", ["generation", "feedback"])
+    .order("mg_created_at", { ascending: false })
+    .limit(500);
 
-  if (gensRes.error) throw gensRes.error;
-  if (fbRes.error) throw fbRes.error;
+  if (error) throw error;
 
   return {
-    generations: gensRes.data || [],
-    feedbacks: fbRes.data || [],
+    generations: (data || []).filter((r) => r.mg_record_type === "generation"),
+    feedbacks: (data || []).filter((r) => r.mg_record_type === "feedback"),
   };
 }
 
@@ -1951,6 +1973,7 @@ app.post("/billing/settings", async (req, res) => {
       customerId: String(customerId),
       enabled: saved.enabled,
       monthlyLimitPacks: saved.monthlyLimitPacks,
+      passId: saved?.passId || null,
     });
   } catch (err) {
     console.error("POST /billing/settings error", err);
@@ -1974,6 +1997,7 @@ app.get("/credits/balance", async (req, res) => {
         historyLength: null,
         meta: { imageCost: IMAGE_CREDITS_COST, motionCost: MOTION_CREDITS_COST },
         message: "Supabase not configured",
+        passId: null,
       });
     }
 
@@ -1982,6 +2006,7 @@ app.get("/credits/balance", async (req, res) => {
       reqUserId: req?.user?.userId,
       reqEmail: req?.user?.email,
     });
+    const passId = rec?.passId || null;
 
     res.json({
       ok: true,
@@ -1991,6 +2016,7 @@ app.get("/credits/balance", async (req, res) => {
       historyLength: rec.historyLength,
       meta: { imageCost: IMAGE_CREDITS_COST, motionCost: MOTION_CREDITS_COST },
       source: rec.source,
+      passId,
     });
   } catch (err) {
     console.error("Error in /credits/balance:", err);
@@ -2044,6 +2070,7 @@ app.post("/credits/add", async (req, res) => {
       customerId,
       newBalance: out.balance,
       source: out.source,
+      passId: out?.passId || null,
     });
   } catch (err) {
     console.error("Error in /credits/add:", err);
@@ -2112,6 +2139,17 @@ app.get("/admin/customers", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("GET /admin/customers error", err);
     res.status(500).json({ error: "Failed to load admin customers" });
+  }
+});
+
+app.get("/admin/mega/parity", requireAdmin, async (_req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "Supabase not available" });
+
+    const summary = await megaParityCounts(supabaseAdmin);
+    res.json({ ok: true, summary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "MEGA_PARITY_FAILED", message: e?.message || String(e) });
   }
 });
 
@@ -2252,11 +2290,12 @@ app.post("/sessions/start", async (req, res) => {
     }
 
     // Ensure customer exists (and welcome credits if configured)
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const session = createSession({ customerId, platform, title });
 
@@ -2267,6 +2306,7 @@ app.post("/sessions/start", async (req, res) => {
       ok: true,
       requestId,
       session,
+      passId,
     });
   } catch (err) {
     console.error("Error in /sessions/start:", err);
@@ -2336,11 +2376,12 @@ app.post("/editorial/generate", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const cfg = await getRuntimeConfig();
     const imageCost = Number(cfg?.credits?.imageCost ?? IMAGE_CREDITS_COST);
@@ -2372,6 +2413,7 @@ app.post("/editorial/generate", async (req, res) => {
         requiredCredits: imageCost,
         currentCredits: creditsInfo.balance ?? 0,
         requestId,
+        passId,
       });
     }
 
@@ -2569,33 +2611,6 @@ app.post("/editorial/generate", async (req, res) => {
       generation_id: generationId,
     });
 
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: seadreamModel,
-      provider: "replicate",
-      status: "succeeded",
-      inputChars: (prompt || "").length,
-      outputChars,
-      latencyMs,
-      meta: {
-        requestId,
-        step: "vision",
-        input_type: productImageUrl ? "image" : "text",
-        output_type: "image",
-        r2_url: imageUrl,
-        customerId,
-        platform,
-        aspectRatio,
-        minaVisionEnabled,
-        stylePresetKey,
-        outputKey,
-      },
-    });
-
     return res.json({
       ok: true,
       message: "Mina Editorial image generated (stored in R2).",
@@ -2605,6 +2620,7 @@ app.post("/editorial/generate", async (req, res) => {
       imageUrls,
       generationId,
       sessionId,
+      passId,
       credits: {
         balance: spend.balance,
         cost: imageCost,
@@ -2631,28 +2647,6 @@ app.post("/editorial/generate", async (req, res) => {
       latency_ms: Date.now() - startedAt,
       generation_id: generationId,
       detail: { error: err?.message },
-    });
-
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId: normalizeSessionUuid(safeString(req.body?.sessionId)) || null,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: SEADREAM_MODEL,
-      provider: "replicate",
-      status: "failed",
-      latencyMs: Date.now() - startedAt,
-      meta: {
-        requestId,
-        step: "vision",
-        input_type: safeString(req.body?.productImageUrl) ? "image" : "text",
-        output_type: "image",
-        customerId,
-        platform: safeString(req.body?.platform || "") || null,
-        stylePresetKey: safeString(req.body?.stylePresetKey || "") || null,
-        error: err?.message,
-      },
     });
 
     return res.status(500).json({
@@ -2729,11 +2723,12 @@ app.post("/motion/suggest", async (req, res) => {
         : "anonymous";
 
     // Ensure customer exists
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     persistSessionHash(req, body.sessionId || customerId || requestId, req.user?.userId, req.user?.email);
 
@@ -2797,32 +2792,11 @@ app.post("/motion/suggest", async (req, res) => {
       generation_id: generationId,
     });
 
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId: normalizeSessionUuid(body.sessionId) || null,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: "gpt-4.1-mini",
-      provider: "openai",
-      status: "succeeded",
-      inputChars: JSON.stringify(body || {}).length,
-      outputChars: (suggestionRes.text || "").length,
-      latencyMs,
-      meta: {
-        requestId,
-        step: "caption",
-        input_type: "image",
-        output_type: "text",
-        customerId,
-        sessionId: normalizeSessionUuid(body.sessionId) || null,
-      },
-    });
-
     res.json({
       ok: true,
       requestId,
       suggestion: suggestionRes.text,
+      passId,
       gpt: {
         usedFallback: suggestionRes.usedFallback,
         error: suggestionRes.gptError,
@@ -2842,27 +2816,6 @@ app.post("/motion/suggest", async (req, res) => {
       generation_id: generationId,
       detail: { error: err?.message },
     });
-
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId: normalizeSessionUuid(req.body?.sessionId) || null,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: "gpt-4.1-mini",
-      provider: "openai",
-      status: "failed",
-      latencyMs: Date.now() - startedAt,
-      meta: {
-        requestId,
-        step: "caption",
-        input_type: "image",
-        output_type: "text",
-        customerId,
-        error: err?.message,
-      },
-    });
-
     res.status(500).json({
       ok: false,
       error: "MOTION_SUGGESTION_ERROR",
@@ -2926,11 +2879,12 @@ app.post("/motion/generate", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const cfg = await getRuntimeConfig();
     const motionCost = Number(cfg?.credits?.motionCost ?? MOTION_CREDITS_COST);
@@ -2948,6 +2902,7 @@ app.post("/motion/generate", async (req, res) => {
         requiredCredits: motionCost,
         currentCredits: creditsInfo.balance ?? 0,
         requestId,
+        passId,
       });
     }
 
@@ -3103,34 +3058,6 @@ app.post("/motion/generate", async (req, res) => {
       output_chars: outputChars,
       generation_id: generationId,
     });
-
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: klingModel,
-      provider: "replicate",
-      status: "succeeded",
-      inputChars: (prompt || "").length,
-      outputChars,
-      latencyMs,
-      meta: {
-        requestId,
-        step: "motion",
-        input_type: "text",
-        output_type: "video",
-        r2_url: videoUrl,
-        customerId,
-        platform,
-        durationSeconds,
-        minaVisionEnabled,
-        stylePresetKey,
-        outputKey,
-      },
-    });
-
     return res.json({
       ok: true,
       message: "Mina Motion video generated (stored in R2).",
@@ -3139,6 +3066,7 @@ app.post("/motion/generate", async (req, res) => {
       videoUrl,
       generationId,
       sessionId,
+      passId,
       credits: {
         balance: spend.balance,
         cost: motionCost,
@@ -3164,27 +3092,6 @@ app.post("/motion/generate", async (req, res) => {
       generation_id: generationId,
       detail: { error: err?.message },
     });
-
-    void upsertGenerationRow({
-      id: generationId,
-      requestId,
-      sessionId: normalizeSessionUuid(req.body?.sessionId) || null,
-      userId: req.user?.userId,
-      email: req.user?.email,
-      model: KLING_MODEL,
-      provider: "replicate",
-      status: "failed",
-      latencyMs: Date.now() - startedAt,
-      meta: {
-        requestId,
-        step: "motion",
-        input_type: "text",
-        output_type: "video",
-        customerId,
-        error: err?.message,
-      },
-    });
-
     return res.status(500).json({
       ok: false,
       error: "MOTION_GENERATION_ERROR",
@@ -3233,31 +3140,43 @@ app.post("/feedback/like", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     let cleanImageUrl = imageUrl || "";
     let cleanVideoUrl = videoUrl || "";
 
-    if (cleanImageUrl && !isOurAssetUrl(cleanImageUrl)) {
-      const stored = await storeRemoteToR2Public({
-        remoteUrl: cleanImageUrl,
-        kind: "likes-images",
-        customerId,
-      });
-      cleanImageUrl = stored.publicUrl;
+    // ✅ Guarantee permanent public URLs (never store signed URLs)
+    if (cleanImageUrl) {
+      const perm = toPermanentPublicAssetUrl(cleanImageUrl);
+      if (perm) {
+        cleanImageUrl = perm;
+      } else if (!isPermanentPublicAssetUrl(cleanImageUrl)) {
+        const stored = await storeRemoteToR2Public({
+          remoteUrl: cleanImageUrl,
+          kind: "likes-images",
+          customerId,
+        });
+        cleanImageUrl = stored.publicUrl;
+      }
     }
 
-    if (cleanVideoUrl && !isOurAssetUrl(cleanVideoUrl)) {
-      const stored = await storeRemoteToR2Public({
-        remoteUrl: cleanVideoUrl,
-        kind: "likes-videos",
-        customerId,
-      });
-      cleanVideoUrl = stored.publicUrl;
+    if (cleanVideoUrl) {
+      const perm = toPermanentPublicAssetUrl(cleanVideoUrl);
+      if (perm) {
+        cleanVideoUrl = perm;
+      } else if (!isPermanentPublicAssetUrl(cleanVideoUrl)) {
+        const stored = await storeRemoteToR2Public({
+          remoteUrl: cleanVideoUrl,
+          kind: "likes-videos",
+          customerId,
+        });
+        cleanVideoUrl = stored.publicUrl;
+      }
     }
 
     rememberLike(customerId, {
@@ -3306,6 +3225,7 @@ app.post("/feedback/like", async (req, res) => {
       totals: {
         likesForCustomer: totalLikes,
       },
+      passId,
     });
   } catch (err) {
     console.error("Error in /feedback/like:", err);

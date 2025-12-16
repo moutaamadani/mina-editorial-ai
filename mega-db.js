@@ -22,6 +22,13 @@ function isAnonymousCustomerId(customerIdRaw) {
   return safeShopifyId(customerIdRaw) === "anonymous";
 }
 
+function namespacedId(prefix, value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  if (v.startsWith(`${prefix}:`)) return v;
+  return `${prefix}:${v}`;
+}
+
 /**
  * Find an existing PassID from any known identifiers (priority: user_id -> email -> shopify_customer_id).
  * Returns passId string or null.
@@ -131,8 +138,13 @@ export async function megaEnsureCustomer(
     };
   }
 
-  // Create new
-  const passId = `pass_${crypto.randomUUID()}`;
+  // Create new (deterministic PassID rule)
+  const passId = isAnonymousCustomerId(shopifyId)
+    ? userId
+      ? namespacedId("pass:user", userId)
+      : namespacedId("pass:anon", crypto.randomUUID())
+    : namespacedId("pass:shopify", shopifyId);
+
   const payload = {
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyId !== "anonymous" ? shopifyId : null,
@@ -213,7 +225,7 @@ export async function megaWriteSessionEvent(
   if (!passId) return { passId: null };
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(sessionId),
+    mg_id: namespacedId("session", sessionId),
     mg_record_type: "session",
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
@@ -222,6 +234,12 @@ export async function megaWriteSessionEvent(
     mg_title: title ? String(title) : null,
     mg_created_at: createdAt || nowIso(),
     mg_meta: { source: "legacy.sessions" },
+    mg_payload: {
+      sessionId: String(sessionId),
+      platform: platform ? String(platform) : null,
+      title: title ? String(title) : null,
+      createdAt: createdAt || nowIso(),
+    },
   });
 
   return { passId };
@@ -245,11 +263,12 @@ export async function megaWriteGenerationEvent(
   const g = generation || {};
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(g.id),
+    mg_id: namespacedId("generation", g.id),
     mg_record_type: "generation",
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: g.sessionId ? String(g.sessionId) : null,
+    mg_generation_id: g.id ? String(g.id) : null,
     mg_platform: g.platform ? String(g.platform) : null,
     mg_type: g.type ? String(g.type) : null,
     mg_prompt: g.prompt ? String(g.prompt) : null,
@@ -264,6 +283,7 @@ export async function megaWriteGenerationEvent(
     mg_error: g.meta?.error ? String(g.meta.error) : null,
     mg_created_at: g.createdAt || nowIso(),
     mg_meta: g.meta ?? null,
+    mg_payload: g,
   });
 
   return { passId };
@@ -287,7 +307,7 @@ export async function megaWriteFeedbackEvent(
   const f = feedback || {};
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(f.id),
+    mg_id: namespacedId("feedback", f.id),
     mg_record_type: "feedback",
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
@@ -301,6 +321,7 @@ export async function megaWriteFeedbackEvent(
     mg_video_url: f.videoUrl ? String(f.videoUrl) : null,
     mg_created_at: f.createdAt || nowIso(),
     mg_meta: { source: "legacy.feedback" },
+    mg_payload: f,
   });
 
   return { passId };
@@ -324,7 +345,7 @@ export async function megaWriteCreditTxnEvent(
   if (!passId) return { passId: null };
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(id || `ctx_${crypto.randomUUID()}`),
+    mg_id: namespacedId("credit_transaction", id || `ctx_${crypto.randomUUID()}`),
     mg_record_type: "credit_transaction",
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
@@ -335,6 +356,16 @@ export async function megaWriteCreditTxnEvent(
     mg_ref_id: refId ? String(refId) : null,
     mg_created_at: createdAt || nowIso(),
     mg_meta: { source: "legacy.credit_transactions" },
+    mg_payload: {
+      id: id || null,
+      delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
+      reason: reason || null,
+      source: source || null,
+      refType: refType || null,
+      refId: refId || null,
+      createdAt: createdAt || nowIso(),
+      nextBalance: typeof nextBalance === "number" ? nextBalance : null,
+    },
   });
 
   if (typeof nextBalance === "number" && Number.isFinite(nextBalance)) {
@@ -363,24 +394,7 @@ export async function megaParityCounts(supabaseAdmin) {
     return c ?? 0;
   };
 
-  const [
-    legacyCustomers,
-    legacySessions,
-    legacyGenerations,
-    legacyFeedback,
-    legacyCreditTxns,
-    megaCustomers,
-    megaSessions,
-    megaGenerations,
-    megaFeedback,
-    megaCreditTxns,
-  ] = await Promise.all([
-    count("customers", "shopify_customer_id"),
-    count("sessions", "id"),
-    count("generations", "id"),
-    count("feedback", "id"),
-    count("credit_transactions", "id"),
-
+  const [megaCustomers, megaSessions, megaGenerations, megaFeedback, megaCreditTxns] = await Promise.all([
     count("mega_customers", "mg_pass_id"),
     count("mega_generations", "mg_id", { eq: ["mg_record_type", "session"] }),
     count("mega_generations", "mg_id", { eq: ["mg_record_type", "generation"] }),
@@ -389,26 +403,12 @@ export async function megaParityCounts(supabaseAdmin) {
   ]);
 
   return {
-    legacy: {
-      customers: legacyCustomers,
-      sessions: legacySessions,
-      generations: legacyGenerations,
-      feedback: legacyFeedback,
-      credit_transactions: legacyCreditTxns,
-    },
     mega: {
       customers: megaCustomers,
       sessions: megaSessions,
       generations: megaGenerations,
       feedback: megaFeedback,
       credit_transactions: megaCreditTxns,
-    },
-    drift: {
-      customers: (megaCustomers ?? 0) - (legacyCustomers ?? 0),
-      sessions: (megaSessions ?? 0) - (legacySessions ?? 0),
-      generations: (megaGenerations ?? 0) - (legacyGenerations ?? 0),
-      feedback: (megaFeedback ?? 0) - (legacyFeedback ?? 0),
-      credit_transactions: (megaCreditTxns ?? 0) - (legacyCreditTxns ?? 0),
     },
     meta: { generatedAt: nowIso() },
   };

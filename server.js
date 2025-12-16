@@ -545,109 +545,51 @@ function normalizeRuntimeConfig(cfg) {
   return safe;
 }
 
-async function sbGetRuntimeRow() {
-  if (!supabaseAdmin) return null;
-
-  const { data, error } = await supabaseAdmin
-    .from("runtime_config")
-    .select("*")
-    .eq("id", 1)
-    .maybeSingle();
-
-  if (error) throw error;
-  return data || null;
-}
-
-async function sbPatchRuntimeRow(patch, updatedBy = null) {
-  if (!supabaseAdmin) throw new Error("Supabase not configured");
-
-  const payload = {
-    id: 1,
-    ...(patch || {}),
-    updated_by: updatedBy ? String(updatedBy) : null,
-    // updated_at handled by trigger
-  };
-
-  const { error } = await supabaseAdmin
-    .from("runtime_config")
-    .upsert(payload, { onConflict: "id" });
-
-  if (error) throw error;
-}
-
-// Convert DB row (flat columns) -> override object (nested)
 function runtimeRowToOverride(row) {
   const o = {};
   if (!row) return o;
 
-  // Models
-  if (row.seadream_model) setDeep(o, "models.seadream", row.seadream_model);
-  if (row.kling_model) setDeep(o, "models.kling", row.kling_model);
-  if (row.gpt_model) setDeep(o, "models.gpt", row.gpt_model);
-
-  // Credits
-  if (row.image_cost !== null && row.image_cost !== undefined)
-    setDeep(o, "credits.imageCost", row.image_cost);
-  if (row.motion_cost !== null && row.motion_cost !== undefined)
-    setDeep(o, "credits.motionCost", row.motion_cost);
-
-  // Replicate: SeaDream
-  if (row.seadream_size) setDeep(o, "replicate.seadream.size", row.seadream_size);
-  if (row.seadream_enhance_prompt !== null && row.seadream_enhance_prompt !== undefined)
-    setDeep(o, "replicate.seadream.enhance_prompt", row.seadream_enhance_prompt);
-  if (row.seadream_sequential_image_generation)
-    setDeep(o, "replicate.seadream.sequential_image_generation", row.seadream_sequential_image_generation);
-
-  // Replicate: Kling
-  if (row.kling_mode) setDeep(o, "replicate.kling.mode", row.kling_mode);
-  if (row.kling_negative_prompt !== null && row.kling_negative_prompt !== undefined)
-    setDeep(o, "replicate.kling.negative_prompt", row.kling_negative_prompt);
-
-  // GPT editorial
-  if (row.gpt_editorial_temperature !== null && row.gpt_editorial_temperature !== undefined)
-    setDeep(o, "gpt.editorial.temperature", row.gpt_editorial_temperature);
-  if (row.gpt_editorial_max_tokens !== null && row.gpt_editorial_max_tokens !== undefined)
-    setDeep(o, "gpt.editorial.max_tokens", row.gpt_editorial_max_tokens);
-  if (row.gpt_editorial_system_text !== null && row.gpt_editorial_system_text !== undefined)
-    setDeep(o, "gpt.editorial.system_text", row.gpt_editorial_system_text);
-  if (row.gpt_editorial_user_extra !== null && row.gpt_editorial_user_extra !== undefined)
-    setDeep(o, "gpt.editorial.user_extra", row.gpt_editorial_user_extra);
-
-  // GPT motion_prompt
-  if (row.gpt_motion_prompt_temperature !== null && row.gpt_motion_prompt_temperature !== undefined)
-    setDeep(o, "gpt.motion_prompt.temperature", row.gpt_motion_prompt_temperature);
-  if (row.gpt_motion_prompt_max_tokens !== null && row.gpt_motion_prompt_max_tokens !== undefined)
-    setDeep(o, "gpt.motion_prompt.max_tokens", row.gpt_motion_prompt_max_tokens);
-  if (row.gpt_motion_prompt_system_text !== null && row.gpt_motion_prompt_system_text !== undefined)
-    setDeep(o, "gpt.motion_prompt.system_text", row.gpt_motion_prompt_system_text);
-  if (row.gpt_motion_prompt_user_extra !== null && row.gpt_motion_prompt_user_extra !== undefined)
-    setDeep(o, "gpt.motion_prompt.user_extra", row.gpt_motion_prompt_user_extra);
-
-  // GPT motion_suggest
-  if (row.gpt_motion_suggest_temperature !== null && row.gpt_motion_suggest_temperature !== undefined)
-    setDeep(o, "gpt.motion_suggest.temperature", row.gpt_motion_suggest_temperature);
-  if (row.gpt_motion_suggest_max_tokens !== null && row.gpt_motion_suggest_max_tokens !== undefined)
-    setDeep(o, "gpt.motion_suggest.max_tokens", row.gpt_motion_suggest_max_tokens);
-  if (row.gpt_motion_suggest_system_text !== null && row.gpt_motion_suggest_system_text !== undefined)
-    setDeep(o, "gpt.motion_suggest.system_text", row.gpt_motion_suggest_system_text);
-  if (row.gpt_motion_suggest_user_extra !== null && row.gpt_motion_suggest_user_extra !== undefined)
-    setDeep(o, "gpt.motion_suggest.user_extra", row.gpt_motion_suggest_user_extra);
+  if (row.value && typeof row.value === "object") return row.value;
+  if (row.mg_value && typeof row.mg_value === "object") return row.mg_value;
 
   return o;
 }
 
 
+async function sbGetRuntimeOverride() {
+  if (!supabaseAdmin) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from("mega_admin")
+    .select("mg_value,mg_meta,mg_updated_at")
+    .eq("mg_record_type", "app_config")
+    .eq("mg_id", "app_config:runtime")
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!data) return null;
+
+  return {
+    value: data.mg_value || {},
+    updated_at: data.mg_updated_at || null,
+    updated_by: data.mg_meta?.updated_by || null,
+  };
+}
+
 async function sbSetRuntimeOverride(nextOverride, updatedBy = null) {
   if (!supabaseAdmin) throw new Error("Supabase not configured");
   const payload = {
-    key: "runtime",
-    value: nextOverride || {},
-    updated_at: nowIso(),
-    updated_by: updatedBy ? String(updatedBy) : null,
+    mg_id: "app_config:runtime",
+    mg_record_type: "app_config",
+    mg_key: "runtime",
+    mg_value: nextOverride || {},
+    mg_meta: { updated_by: updatedBy || null },
+    mg_created_at: nowIso(),
+    mg_updated_at: nowIso(),
   };
   const { error } = await supabaseAdmin
-    .from("app_config")
-    .upsert(payload, { onConflict: "key" });
+    .from("mega_admin")
+    .upsert(payload, { onConflict: "mg_id" });
   if (error) throw error;
 }
 
@@ -669,7 +611,7 @@ async function getRuntimeConfig() {
     return runtimeConfigCache.effective;
   }
 
-   const row = await sbGetRuntimeRow();
+  const row = await sbGetRuntimeOverride();
   const override = runtimeRowToOverride(row);
   const effective = normalizeRuntimeConfig(override);
 

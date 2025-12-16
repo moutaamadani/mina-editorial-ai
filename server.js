@@ -12,6 +12,14 @@ import crypto from "node:crypto";
 import multer from "multer";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createClient } from "@supabase/supabase-js";
+import {
+  megaEnsureCustomer,
+  megaWriteSessionEvent,
+  megaWriteGenerationEvent,
+  megaWriteFeedbackEvent,
+  megaWriteCreditTxnEvent,
+  megaParityCounts,
+} from "./mega-db.js";
 
 import { parseDataUrl } from "./r2.js";
 
@@ -206,20 +214,82 @@ function r2PublicUrlForKeyLocal(key) {
   return "";
 }
 
-function isOurAssetUrl(u) {
+function hasAwsSignatureParams(urlObj) {
+  for (const [k] of urlObj.searchParams.entries()) {
+    const key = String(k || "").toLowerCase();
+    if (key.startsWith("x-amz-") || key.includes("signature") || key.includes("expires")) return true;
+  }
+  return false;
+}
+
+// Extract the object key from R2 URLs (bucket subdomain or path-style)
+function extractR2KeyFromUrl(u) {
   try {
     const url = new URL(String(u));
     const host = url.hostname.toLowerCase();
+    let path = url.pathname || "";
+    if (path.startsWith("/")) path = path.slice(1);
 
-    if (R2_PUBLIC_BASE_URL) {
-      const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
-      if (host === baseHost) return true;
+    // If path style: /<bucket>/<key>
+    if (R2_BUCKET) {
+      const first = path.split("/")[0];
+      if (first === R2_BUCKET) {
+        path = path.split("/").slice(1).join("/");
+      }
     }
 
-    if (host.endsWith("r2.cloudflarestorage.com")) return true;
-    return false;
+    // If bucket subdomain: <bucket>.<account>.r2.cloudflarestorage.com/<key>
+    // then pathname is already the key
+    if (host.endsWith("r2.cloudflarestorage.com")) {
+      return path || "";
+    }
+
+    // If already on custom public domain: /<key>
+    if (R2_PUBLIC_BASE_URL) {
+      const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
+      if (host === baseHost) return path || "";
+    }
+
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+// ✅ True only if URL is already PERMANENT public (your custom domain, and not signed)
+function isPermanentPublicAssetUrl(u) {
+  try {
+    const url = new URL(String(u));
+    if (!R2_PUBLIC_BASE_URL) return false;
+    const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
+    if (url.hostname.toLowerCase() !== baseHost) return false;
+    if (hasAwsSignatureParams(url)) return false;
+    return true;
   } catch {
     return false;
+  }
+}
+
+// ✅ Convert signed R2 URLs -> permanent public URL when possible
+function toPermanentPublicAssetUrl(u) {
+  try {
+    if (!R2_PUBLIC_BASE_URL) return "";
+    const url = new URL(String(u));
+
+    // Already permanent
+    if (isPermanentPublicAssetUrl(u)) return String(u);
+
+    // If it's R2 but signed, build the public URL from the key
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith("r2.cloudflarestorage.com") || hasAwsSignatureParams(url)) {
+      const key = extractR2KeyFromUrl(u);
+      if (!key) return "";
+      return `${R2_PUBLIC_BASE_URL}/${encodeKeyForUrl(key)}`;
+    }
+
+    return "";
+  } catch {
+    return "";
   }
 }
 
@@ -760,6 +830,22 @@ async function sbInsertCreditTxn({ customerId, delta, reason, source, refType = 
 
   const { error } = await supabaseAdmin.from("credit_transactions").insert(txn);
   if (error) throw error;
+
+  // ✅ MEGA dual-write credit transaction (best-effort)
+  try {
+    await megaWriteCreditTxnEvent(supabaseAdmin, {
+      customerId: txn.shopify_customer_id,
+      id: txn.id,
+      delta: txn.delta,
+      reason: txn.reason,
+      source: txn.source,
+      refType: txn.ref_type,
+      refId: txn.ref_id,
+      createdAt: txn.created_at,
+    });
+  } catch (e) {
+    console.error("[mega] credit txn dual-write failed:", e?.message || e);
+  }
 }
 
 async function sbEnsureCustomer({ customerId, userId, email }) {
@@ -819,11 +905,25 @@ async function sbEnsureCustomer({ customerId, userId, email }) {
     if (error) throw error;
   }
 
+  // ✅ MEGA: ensure PassID exists + sync credits (best-effort)
+  try {
+    const mega = await megaEnsureCustomer(supabaseAdmin, {
+      customerId: id,
+      userId: userId || null,
+      email: email || null,
+      legacyCredits: row?.credits ?? 0,
+    });
+    row.passId = mega?.passId || null;
+  } catch (e) {
+    row.passId = null;
+    console.error("[mega] ensure customer failed:", e?.message || e);
+  }
+
   return row;
 }
 
 async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
-  if (!supabaseAdmin) return { balance: null, historyLength: null, source: "no-sb" };
+  if (!supabaseAdmin) return { balance: null, historyLength: null, source: "no-sb", passId: null };
 
   const cust = await sbEnsureCustomer({
     customerId,
@@ -841,12 +941,13 @@ async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
     balance: cust.credits ?? 0,
     historyLength: countErr ? null : (count ?? 0),
     source: "supabase",
+    passId: cust?.passId || null,
   };
 }
 
 // WARNING: not fully atomic under concurrency (fine for low traffic)
 async function sbAdjustCredits({ customerId, delta, reason, source, refType, refId, reqUserId, reqEmail }) {
-  if (!supabaseAdmin) return { ok: false, balance: null, source: "no-sb" };
+  if (!supabaseAdmin) return { ok: false, balance: null, source: "no-sb", passId: null };
 
   const cust = await sbEnsureCustomer({
     customerId,
@@ -867,6 +968,18 @@ async function sbAdjustCredits({ customerId, delta, reason, source, refType, ref
   const { error } = await supabaseAdmin.from("customers").update(updates).eq("shopify_customer_id", cust.shopify_customer_id);
   if (error) throw error;
 
+  // ✅ MEGA: sync credits balance (best-effort)
+  try {
+    await megaEnsureCustomer(supabaseAdmin, {
+      customerId: cust.shopify_customer_id,
+      userId: reqUserId || null,
+      email: reqEmail || null,
+      legacyCredits: nextBalance,
+    });
+  } catch (e) {
+    console.error("[mega] credits sync failed:", e?.message || e);
+  }
+
   // Insert transaction (best effort)
   try {
     await sbInsertCreditTxn({
@@ -881,7 +994,7 @@ async function sbAdjustCredits({ customerId, delta, reason, source, refType, ref
     console.error("[supabase] credit txn insert failed:", e?.message || e);
   }
 
-  return { ok: true, balance: nextBalance, source: "supabase" };
+  return { ok: true, balance: nextBalance, source: "supabase", passId: cust?.passId || null };
 }
 
 async function sbUpsertAppSession({ id, customerId, platform, title, createdAt }) {
@@ -900,6 +1013,19 @@ async function sbUpsertAppSession({ id, customerId, platform, title, createdAt }
 
   const { error } = await supabaseAdmin.from("sessions").upsert(payload, { onConflict: "id" });
   if (error) throw error;
+
+  // ✅ MEGA dual-write (best-effort)
+  try {
+    await megaWriteSessionEvent(supabaseAdmin, {
+      customerId: payload.shopify_customer_id,
+      sessionId: payload.id,
+      platform: payload.platform,
+      title: payload.title,
+      createdAt: payload.created_at,
+    });
+  } catch (e) {
+    console.error("[mega] session dual-write failed:", e?.message || e);
+  }
 }
 
 async function sbUpsertGenerationBusiness(gen) {
@@ -924,6 +1050,18 @@ async function sbUpsertGenerationBusiness(gen) {
 
   const { error } = await supabaseAdmin.from("generations").upsert(payload, { onConflict: "id" });
   if (error) throw error;
+
+  // ✅ MEGA dual-write (best-effort)
+  try {
+    await megaWriteGenerationEvent(supabaseAdmin, {
+      customerId: gen.customerId,
+      userId: gen.meta?.userId || null,
+      email: gen.meta?.email || null,
+      generation: gen,
+    });
+  } catch (e) {
+    console.error("[mega] generation dual-write failed:", e?.message || e);
+  }
 }
 
 async function sbUpsertFeedbackBusiness(fb) {
@@ -954,6 +1092,16 @@ async function sbUpsertFeedbackBusiness(fb) {
 
   const { error } = await supabaseAdmin.from("feedback").upsert(payload, { onConflict: "id" });
   if (error) throw error;
+
+  // ✅ MEGA dual-write (best-effort)
+  try {
+    await megaWriteFeedbackEvent(supabaseAdmin, {
+      customerId: fb.customerId,
+      feedback: fb,
+    });
+  } catch (e) {
+    console.error("[mega] feedback dual-write failed:", e?.message || e);
+  }
 }
 
 async function sbGetLikesForCustomer(customerId, limit = 50) {
@@ -980,7 +1128,7 @@ async function sbGetLikesForCustomer(customerId, limit = 50) {
 }
 
 async function sbGetBillingSettings(customerId) {
-  if (!supabaseAdmin) return { enabled: false, monthlyLimitPacks: 0, source: "no-db" };
+  if (!supabaseAdmin) return { enabled: false, monthlyLimitPacks: 0, source: "no-db", passId: null };
 
   const cust = await sbEnsureCustomer({ customerId, userId: null, email: null });
   const meta = cust?.meta || {};
@@ -991,6 +1139,7 @@ async function sbGetBillingSettings(customerId) {
       ? Math.max(0, Math.floor(autoTopup.monthlyLimitPacks))
       : 0,
     source: "customers.meta",
+    passId: cust?.passId || null,
   };
 }
 
@@ -1017,7 +1166,11 @@ async function sbSetBillingSettings(customerId, enabled, monthlyLimitPacks) {
 
   if (error) throw error;
 
-  return { enabled: nextMeta.autoTopup.enabled, monthlyLimitPacks: nextMeta.autoTopup.monthlyLimitPacks };
+  return {
+    enabled: nextMeta.autoTopup.enabled,
+    monthlyLimitPacks: nextMeta.autoTopup.monthlyLimitPacks,
+    passId: cust?.passId || null,
+  };
 }
 
 async function sbCountCustomers() {
@@ -1951,6 +2104,7 @@ app.post("/billing/settings", async (req, res) => {
       customerId: String(customerId),
       enabled: saved.enabled,
       monthlyLimitPacks: saved.monthlyLimitPacks,
+      passId: saved?.passId || null,
     });
   } catch (err) {
     console.error("POST /billing/settings error", err);
@@ -1974,6 +2128,7 @@ app.get("/credits/balance", async (req, res) => {
         historyLength: null,
         meta: { imageCost: IMAGE_CREDITS_COST, motionCost: MOTION_CREDITS_COST },
         message: "Supabase not configured",
+        passId: null,
       });
     }
 
@@ -1982,6 +2137,7 @@ app.get("/credits/balance", async (req, res) => {
       reqUserId: req?.user?.userId,
       reqEmail: req?.user?.email,
     });
+    const passId = rec?.passId || null;
 
     res.json({
       ok: true,
@@ -1991,6 +2147,7 @@ app.get("/credits/balance", async (req, res) => {
       historyLength: rec.historyLength,
       meta: { imageCost: IMAGE_CREDITS_COST, motionCost: MOTION_CREDITS_COST },
       source: rec.source,
+      passId,
     });
   } catch (err) {
     console.error("Error in /credits/balance:", err);
@@ -2044,6 +2201,7 @@ app.post("/credits/add", async (req, res) => {
       customerId,
       newBalance: out.balance,
       source: out.source,
+      passId: out?.passId || null,
     });
   } catch (err) {
     console.error("Error in /credits/add:", err);
@@ -2112,6 +2270,17 @@ app.get("/admin/customers", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("GET /admin/customers error", err);
     res.status(500).json({ error: "Failed to load admin customers" });
+  }
+});
+
+app.get("/admin/mega/parity", requireAdmin, async (_req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "Supabase not available" });
+
+    const summary = await megaParityCounts(supabaseAdmin);
+    res.json({ ok: true, summary });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: "MEGA_PARITY_FAILED", message: e?.message || String(e) });
   }
 });
 
@@ -2252,11 +2421,12 @@ app.post("/sessions/start", async (req, res) => {
     }
 
     // Ensure customer exists (and welcome credits if configured)
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const session = createSession({ customerId, platform, title });
 
@@ -2267,6 +2437,7 @@ app.post("/sessions/start", async (req, res) => {
       ok: true,
       requestId,
       session,
+      passId,
     });
   } catch (err) {
     console.error("Error in /sessions/start:", err);
@@ -2336,11 +2507,12 @@ app.post("/editorial/generate", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const cfg = await getRuntimeConfig();
     const imageCost = Number(cfg?.credits?.imageCost ?? IMAGE_CREDITS_COST);
@@ -2372,6 +2544,7 @@ app.post("/editorial/generate", async (req, res) => {
         requiredCredits: imageCost,
         currentCredits: creditsInfo.balance ?? 0,
         requestId,
+        passId,
       });
     }
 
@@ -2605,6 +2778,7 @@ app.post("/editorial/generate", async (req, res) => {
       imageUrls,
       generationId,
       sessionId,
+      passId,
       credits: {
         balance: spend.balance,
         cost: imageCost,
@@ -2729,11 +2903,12 @@ app.post("/motion/suggest", async (req, res) => {
         : "anonymous";
 
     // Ensure customer exists
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     persistSessionHash(req, body.sessionId || customerId || requestId, req.user?.userId, req.user?.email);
 
@@ -2823,6 +2998,7 @@ app.post("/motion/suggest", async (req, res) => {
       ok: true,
       requestId,
       suggestion: suggestionRes.text,
+      passId,
       gpt: {
         usedFallback: suggestionRes.usedFallback,
         error: suggestionRes.gptError,
@@ -2926,11 +3102,12 @@ app.post("/motion/generate", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     const cfg = await getRuntimeConfig();
     const motionCost = Number(cfg?.credits?.motionCost ?? MOTION_CREDITS_COST);
@@ -2948,6 +3125,7 @@ app.post("/motion/generate", async (req, res) => {
         requiredCredits: motionCost,
         currentCredits: creditsInfo.balance ?? 0,
         requestId,
+        passId,
       });
     }
 
@@ -3139,6 +3317,7 @@ app.post("/motion/generate", async (req, res) => {
       videoUrl,
       generationId,
       sessionId,
+      passId,
       credits: {
         balance: spend.balance,
         cost: motionCost,
@@ -3233,31 +3412,43 @@ app.post("/feedback/like", async (req, res) => {
       });
     }
 
-    await sbEnsureCustomer({
+    const cust = await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
+    const passId = cust?.passId || null;
 
     let cleanImageUrl = imageUrl || "";
     let cleanVideoUrl = videoUrl || "";
 
-    if (cleanImageUrl && !isOurAssetUrl(cleanImageUrl)) {
-      const stored = await storeRemoteToR2Public({
-        remoteUrl: cleanImageUrl,
-        kind: "likes-images",
-        customerId,
-      });
-      cleanImageUrl = stored.publicUrl;
+    // ✅ Guarantee permanent public URLs (never store signed URLs)
+    if (cleanImageUrl) {
+      const perm = toPermanentPublicAssetUrl(cleanImageUrl);
+      if (perm) {
+        cleanImageUrl = perm;
+      } else if (!isPermanentPublicAssetUrl(cleanImageUrl)) {
+        const stored = await storeRemoteToR2Public({
+          remoteUrl: cleanImageUrl,
+          kind: "likes-images",
+          customerId,
+        });
+        cleanImageUrl = stored.publicUrl;
+      }
     }
 
-    if (cleanVideoUrl && !isOurAssetUrl(cleanVideoUrl)) {
-      const stored = await storeRemoteToR2Public({
-        remoteUrl: cleanVideoUrl,
-        kind: "likes-videos",
-        customerId,
-      });
-      cleanVideoUrl = stored.publicUrl;
+    if (cleanVideoUrl) {
+      const perm = toPermanentPublicAssetUrl(cleanVideoUrl);
+      if (perm) {
+        cleanVideoUrl = perm;
+      } else if (!isPermanentPublicAssetUrl(cleanVideoUrl)) {
+        const stored = await storeRemoteToR2Public({
+          remoteUrl: cleanVideoUrl,
+          kind: "likes-videos",
+          customerId,
+        });
+        cleanVideoUrl = stored.publicUrl;
+      }
     }
 
     rememberLike(customerId, {
@@ -3306,6 +3497,7 @@ app.post("/feedback/like", async (req, res) => {
       totals: {
         likesForCustomer: totalLikes,
       },
+      passId,
     });
   } catch (err) {
     console.error("Error in /feedback/like:", err);

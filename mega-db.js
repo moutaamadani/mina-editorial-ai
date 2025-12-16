@@ -7,15 +7,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function envTrue(name) {
-  const v = String(process.env[name] || "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes" || v === "on";
-}
-
-export function megaDualWriteEnabled() {
-  return envTrue("MEGA_DUAL_WRITE");
-}
-
 function normalizeEmail(email) {
   if (!email) return null;
   const s = String(email).trim().toLowerCase();
@@ -29,6 +20,13 @@ function safeShopifyId(customerIdRaw) {
 
 function isAnonymousCustomerId(customerIdRaw) {
   return safeShopifyId(customerIdRaw) === "anonymous";
+}
+
+function namespacedId(prefix, value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  if (v.startsWith(`${prefix}:`)) return v;
+  return `${prefix}:${v}`;
 }
 
 /**
@@ -89,7 +87,7 @@ export async function megaEnsureCustomer(
   supabaseAdmin,
   { customerId, userId, email, legacyCredits = null }
 ) {
-  if (!supabaseAdmin) return { passId: null };
+  if (!supabaseAdmin) return { passId: null, credits: null };
 
   const shopifyId = safeShopifyId(customerId);
   const normEmail = normalizeEmail(email);
@@ -98,7 +96,7 @@ export async function megaEnsureCustomer(
   // (if no email/userId, we return null passId unless you pass a non-anon customerId)
   const hasStrongId = !!userId || !!normEmail || (shopifyId && shopifyId !== "anonymous");
   if (!hasStrongId) {
-    return { passId: null };
+    return { passId: null, credits: null };
   }
 
   const existingPassId = await megaFindPassId(supabaseAdmin, { customerId: shopifyId, userId, email: normEmail });
@@ -124,11 +122,29 @@ export async function megaEnsureCustomer(
       await supabaseAdmin.from("mega_customers").update(updates).eq("mg_pass_id", existingPassId);
     } catch (_) {}
 
-    return { passId: existingPassId };
+    const { data } = await supabaseAdmin
+      .from("mega_customers")
+      .select("mg_pass_id,mg_credits,mg_shopify_customer_id,mg_user_id,mg_email,mg_meta")
+      .eq("mg_pass_id", existingPassId)
+      .maybeSingle();
+
+    return {
+      passId: existingPassId,
+      credits: data?.mg_credits ?? null,
+      shopifyCustomerId: data?.mg_shopify_customer_id || null,
+      userId: data?.mg_user_id || null,
+      email: data?.mg_email || null,
+      meta: data?.mg_meta || {},
+    };
   }
 
-  // Create new
-  const passId = `pass_${crypto.randomUUID()}`;
+  // Create new (deterministic PassID rule)
+  const passId = isAnonymousCustomerId(shopifyId)
+    ? userId
+      ? namespacedId("pass:user", userId)
+      : namespacedId("pass:anon", crypto.randomUUID())
+    : namespacedId("pass:shopify", shopifyId);
+
   const payload = {
     mg_pass_id: passId,
     mg_shopify_customer_id: shopifyId !== "anonymous" ? shopifyId : null,
@@ -148,10 +164,34 @@ export async function megaEnsureCustomer(
   if (error) {
     // If insertion failed due to race/unique, try resolving again
     const retry = await megaFindPassId(supabaseAdmin, { customerId: shopifyId, userId, email: normEmail });
-    return { passId: retry || null };
+    if (retry) {
+      const { data } = await supabaseAdmin
+        .from("mega_customers")
+        .select("mg_pass_id,mg_credits,mg_shopify_customer_id,mg_user_id,mg_email,mg_meta")
+        .eq("mg_pass_id", retry)
+        .maybeSingle();
+
+      return {
+        passId: retry,
+        credits: data?.mg_credits ?? null,
+        shopifyCustomerId: data?.mg_shopify_customer_id || null,
+        userId: data?.mg_user_id || null,
+        email: data?.mg_email || null,
+        meta: data?.mg_meta || {},
+      };
+    }
+
+    return { passId: null, credits: null };
   }
 
-  return { passId };
+  return {
+    passId,
+    credits: payload.mg_credits,
+    shopifyCustomerId: payload.mg_shopify_customer_id,
+    userId: payload.mg_user_id,
+    email: payload.mg_email,
+    meta: payload.mg_meta,
+  };
 }
 
 async function megaUpsertLedgerRow(supabaseAdmin, row) {
@@ -175,7 +215,7 @@ export async function megaWriteSessionEvent(
   supabaseAdmin,
   { customerId, userId = null, email = null, sessionId, platform, title, createdAt }
 ) {
-  const { passId } = await megaEnsureCustomer(supabaseAdmin, {
+  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
     customerId,
     userId,
     email,
@@ -185,14 +225,21 @@ export async function megaWriteSessionEvent(
   if (!passId) return { passId: null };
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(sessionId),
+    mg_id: namespacedId("session", sessionId),
     mg_record_type: "session",
     mg_pass_id: passId,
+    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: String(sessionId),
     mg_platform: platform ? String(platform) : null,
     mg_title: title ? String(title) : null,
     mg_created_at: createdAt || nowIso(),
     mg_meta: { source: "legacy.sessions" },
+    mg_payload: {
+      sessionId: String(sessionId),
+      platform: platform ? String(platform) : null,
+      title: title ? String(title) : null,
+      createdAt: createdAt || nowIso(),
+    },
   });
 
   return { passId };
@@ -205,7 +252,7 @@ export async function megaWriteGenerationEvent(
   supabaseAdmin,
   { customerId, userId = null, email = null, generation }
 ) {
-  const { passId } = await megaEnsureCustomer(supabaseAdmin, {
+  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
     customerId,
     userId,
     email,
@@ -216,10 +263,12 @@ export async function megaWriteGenerationEvent(
   const g = generation || {};
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(g.id),
+    mg_id: namespacedId("generation", g.id),
     mg_record_type: "generation",
     mg_pass_id: passId,
+    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: g.sessionId ? String(g.sessionId) : null,
+    mg_generation_id: g.id ? String(g.id) : null,
     mg_platform: g.platform ? String(g.platform) : null,
     mg_type: g.type ? String(g.type) : null,
     mg_prompt: g.prompt ? String(g.prompt) : null,
@@ -234,6 +283,7 @@ export async function megaWriteGenerationEvent(
     mg_error: g.meta?.error ? String(g.meta.error) : null,
     mg_created_at: g.createdAt || nowIso(),
     mg_meta: g.meta ?? null,
+    mg_payload: g,
   });
 
   return { passId };
@@ -246,7 +296,7 @@ export async function megaWriteFeedbackEvent(
   supabaseAdmin,
   { customerId, userId = null, email = null, feedback }
 ) {
-  const { passId } = await megaEnsureCustomer(supabaseAdmin, {
+  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
     customerId,
     userId,
     email,
@@ -257,9 +307,10 @@ export async function megaWriteFeedbackEvent(
   const f = feedback || {};
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(f.id),
+    mg_id: namespacedId("feedback", f.id),
     mg_record_type: "feedback",
     mg_pass_id: passId,
+    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: f.sessionId ? String(f.sessionId) : null,
     mg_generation_id: f.generationId ? String(f.generationId) : null,
     mg_platform: f.platform ? String(f.platform) : null,
@@ -270,6 +321,7 @@ export async function megaWriteFeedbackEvent(
     mg_video_url: f.videoUrl ? String(f.videoUrl) : null,
     mg_created_at: f.createdAt || nowIso(),
     mg_meta: { source: "legacy.feedback" },
+    mg_payload: f,
   });
 
   return { passId };
@@ -281,9 +333,9 @@ export async function megaWriteFeedbackEvent(
  */
 export async function megaWriteCreditTxnEvent(
   supabaseAdmin,
-  { customerId, userId = null, email = null, id, delta, reason, source, refType = null, refId = null, createdAt = null }
+  { customerId, userId = null, email = null, id, delta, reason, source, refType = null, refId = null, createdAt = null, nextBalance = null }
 ) {
-  const { passId } = await megaEnsureCustomer(supabaseAdmin, {
+  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
     customerId,
     userId,
     email,
@@ -293,9 +345,10 @@ export async function megaWriteCreditTxnEvent(
   if (!passId) return { passId: null };
 
   await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: String(id || `ctx_${crypto.randomUUID()}`),
+    mg_id: namespacedId("credit_transaction", id || `ctx_${crypto.randomUUID()}`),
     mg_record_type: "credit_transaction",
     mg_pass_id: passId,
+    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
     mg_reason: reason ? String(reason) : null,
     mg_source: source ? String(source) : null,
@@ -303,7 +356,26 @@ export async function megaWriteCreditTxnEvent(
     mg_ref_id: refId ? String(refId) : null,
     mg_created_at: createdAt || nowIso(),
     mg_meta: { source: "legacy.credit_transactions" },
+    mg_payload: {
+      id: id || null,
+      delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
+      reason: reason || null,
+      source: source || null,
+      refType: refType || null,
+      refId: refId || null,
+      createdAt: createdAt || nowIso(),
+      nextBalance: typeof nextBalance === "number" ? nextBalance : null,
+    },
   });
+
+  if (typeof nextBalance === "number" && Number.isFinite(nextBalance)) {
+    try {
+      await supabaseAdmin
+        .from("mega_customers")
+        .update({ mg_credits: Math.floor(nextBalance), mg_updated_at: nowIso() })
+        .eq("mg_pass_id", passId);
+    } catch (_) {}
+  }
 
   return { passId };
 }
@@ -322,24 +394,7 @@ export async function megaParityCounts(supabaseAdmin) {
     return c ?? 0;
   };
 
-  const [
-    legacyCustomers,
-    legacySessions,
-    legacyGenerations,
-    legacyFeedback,
-    legacyCreditTxns,
-    megaCustomers,
-    megaSessions,
-    megaGenerations,
-    megaFeedback,
-    megaCreditTxns,
-  ] = await Promise.all([
-    count("customers", "shopify_customer_id"),
-    count("sessions", "id"),
-    count("generations", "id"),
-    count("feedback", "id"),
-    count("credit_transactions", "id"),
-
+  const [megaCustomers, megaSessions, megaGenerations, megaFeedback, megaCreditTxns] = await Promise.all([
     count("mega_customers", "mg_pass_id"),
     count("mega_generations", "mg_id", { eq: ["mg_record_type", "session"] }),
     count("mega_generations", "mg_id", { eq: ["mg_record_type", "generation"] }),
@@ -348,26 +403,12 @@ export async function megaParityCounts(supabaseAdmin) {
   ]);
 
   return {
-    legacy: {
-      customers: legacyCustomers,
-      sessions: legacySessions,
-      generations: legacyGenerations,
-      feedback: legacyFeedback,
-      credit_transactions: legacyCreditTxns,
-    },
     mega: {
       customers: megaCustomers,
       sessions: megaSessions,
       generations: megaGenerations,
       feedback: megaFeedback,
       credit_transactions: megaCreditTxns,
-    },
-    drift: {
-      customers: (megaCustomers ?? 0) - (legacyCustomers ?? 0),
-      sessions: (megaSessions ?? 0) - (legacySessions ?? 0),
-      generations: (megaGenerations ?? 0) - (legacyGenerations ?? 0),
-      feedback: (megaFeedback ?? 0) - (legacyFeedback ?? 0),
-      credit_transactions: (megaCreditTxns ?? 0) - (legacyCreditTxns ?? 0),
     },
     meta: { generatedAt: nowIso() },
   };

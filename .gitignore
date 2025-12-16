@@ -1,4 +1,8 @@
 node_modules
 .env
-npm-debug.log
-.DS_Store
+.env.local
+npm-debug.log*
+pnpm-lock.yaml
+yarn.lock
+dist
+prisma/dev.db

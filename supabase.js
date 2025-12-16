@@ -56,24 +56,24 @@ export async function upsertProfileRow({ userId, email, shopifyCustomerId }) {
     if (!supabase) return;
 
     const normalizedEmail = normalizeEmail(email);
-    if (!userId) return;
-    if (!UUID_REGEX.test(userId)) {
-      console.error("[supabase] upsertProfileRow skipped invalid userId", userId);
-      return;
-    }
+    if (!userId && !normalizedEmail) return;
 
     const now = new Date().toISOString();
+    const mgId = userId ? `profile:${userId}` : `profile:${normalizedEmail}`;
+
     const payload = {
-      user_id: userId,
-      email: normalizedEmail,
-      shopify_customer_id: shopifyCustomerId || null,
-      updated_at: now,
-      created_at: now,
+      mg_id: mgId,
+      mg_record_type: "profile",
+      mg_user_id: userId && UUID_REGEX.test(userId) ? userId : null,
+      mg_email: normalizedEmail,
+      mg_shopify_customer_id: shopifyCustomerId || null,
+      mg_created_at: now,
+      mg_updated_at: now,
     };
 
     const { error } = await supabase
-      .from("profiles")
-      .upsert(payload, { onConflict: "user_id" });
+      .from("mega_admin")
+      .upsert(payload, { onConflict: "mg_id" });
     if (error) {
       console.error("[supabase] upsertProfileRow error", error);
     }
@@ -82,13 +82,7 @@ export async function upsertProfileRow({ userId, email, shopifyCustomerId }) {
   }
 }
 
-export async function upsertSessionRow({
-  userId,
-  email,
-  token,
-  ip,
-  userAgent,
-}) {
+export async function upsertSessionRow({ userId, email, token, ip, userAgent }) {
   try {
     const supabase = getSupabaseAdmin();
     if (!supabase) return;
@@ -103,19 +97,22 @@ export async function upsertSessionRow({
     const now = new Date().toISOString();
 
     const payload = {
-      session_hash: hash,
-      user_id: validUserId,
-      email: normalizedEmail,
-      ip: safeIp(ip),
-      user_agent: safeUserAgent(userAgent),
-      first_seen_at: now,
-      last_seen_at: now,
-      updated_at: now,
+      mg_id: `admin_session:${hash}`,
+      mg_record_type: "admin_session",
+      mg_session_hash: hash,
+      mg_user_id: validUserId,
+      mg_email: normalizedEmail,
+      mg_ip: safeIp(ip),
+      mg_user_agent: safeUserAgent(userAgent),
+      mg_first_seen_at: now,
+      mg_last_seen_at: now,
+      mg_created_at: now,
+      mg_updated_at: now,
     };
 
     const { error } = await supabase
-      .from("admin_sessions")
-      .upsert(payload, { onConflict: "session_hash" });
+      .from("mega_admin")
+      .upsert(payload, { onConflict: "mg_id" });
     if (error) {
       console.error("[supabase] upsertSessionRow error", error);
     }
@@ -143,18 +140,20 @@ export async function logAdminAction({
     const now = new Date().toISOString();
 
     const payload = {
-      id: id || crypto.randomUUID(),
-      user_id: validUserId,
-      email: normalizedEmail,
-      action: action || null,
-      route: route || null,
-      method: method || null,
-      status: typeof status === "number" ? status : null,
-      detail: detail ?? null,
-      created_at: now,
+      mg_id: id ? `admin_audit:${id}` : `admin_audit:${crypto.randomUUID()}`,
+      mg_record_type: "admin_audit",
+      mg_user_id: validUserId,
+      mg_email: normalizedEmail,
+      mg_action: action || null,
+      mg_route: route || null,
+      mg_method: method || null,
+      mg_status: typeof status === "number" ? status : null,
+      mg_detail: detail ?? null,
+      mg_created_at: now,
+      mg_updated_at: now,
     };
 
-    const { error } = await supabase.from("admin_audit").insert(payload);
+    const { error } = await supabase.from("mega_admin").upsert(payload, { onConflict: "mg_id" });
     if (error) {
       console.error("[supabase] logAdminAction error", error);
     }
@@ -163,57 +162,4 @@ export async function logAdminAction({
   }
 }
 
-export async function upsertGenerationRow({
-  id,
-  userId,
-  email,
-  requestId,
-  sessionId,
-  model,
-  provider,
-  status,
-  inputChars,
-  outputChars,
-  latencyMs,
-  meta,
-  detail,
-}) {
-  try {
-    const supabase = getSupabaseAdmin();
-    if (!supabase) return;
-    if (!id) {
-      console.error("[supabase] upsertGenerationRow requires id");
-      return;
-    }
-
-    const normalizedEmail = normalizeEmail(email);
-    const validUserId = userId && UUID_REGEX.test(userId) ? userId : null;
-    const now = new Date().toISOString();
-
-    const payload = {
-      id,
-      user_id: validUserId,
-      email: normalizedEmail,
-      request_id: requestId || null,
-      session_id: sessionId || null,
-      model: model || null,
-      provider: provider || null,
-      status: status || null,
-      input_chars: typeof inputChars === "number" ? inputChars : null,
-      output_chars: typeof outputChars === "number" ? outputChars : null,
-      latency_ms: typeof latencyMs === "number" ? latencyMs : null,
-      meta: meta ?? detail ?? null,
-      created_at: now,
-      updated_at: now,
-    };
-
-    const { error } = await supabase
-      .from("generations")
-      .upsert(payload, { onConflict: "id" });
-    if (error) {
-      console.error("[supabase] upsertGenerationRow error", error);
-    }
-  } catch (err) {
-    console.error("[supabase] upsertGenerationRow failed", err);
-  }
-}
+// Additional legacy helpers removed; MEGA tables are the source of truth.

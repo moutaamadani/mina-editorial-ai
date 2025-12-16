@@ -17,5 +17,8 @@
     "openai": "^4.73.0",
     "replicate": "^0.32.0",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
   }
 }

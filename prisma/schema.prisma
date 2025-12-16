@@ -1,0 +1,10 @@
+// Minimal Prisma schema to satisfy Render build (project uses Supabase directly)
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}

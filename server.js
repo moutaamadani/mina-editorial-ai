@@ -13,13 +13,7 @@ import multer from "multer";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createClient } from "@supabase/supabase-js";
 
-import {
-  parseDataUrl,
-  makeKey,
-  putBufferToR2,
-  publicUrlForKey,
-  storeRemoteImageToR2,
-} from "./r2.js";
+import { parseDataUrl } from "./r2.js";
 
 import { logAdminAction, upsertGenerationRow, upsertSessionRow } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
@@ -187,6 +181,12 @@ function makeGptIOInput({ model, systemMessage, userContent, temperature, maxTok
 // R2 PUBLIC (non-expiring) helpers
 // =======================
 const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/+$/, ""); // e.g. https://assets.faltastudio.com
+
+if (process.env.NODE_ENV === "production" && !R2_PUBLIC_BASE_URL) {
+  throw new Error(
+    "R2_PUBLIC_BASE_URL is REQUIRED in production so asset URLs are permanent (non-expiring)."
+  );
+}
 
 function encodeKeyForUrl(key) {
   return String(key || "")

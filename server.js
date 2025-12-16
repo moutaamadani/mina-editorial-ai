@@ -10,8 +10,7 @@ import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "node:crypto";
 import multer from "multer";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createClient } from "@supabase/supabase-js";
 
 import {
@@ -121,6 +120,20 @@ const upload = multer({
 function safeName(name = "file") {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
+
+function safeFolderName(name = "uploads") {
+  return String(name).replace(/[^a-zA-Z0-9/_-]/g, "_");
+}
+
+function guessExtFromContentType(contentType = "") {
+  const ct = String(contentType).toLowerCase();
+  if (ct.includes("png")) return "png";
+  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
+  if (ct.includes("webp")) return "webp";
+  if (ct.includes("gif")) return "gif";
+  if (ct.includes("mp4")) return "mp4";
+  return "";
+}
 // =======================
 // GPT I/O capture helpers (store what we send to OpenAI + what we get back)
 // =======================
@@ -170,24 +183,82 @@ function makeGptIOInput({ model, systemMessage, userContent, temperature, maxTok
   };
 }
 
-async function r2PutAndSignGet({ key, body, contentType }) {
+// =======================
+// R2 PUBLIC (non-expiring) helpers
+// =======================
+const R2_PUBLIC_BASE_URL = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/+$/, ""); // e.g. https://assets.faltastudio.com
+
+function encodeKeyForUrl(key) {
+  return String(key || "")
+    .split("/")
+    .map((p) => encodeURIComponent(p))
+    .join("/");
+}
+
+function r2PublicUrlForKeyLocal(key) {
+  if (!key) return "";
+  if (R2_PUBLIC_BASE_URL) return `${R2_PUBLIC_BASE_URL}/${encodeKeyForUrl(key)}`;
+
+  // Fallback works only if your bucket is publicly accessible on the default endpoint
+  if (R2_ACCOUNT_ID && R2_BUCKET) {
+    return `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET}/${encodeKeyForUrl(key)}`;
+  }
+  return "";
+}
+
+function isOurAssetUrl(u) {
+  try {
+    const url = new URL(String(u));
+    const host = url.hostname.toLowerCase();
+
+    if (R2_PUBLIC_BASE_URL) {
+      const baseHost = new URL(R2_PUBLIC_BASE_URL).hostname.toLowerCase();
+      if (host === baseHost) return true;
+    }
+
+    if (host.endsWith("r2.cloudflarestorage.com")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function r2PutPublic({ key, body, contentType }) {
   await r2.send(
     new PutObjectCommand({
       Bucket: R2_BUCKET,
       Key: key,
       Body: body,
       ContentType: contentType || "application/octet-stream",
+      CacheControl: "public, max-age=31536000, immutable",
     })
   );
 
-  // Signed GET URL (works even if bucket is private)
-  const signedUrl = await getSignedUrl(
-    r2,
-    new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }),
-    { expiresIn: 60 * 60 * 24 * 7 } // 7 days
-  );
+  const publicUrl = r2PublicUrlForKeyLocal(key);
+  if (!publicUrl) {
+    throw new Error(
+      "Missing R2_PUBLIC_BASE_URL. Set it to your public R2 domain so URLs never expire."
+    );
+  }
 
-  return signedUrl;
+  return { key, publicUrl };
+}
+
+async function storeRemoteToR2Public({ remoteUrl, kind = "generations", customerId = "anon" }) {
+  const resp = await fetch(remoteUrl);
+  if (!resp.ok) throw new Error(`REMOTE_FETCH_FAILED (${resp.status})`);
+
+  const contentType = resp.headers.get("content-type") || "application/octet-stream";
+  const arrayBuf = await resp.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
+
+  const folder = safeFolderName(kind);
+  const cid = String(customerId || "anon");
+  const uuid = crypto.randomUUID();
+  const extGuess = guessExtFromContentType(contentType);
+  const key = `${folder}/${cid}/${Date.now()}-${uuid}${extGuess ? `.${extGuess}` : ""}`;
+
+  return r2PutPublic({ key, body: buf, contentType });
 }
 
 function getRequestMeta(req) {
@@ -2209,14 +2280,13 @@ app.post("/sessions/start", async (req, res) => {
 });
 
 // =======================
-// ---- Mina Editorial (image) — Supabase-only credits
+// ---- Mina Editorial (image) — R2 ONLY output (no provider URLs)
 // =======================
 app.post("/editorial/generate", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   const generationId = `gen_${uuidv4()}`;
   const startedAt = Date.now();
 
-  // keep for catch/meta
   let customerId = "anonymous";
   let platform = "tiktok";
   let stylePresetKey = "";
@@ -2266,14 +2336,12 @@ app.post("/editorial/generate", async (req, res) => {
       });
     }
 
-    // Ensure customer exists (welcome credits etc.)
     await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
 
-    // Credits check (Supabase)
     const cfg = await getRuntimeConfig();
     const imageCost = Number(cfg?.credits?.imageCost ?? IMAGE_CREDITS_COST);
     const creditsInfo = await sbGetCredits({
@@ -2307,7 +2375,6 @@ app.post("/editorial/generate", async (req, res) => {
       });
     }
 
-    // Session
     const session = ensureSession(body.sessionId, customerId, platform);
     const sessionId = session.id;
     persistSessionHash(req, sessionId || requestId, req.user?.userId, req.user?.email);
@@ -2358,22 +2425,6 @@ app.post("/editorial/generate", async (req, res) => {
     const imageTexts = promptResult.imageTexts || [];
     const userMessage = promptResult.userMessage || "";
 
-    auditAiEvent(req, "ai_request", 200, {
-      request_id: requestId,
-      step: "vision",
-      input_type: productImageUrl ? "image" : "text",
-      output_type: "image",
-      session_id: sessionId,
-      customer_id: customerId,
-      model: SEADREAM_MODEL,
-      provider: "replicate",
-      input_chars: (prompt || "").length,
-      stylePresetKey,
-      minaVisionEnabled,
-      generation_id: generationId,
-    });
-
-    // Aspect ratio
     const requestedAspect = safeString(body.aspectRatio || "");
     const validAspects = new Set(["9:16", "3:4", "2:3", "1:1", "3:2", "16:9"]);
     let aspectRatio = "2:3";
@@ -2388,7 +2439,6 @@ app.post("/editorial/generate", async (req, res) => {
       else if (platform.includes("youtube")) aspectRatio = "16:9";
     }
 
-        // Replicate run (SeaDream) — uses runtime config (cfg) loaded earlier in this route
     const seadreamModel = cfg?.models?.seadream || SEADREAM_MODEL;
 
     const input = {
@@ -2401,12 +2451,26 @@ app.post("/editorial/generate", async (req, res) => {
       sequential_image_generation: cfg?.replicate?.seadream?.sequential_image_generation || "disabled",
     };
 
+    auditAiEvent(req, "ai_request", 200, {
+      request_id: requestId,
+      step: "vision",
+      input_type: productImageUrl ? "image" : "text",
+      output_type: "image",
+      session_id: sessionId,
+      customer_id: customerId,
+      model: seadreamModel,
+      provider: "replicate",
+      input_chars: (prompt || "").length,
+      stylePresetKey,
+      minaVisionEnabled,
+      generation_id: generationId,
+    });
+
     const output = await replicate.run(seadreamModel, { input });
 
-
-    let imageUrls = [];
+    let providerUrls = [];
     if (Array.isArray(output)) {
-      imageUrls = output
+      providerUrls = output
         .map((item) => {
           if (typeof item === "string") return item;
           if (item && typeof item === "object") return item.url || item.image || null;
@@ -2414,18 +2478,30 @@ app.post("/editorial/generate", async (req, res) => {
         })
         .filter(Boolean);
     } else if (typeof output === "string") {
-      imageUrls = [output];
+      providerUrls = [output];
     } else if (output && typeof output === "object") {
-      if (typeof output.url === "string") imageUrls = [output.url];
-      else if (Array.isArray(output.output)) imageUrls = output.output.filter((v) => typeof v === "string");
+      if (typeof output.url === "string") providerUrls = [output.url];
+      else if (Array.isArray(output.output)) providerUrls = output.output.filter((v) => typeof v === "string");
     }
 
+    if (!providerUrls.length) throw new Error("Image generation returned no URL.");
+
+    const storedImages = await Promise.all(
+      providerUrls.map((u) =>
+        storeRemoteToR2Public({
+          remoteUrl: u,
+          kind: "generations",
+          customerId,
+        })
+      )
+    );
+
+    const imageUrls = storedImages.map((s) => s.publicUrl);
+    const outputKey = storedImages[0]?.key || null;
     const imageUrl = imageUrls[0] || null;
-    if (!imageUrl) {
-      throw new Error("Image generation returned no URL.");
-    }
 
-    // Spend credits AFTER successful generation (Supabase)
+    if (!imageUrl) throw new Error("R2 store failed (no public URL). Check R2_PUBLIC_BASE_URL.");
+
     const spend = await sbAdjustCredits({
       customerId,
       delta: -imageCost,
@@ -2448,6 +2524,7 @@ app.post("/editorial/generate", async (req, res) => {
       platform,
       prompt: prompt || "",
       outputUrl: imageUrl,
+      outputKey,
       createdAt: new Date().toISOString(),
       meta: {
         tone,
@@ -2464,7 +2541,7 @@ app.post("/editorial/generate", async (req, res) => {
         latencyMs,
         inputChars: (prompt || "").length,
         outputChars,
-        model: SEADREAM_MODEL,
+        model: seadreamModel,
         provider: "replicate",
         status: "succeeded",
         userId: req.user?.userId,
@@ -2472,7 +2549,6 @@ app.post("/editorial/generate", async (req, res) => {
       },
     };
 
-    // Persist business generation row (Supabase table)
     void sbUpsertGenerationBusiness(generationRecord).catch((e) =>
       console.error("[supabase] generation upsert failed:", e?.message || e)
     );
@@ -2485,7 +2561,7 @@ app.post("/editorial/generate", async (req, res) => {
       r2_url: imageUrl,
       session_id: sessionId,
       customer_id: customerId,
-      model: SEADREAM_MODEL,
+      model: seadreamModel,
       provider: "replicate",
       latency_ms: latencyMs,
       input_chars: (prompt || "").length,
@@ -2499,7 +2575,7 @@ app.post("/editorial/generate", async (req, res) => {
       sessionId,
       userId: req.user?.userId,
       email: req.user?.email,
-      model: SEADREAM_MODEL,
+      model: seadreamModel,
       provider: "replicate",
       status: "succeeded",
       inputChars: (prompt || "").length,
@@ -2516,18 +2592,17 @@ app.post("/editorial/generate", async (req, res) => {
         aspectRatio,
         minaVisionEnabled,
         stylePresetKey,
+        outputKey,
       },
     });
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "Mina Editorial image generated via SeaDream.",
+      message: "Mina Editorial image generated (stored in R2).",
       requestId,
       prompt,
       imageUrl,
       imageUrls,
-      rawOutput: output,
-      payload: body,
       generationId,
       sessionId,
       credits: {
@@ -2580,7 +2655,7 @@ app.post("/editorial/generate", async (req, res) => {
       },
     });
 
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "EDITORIAL_GENERATION_ERROR",
       message: err?.message || "Unexpected error during image generation.",
@@ -2588,7 +2663,6 @@ app.post("/editorial/generate", async (req, res) => {
     });
   }
 });
-
 // =======================
 // ---- Motion suggestion (textarea) — Supabase-only likes read
 // =======================
@@ -2799,7 +2873,7 @@ app.post("/motion/suggest", async (req, res) => {
 });
 
 // =======================
-// ---- Mina Motion (video) — Supabase-only credits
+// ---- Mina Motion (video) — R2 ONLY output (no provider URLs)
 // =======================
 app.post("/motion/generate", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
@@ -2835,16 +2909,6 @@ app.post("/motion/generate", async (req, res) => {
         : "anonymous";
 
     if (!lastImageUrl) {
-      auditAiEvent(req, "ai_error", 400, {
-        request_id: requestId,
-        step: "motion",
-        input_type: "text",
-        output_type: "video",
-        model: KLING_MODEL,
-        provider: "replicate",
-        generation_id: generationId,
-        detail: { reason: "missing_last_image" },
-      });
       return res.status(400).json({
         ok: false,
         error: "MISSING_LAST_IMAGE",
@@ -2854,16 +2918,6 @@ app.post("/motion/generate", async (req, res) => {
     }
 
     if (!motionDescription) {
-      auditAiEvent(req, "ai_error", 400, {
-        request_id: requestId,
-        step: "motion",
-        input_type: "text",
-        output_type: "video",
-        model: KLING_MODEL,
-        provider: "replicate",
-        generation_id: generationId,
-        detail: { reason: "missing_motion_description" },
-      });
       return res.status(400).json({
         ok: false,
         error: "MISSING_MOTION_DESCRIPTION",
@@ -2872,15 +2926,12 @@ app.post("/motion/generate", async (req, res) => {
       });
     }
 
-    // Ensure customer exists
     await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
 
-    // Credits check (Supabase)
-    // Credits check (Supabase)
     const cfg = await getRuntimeConfig();
     const motionCost = Number(cfg?.credits?.motionCost ?? MOTION_CREDITS_COST);
     const creditsInfo = await sbGetCredits({
@@ -2890,20 +2941,6 @@ app.post("/motion/generate", async (req, res) => {
     });
 
     if ((creditsInfo.balance ?? 0) < motionCost) {
-      auditAiEvent(req, "ai_error", 402, {
-        request_id: requestId,
-        step: "motion",
-        input_type: "text",
-        output_type: "video",
-        model: KLING_MODEL,
-        provider: "replicate",
-        generation_id: generationId,
-        detail: {
-          reason: "insufficient_credits",
-          required: motionCost,
-          balance: creditsInfo.balance ?? 0,
-        },
-      });
       return res.status(402).json({
         ok: false,
         error: "INSUFFICIENT_CREDITS",
@@ -2914,7 +2951,6 @@ app.post("/motion/generate", async (req, res) => {
       });
     }
 
-    // Session
     const session = ensureSession(body.sessionId, customerId, platform);
     const sessionId = session.id;
     persistSessionHash(req, sessionId || requestId, req.user?.userId, req.user?.email);
@@ -2962,22 +2998,7 @@ app.post("/motion/generate", async (req, res) => {
     if (durationSeconds > 10) durationSeconds = 10;
     if (durationSeconds < 1) durationSeconds = 1;
 
-    auditAiEvent(req, "ai_request", 200, {
-      request_id: requestId,
-      step: "motion",
-      input_type: "text",
-      output_type: "video",
-      session_id: sessionId,
-      customer_id: customerId,
-      model: KLING_MODEL,
-      provider: "replicate",
-      input_chars: (prompt || "").length,
-      stylePresetKey,
-      minaVisionEnabled,
-      generation_id: generationId,
-    });
-
-        const klingModel = cfg?.models?.kling || KLING_MODEL;
+    const klingModel = cfg?.models?.kling || KLING_MODEL;
 
     const input = {
       mode: cfg?.replicate?.kling?.mode || "pro",
@@ -2989,30 +3010,37 @@ app.post("/motion/generate", async (req, res) => {
 
     const output = await replicate.run(klingModel, { input });
 
-
-    let videoUrl = null;
+    let providerVideoUrl = null;
     if (typeof output === "string") {
-      videoUrl = output;
+      providerVideoUrl = output;
     } else if (Array.isArray(output) && output.length > 0) {
       const first = output[0];
-      if (typeof first === "string") videoUrl = first;
+      if (typeof first === "string") providerVideoUrl = first;
       else if (first && typeof first === "object") {
-        if (typeof first.url === "string") videoUrl = first.url;
-        else if (typeof first.video === "string") videoUrl = first.video;
+        if (typeof first.url === "string") providerVideoUrl = first.url;
+        else if (typeof first.video === "string") providerVideoUrl = first.video;
       }
     } else if (output && typeof output === "object") {
-      if (typeof output.url === "string") videoUrl = output.url;
-      else if (typeof output.video === "string") videoUrl = output.video;
+      if (typeof output.url === "string") providerVideoUrl = output.url;
+      else if (typeof output.video === "string") providerVideoUrl = output.video;
       else if (Array.isArray(output.output) && output.output.length > 0) {
-        if (typeof output.output[0] === "string") videoUrl = output.output[0];
+        if (typeof output.output[0] === "string") providerVideoUrl = output.output[0];
       }
     }
 
-    if (!videoUrl) {
-      throw new Error("Motion generation returned no URL.");
-    }
+    if (!providerVideoUrl) throw new Error("Motion generation returned no URL.");
 
-    // Spend credits AFTER successful generation (Supabase)
+    const storedVideo = await storeRemoteToR2Public({
+      remoteUrl: providerVideoUrl,
+      kind: "motions",
+      customerId,
+    });
+
+    const videoUrl = storedVideo.publicUrl;
+    const outputKey = storedVideo.key;
+
+    if (!videoUrl) throw new Error("R2 store failed (no public URL). Check R2_PUBLIC_BASE_URL.");
+
     const spend = await sbAdjustCredits({
       customerId,
       delta: -motionCost,
@@ -3035,6 +3063,7 @@ app.post("/motion/generate", async (req, res) => {
       platform,
       prompt: motionDescription || "",
       outputUrl: videoUrl,
+      outputKey,
       createdAt: new Date().toISOString(),
       meta: {
         tone,
@@ -3047,7 +3076,7 @@ app.post("/motion/generate", async (req, res) => {
         latencyMs,
         inputChars: (prompt || "").length,
         outputChars,
-        model: KLING_MODEL,
+        model: klingModel,
         provider: "replicate",
         status: "succeeded",
         userId: req.user?.userId,
@@ -3067,7 +3096,7 @@ app.post("/motion/generate", async (req, res) => {
       r2_url: videoUrl,
       session_id: sessionId,
       customer_id: customerId,
-      model: KLING_MODEL,
+      model: klingModel,
       provider: "replicate",
       latency_ms: latencyMs,
       input_chars: (prompt || "").length,
@@ -3081,7 +3110,7 @@ app.post("/motion/generate", async (req, res) => {
       sessionId,
       userId: req.user?.userId,
       email: req.user?.email,
-      model: KLING_MODEL,
+      model: klingModel,
       provider: "replicate",
       status: "succeeded",
       inputChars: (prompt || "").length,
@@ -3098,27 +3127,18 @@ app.post("/motion/generate", async (req, res) => {
         durationSeconds,
         minaVisionEnabled,
         stylePresetKey,
+        outputKey,
       },
     });
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "Mina Motion video generated via Kling.",
+      message: "Mina Motion video generated (stored in R2).",
       requestId,
       prompt,
       videoUrl,
-      rawOutput: output,
       generationId,
       sessionId,
-      payload: {
-        lastImageUrl,
-        motionDescription,
-        tone,
-        platform,
-        durationSeconds,
-        customerId,
-        stylePresetKey,
-      },
       credits: {
         balance: spend.balance,
         cost: motionCost,
@@ -3165,7 +3185,7 @@ app.post("/motion/generate", async (req, res) => {
       },
     });
 
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "MOTION_GENERATION_ERROR",
       message: err?.message || "Unexpected error during motion generation.",
@@ -3173,9 +3193,8 @@ app.post("/motion/generate", async (req, res) => {
     });
   }
 });
-
 // =======================
-// ---- Feedback / likes (image + motion) — Supabase-only persistence
+// ---- Feedback / likes (R2 ONLY persistence)
 // =======================
 app.post("/feedback/like", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
@@ -3214,25 +3233,43 @@ app.post("/feedback/like", async (req, res) => {
       });
     }
 
-    // Ensure customer exists
     await sbEnsureCustomer({
       customerId,
       userId: req?.user?.userId || null,
       email: req?.user?.email || null,
     });
 
-    // Update cache (optional)
+    let cleanImageUrl = imageUrl || "";
+    let cleanVideoUrl = videoUrl || "";
+
+    if (cleanImageUrl && !isOurAssetUrl(cleanImageUrl)) {
+      const stored = await storeRemoteToR2Public({
+        remoteUrl: cleanImageUrl,
+        kind: "likes-images",
+        customerId,
+      });
+      cleanImageUrl = stored.publicUrl;
+    }
+
+    if (cleanVideoUrl && !isOurAssetUrl(cleanVideoUrl)) {
+      const stored = await storeRemoteToR2Public({
+        remoteUrl: cleanVideoUrl,
+        kind: "likes-videos",
+        customerId,
+      });
+      cleanVideoUrl = stored.publicUrl;
+    }
+
     rememberLike(customerId, {
       resultType,
       platform,
       prompt,
       comment,
-      imageUrl: imageUrl || null,
-      videoUrl: videoUrl || null,
+      imageUrl: cleanImageUrl || null,
+      videoUrl: cleanVideoUrl || null,
     });
 
-    // Persist to Supabase feedback table
-    const feedbackId = crypto.randomUUID(); // feedback.id is uuid
+    const feedbackId = crypto.randomUUID();
     const feedback = {
       id: feedbackId,
       sessionId,
@@ -3242,23 +3279,22 @@ app.post("/feedback/like", async (req, res) => {
       platform,
       prompt,
       comment,
-      imageUrl: imageUrl || null,
-      videoUrl: videoUrl || null,
+      imageUrl: cleanImageUrl || null,
+      videoUrl: cleanVideoUrl || null,
       createdAt: new Date().toISOString(),
     };
 
     await sbUpsertFeedbackBusiness(feedback);
 
-    // total likes (best-effort)
     let totalLikes = null;
     try {
       const likes = await sbGetLikesForCustomer(customerId, MAX_LIKES_PER_CUSTOMER);
       totalLikes = likes.length;
     } catch (_) {}
 
-    res.json({
+    return res.json({
       ok: true,
-      message: "Like stored for Mina Vision Intelligence.",
+      message: "Like stored (R2 only).",
       requestId,
       payload: {
         customerId,
@@ -3273,7 +3309,7 @@ app.post("/feedback/like", async (req, res) => {
     });
   } catch (err) {
     console.error("Error in /feedback/like:", err);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "FEEDBACK_ERROR",
       message: err?.message || "Unexpected error while saving feedback.",
@@ -3281,175 +3317,8 @@ app.post("/feedback/like", async (req, res) => {
     });
   }
 });
-
-// =======================
-// Shopify credits integration — Supabase-only
-// =======================
-const CREDIT_SKUS = {
-  "MINA-50": 50,
-};
-
-app.post("/api/credits/shopify-order", async (req, res) => {
-  try {
-    const secretFromQuery = req.query.secret;
-    if (!secretFromQuery || secretFromQuery !== process.env.SHOPIFY_ORDER_WEBHOOK_SECRET) {
-      return res.status(401).json({
-        ok: false,
-        error: "UNAUTHORIZED",
-        message: "Invalid webhook secret",
-      });
-    }
-
-    if (!sbEnabled()) {
-      return res.status(500).json({
-        ok: false,
-        error: "NO_DB",
-        message: "Supabase not configured",
-      });
-    }
-
-    const order = req.body;
-    if (!order) {
-      return res.status(400).json({ ok: false, error: "NO_ORDER", message: "Missing order payload" });
-    }
-
-    if (!order.customer || !order.customer.id) {
-      return res.status(400).json({ ok: false, error: "NO_CUSTOMER", message: "Order has no customer.id" });
-    }
-
-    const customerId = String(order.customer.id);
-
-    let creditsToAdd = 0;
-    const items = order.line_items || [];
-
-    for (const item of items) {
-      const sku = item.sku;
-      const quantity = item.quantity || 1;
-      if (sku && CREDIT_SKUS[sku]) creditsToAdd += CREDIT_SKUS[sku] * quantity;
-    }
-
-    if (creditsToAdd <= 0) {
-      console.log("[SHOPIFY_WEBHOOK] Order has no credit SKUs. Doing nothing.");
-      return res.json({ ok: true, message: "No credit products found in order.", added: 0 });
-    }
-
-    // Ensure customer exists + add credits
-    await sbEnsureCustomer({ customerId, userId: null, email: order?.email || null });
-
-    const out = await sbAdjustCredits({
-      customerId,
-      delta: creditsToAdd,
-      reason: `shopify-order:${order.id || "unknown"}`,
-      source: "shopify",
-      refType: "shopify-order",
-      refId: order.id ? String(order.id) : null,
-      reqUserId: null,
-      reqEmail: order?.email || null,
-    });
-
-    return res.json({
-      ok: true,
-      message: "Credits added from Shopify order.",
-      customerId,
-      added: creditsToAdd,
-      balance: out.balance,
-      source: out.source,
-    });
-  } catch (err) {
-    console.error("Error in /api/credits/shopify-order:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "INTERNAL_ERROR",
-      message: "Failed to process Shopify order webhook",
-    });
-  }
-});
-
-// =======================
-// Debug credits endpoint — Supabase-only
-// =======================
-app.get("/api/credits/:customerId", async (req, res) => {
-  try {
-    const customerId = String(req.params.customerId || "anonymous");
-
-    if (!sbEnabled()) {
-      return res.status(500).json({
-        ok: false,
-        error: "NO_DB",
-        message: "Supabase not configured",
-      });
-    }
-
-    const history = await sbGetCustomerHistory(customerId);
-    return res.json({
-      ok: true,
-      customerId,
-      balance: history?.credits?.balance ?? 0,
-      history: history?.credits?.history ?? [],
-    });
-  } catch (err) {
-    console.error("GET /api/credits/:customerId error", err);
-    return res.status(500).json({ ok: false, error: "CREDITS_DEBUG_ERROR", message: err?.message || "Failed" });
-  }
-});
-
-// =======================
-// History endpoints — Supabase-only
-// =======================
-app.get("/history/customer/:customerId", async (req, res) => {
-  try {
-    const customerId = String(req.params.customerId || "anonymous");
-
-    if (!sbEnabled()) {
-      return res.status(500).json({ ok: false, error: "NO_DB", message: "Supabase not configured" });
-    }
-
-    const history = await sbGetCustomerHistory(customerId);
-    return res.json({
-      ok: true,
-      ...history,
-    });
-  } catch (err) {
-    console.error("Error in /history/customer/:customerId", err);
-    return res.status(500).json({
-      ok: false,
-      error: "HISTORY_ERROR",
-      message: err?.message || "Unexpected error while loading history.",
-    });
-  }
-});
-
-app.get("/history/admin/overview", requireAdmin, async (_req, res) => {
-  try {
-    if (!sbEnabled()) {
-      return res.status(500).json({ ok: false, error: "NO_DB", message: "Supabase not configured" });
-    }
-
-    const data = await sbGetAdminOverview();
-    const generations = data?.generations || [];
-    const feedbacks = data?.feedbacks || [];
-
-    return res.json({
-      ok: true,
-      totals: {
-        generations: generations.length,
-        feedbacks: feedbacks.length,
-      },
-      generations,
-      feedbacks,
-    });
-  } catch (err) {
-    console.error("Error in /history/admin/overview", err);
-    return res.status(500).json({
-      ok: false,
-      error: "ADMIN_HISTORY_ERROR",
-      message: err?.message || "Unexpected error while loading admin overview.",
-    });
-  }
-});
-
 // ============================
-// Store remote generation (Replicate/OpenAI result URL -> R2) — unchanged
+// Store remote generation (Provider URL -> R2 PUBLIC URL)
 // ============================
 app.post("/store-remote-generation", async (req, res) => {
   try {
@@ -3464,88 +3333,28 @@ app.post("/store-remote-generation", async (req, res) => {
     const cid = (customerId || "anon").toString();
     const fold = (folder || "generations").toString();
 
-    const resp = await fetch(remoteUrl);
-    if (!resp.ok) {
-      return res.status(400).json({
-        ok: false,
-        error: "REMOTE_FETCH_FAILED",
-        status: resp.status,
-      });
-    }
-
-    const contentType = resp.headers.get("content-type") || "application/octet-stream";
-    const arrayBuf = await resp.arrayBuffer();
-    const buf = Buffer.from(arrayBuf);
-
-    const uuid = crypto.randomUUID();
-
-    const ext =
-      contentType.includes("png")
-        ? "png"
-        : contentType.includes("jpeg")
-          ? "jpg"
-          : contentType.includes("webp")
-            ? "webp"
-            : contentType.includes("gif")
-              ? "gif"
-              : contentType.includes("mp4")
-                ? "mp4"
-                : "";
-
-    const key = `${fold}/${cid}/${Date.now()}-${uuid}${ext ? `.${ext}` : ""}`;
-
-    const storedUrl = await r2PutAndSignGet({
-      key,
-      body: buf,
-      contentType,
+    const stored = await storeRemoteToR2Public({
+      remoteUrl,
+      kind: fold,
+      customerId: cid,
     });
 
     return res.json({
       ok: true,
-      key,
-      url: storedUrl,
-      contentType,
-      size: buf.length,
-      sourceUrl: remoteUrl,
+      key: stored.key,
+      url: stored.publicUrl,      // ✅ public, never expires
+      publicUrl: stored.publicUrl,
     });
   } catch (err) {
     console.error("POST /store-remote-generation error:", err);
-    return res.status(500).json({ ok: false, error: "STORE_REMOTE_FAILED" });
+    return res.status(500).json({ ok: false, error: "STORE_REMOTE_FAILED", message: err?.message || "Failed" });
   }
 });
 
+
 // =========================
-// R2 Signed Uploads (SIGNED URL ALWAYS) — unchanged
+// R2 Upload (kept same route name, BUT returns PUBLIC url)
 // =========================
-function safeFolderName(name = "uploads") {
-  return String(name).replace(/[^a-zA-Z0-9/_-]/g, "_");
-}
-
-function guessExtFromContentType(contentType = "") {
-  const ct = String(contentType).toLowerCase();
-  if (ct.includes("png")) return "png";
-  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
-  if (ct.includes("webp")) return "webp";
-  if (ct.includes("gif")) return "gif";
-  if (ct.includes("mp4")) return "mp4";
-  return "";
-}
-
-app.get("/debug/r2", (_req, res) => {
-  const missing = [];
-  if (!process.env.R2_ACCOUNT_ID) missing.push("R2_ACCOUNT_ID");
-  if (!process.env.R2_ACCESS_KEY_ID) missing.push("R2_ACCESS_KEY_ID");
-  if (!process.env.R2_SECRET_ACCESS_KEY) missing.push("R2_SECRET_ACCESS_KEY");
-  if (!process.env.R2_BUCKET) missing.push("R2_BUCKET");
-
-  res.json({
-    ok: missing.length === 0,
-    missing,
-    hasEndpointOverride: !!process.env.R2_ENDPOINT,
-    nodeVersion: process.version,
-  });
-});
-
 app.post("/api/r2/upload-signed", async (req, res) => {
   try {
     const { dataUrl, kind = "uploads", customerId = "anon", filename = "" } = req.body || {};
@@ -3563,12 +3372,13 @@ app.post("/api/r2/upload-signed", async (req, res) => {
       extGuess && !base.toLowerCase().endsWith(`.${extGuess}`) ? `.${extGuess}` : ""
     }`;
 
-    const signedUrl = await r2PutAndSignGet({ key, body: buffer, contentType });
+    const stored = await r2PutPublic({ key, body: buffer, contentType });
 
     return res.json({
       ok: true,
-      key,
-      url: signedUrl,
+      key: stored.key,
+      url: stored.publicUrl,        // ✅ public non-expiring
+      publicUrl: stored.publicUrl,
       contentType,
       bytes: buffer.length,
     });
@@ -3576,7 +3386,7 @@ app.post("/api/r2/upload-signed", async (req, res) => {
     console.error("POST /api/r2/upload-signed error:", err);
     return res.status(500).json({
       ok: false,
-      error: "UPLOAD_SIGNED_FAILED",
+      error: "UPLOAD_PUBLIC_FAILED",
       message: err?.message || "Unexpected error",
     });
   }
@@ -3587,45 +3397,28 @@ app.post("/api/r2/store-remote-signed", async (req, res) => {
     const { url, kind = "generations", customerId = "anon" } = req.body || {};
     if (!url) return res.status(400).json({ ok: false, error: "MISSING_URL" });
 
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      return res.status(400).json({
-        ok: false,
-        error: "REMOTE_FETCH_FAILED",
-        status: resp.status,
-      });
-    }
-
-    const contentType = resp.headers.get("content-type") || "application/octet-stream";
-    const arrayBuf = await resp.arrayBuffer();
-    const buf = Buffer.from(arrayBuf);
-
-    const folder = safeFolderName(kind);
-    const cid = String(customerId || "anon");
-    const uuid = crypto.randomUUID();
-    const extGuess = guessExtFromContentType(contentType);
-
-    const key = `${folder}/${cid}/${Date.now()}-${uuid}${extGuess ? `.${extGuess}` : ""}`;
-
-    const signedUrl = await r2PutAndSignGet({ key, body: buf, contentType });
+    const stored = await storeRemoteToR2Public({
+      remoteUrl: url,
+      kind,
+      customerId,
+    });
 
     return res.json({
       ok: true,
-      key,
-      url: signedUrl,
-      contentType,
-      size: buf.length,
-      sourceUrl: url,
+      key: stored.key,
+      url: stored.publicUrl,        // ✅ public non-expiring
+      publicUrl: stored.publicUrl,
     });
   } catch (err) {
     console.error("POST /api/r2/store-remote-signed error:", err);
     return res.status(500).json({
       ok: false,
-      error: "STORE_REMOTE_SIGNED_FAILED",
+      error: "STORE_REMOTE_PUBLIC_FAILED",
       message: err?.message || "Unexpected error",
     });
   }
 });
+
 
 // =======================
 // Start server

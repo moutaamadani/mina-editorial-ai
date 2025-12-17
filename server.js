@@ -2109,119 +2109,152 @@ function getBearerToken(req) {
   return token;
 }
 
-// ✅ /me should ALSO ensure mega_customers row + grant free credits once
+// ======================================================
+// /me — ensures mega_customers row + returns passId
+// - Creates a customer row on first login
+// - Repairs old rows created by the frontend (missing last_active, credits, etc.)
+// - Grants DEFAULT_FREE_CREDITS once (optional) + sets expiry (optional)
+// ======================================================
 app.get("/me", async (req, res) => {
+  const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     const token = getBearerToken(req);
 
-    // If no token, treat as logged out (don’t 401 spam the app)
+    // Client can send its local passId here so we keep continuity
+    const incomingPassId = String(req.get("X-Mina-Pass-Id") || "").trim() || null;
+
+    const now = new Date().toISOString();
+    const newPassId = () => crypto.randomUUID();
+
+    // If no token, user is not logged in => DO NOT write DB
+    // But still return a passId so the frontend can store it in localStorage
     if (!token) {
-      return res.json({ ok: true, user: null, isAdmin: false });
+      return res.json({
+        ok: true,
+        user: null,
+        isAdmin: false,
+        passId: incomingPassId || newPassId(),
+        requestId,
+      });
     }
 
     if (!supabaseAdmin) {
-      return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
+      return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
     }
 
     const { data, error } = await supabaseAdmin.auth.getUser(token);
     if (error || !data?.user) {
-      return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+      return res.status(401).json({ ok: false, error: "INVALID_TOKEN", requestId });
     }
 
-    const crypto = require("node:crypto");
+    const email = String(data.user.email || "").toLowerCase();
+    const userId = String(data.user.id || "");
 
-    const nowIso = () => new Date().toISOString();
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: "MISSING_USER_ID", requestId });
+    }
 
-    const email = String(data.user.email || "").toLowerCase().trim();
-    const userId = String(data.user.id || "").trim();
-
-    // passId comes from frontend header (AuthGate sends it)
-    const headerPassId =
-      (req.get("X-Mina-Pass-Id") || req.get("x-mina-pass-id") || "").trim() || null;
-
-    const DEFAULT_FREE = Math.max(0, Number(process.env.DEFAULT_FREE_CREDITS || 0) || 0);
-    const EXPIRE_DAYS = Math.max(0, Number(process.env.CREDITS_EXPIRE_DAYS || 0) || 0);
-
-    const addDaysIso = (days) => {
-      const d = new Date();
-      d.setDate(d.getDate() + days);
-      return d.toISOString();
-    };
-
-    // 1) Find customer row (by userId or email)
-    const { data: customer, error: custErr } = await supabaseAdmin
+    // Read existing customer row (if any)
+    const { data: existing, error: exErr } = await supabaseAdmin
       .from("mega_customers")
-      .select("*")
+      .select("mg_pass_id, mg_admin_allowlist, mg_credits, mg_meta, mg_expires_at, mg_user_id, mg_email")
       .or(`mg_user_id.eq.${userId},mg_email.eq.${email}`)
       .limit(1)
       .maybeSingle();
 
-    if (custErr) throw custErr;
+    if (exErr) throw exErr;
 
-    // 2) Decide passId
-    const passId =
-      headerPassId ||
-      (customer?.mg_pass_id ? String(customer.mg_pass_id) : null) ||
-      `pass_${crypto.randomUUID()}`;
+    // Decide passId:
+    // 1) DB passId (if exists)
+    // 2) incoming header passId
+    // 3) new uuid
+    let passId = String(existing?.mg_pass_id || incomingPassId || "").trim();
+    if (!passId) passId = newPassId();
 
-    // 3) “Welcome credits” rule:
-    // Give DEFAULT_FREE_CREDITS once, only for brand new / never-active rows.
-    // (This avoids giving free credits again when someone spends down to 0 later.)
-    const alreadyActive = !!customer?.mg_last_active;
-    const meta = (customer?.mg_meta && typeof customer.mg_meta === "object") ? customer.mg_meta : {};
-    const alreadyGranted = meta?.welcome_free_grant_v1 === true;
+    // meta can be json or string depending on column type/history
+    const meta = (() => {
+      const m = existing?.mg_meta;
+      if (!m) return {};
+      if (typeof m === "object") return m;
+      if (typeof m === "string") {
+        try {
+          const j = JSON.parse(m);
+          return j && typeof j === "object" ? j : {};
+        } catch {
+          return {};
+        }
+      }
+      return {};
+    })();
 
-    const shouldGrantWelcome =
-      DEFAULT_FREE > 0 && !alreadyActive && !alreadyGranted;
+    const DEFAULT_FREE_CREDITS = Math.max(0, Number(process.env.DEFAULT_FREE_CREDITS || 0) || 0);
+    const CREDITS_EXPIRE_DAYS = Math.max(0, Number(process.env.CREDITS_EXPIRE_DAYS || 0) || 0);
 
-    // 4) Create row if missing
-    if (!customer) {
-      const createdAt = nowIso();
+    const expiresAtFromDays = (days) => {
+      if (!days || days <= 0) return null;
+      return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    };
 
-      const insertPayload = {
+    const welcomeAlreadyGranted = meta?.welcomeCreditsGranted === true;
+
+    // -----------------------------
+    // CREATE new row if missing
+    // -----------------------------
+    if (!existing) {
+      const welcomeCredits = DEFAULT_FREE_CREDITS;
+      const expiresAt =
+        welcomeCredits > 0 && CREDITS_EXPIRE_DAYS > 0 ? expiresAtFromDays(CREDITS_EXPIRE_DAYS) : null;
+
+      const payload = {
         mg_pass_id: passId,
         mg_user_id: userId,
         mg_email: email || null,
         mg_display_name: email || null,
 
-        mg_credits: shouldGrantWelcome ? DEFAULT_FREE : 0,
-        mg_expires_at: shouldGrantWelcome && EXPIRE_DAYS > 0 ? addDaysIso(EXPIRE_DAYS) : null,
+        mg_credits: welcomeCredits,
+        mg_expires_at: expiresAt,
+        mg_last_active: now,
 
-        mg_last_active: createdAt,
         mg_disabled: false,
+        mg_admin_allowlist: false,
 
-        mg_meta: shouldGrantWelcome
-          ? { ...meta, welcome_free_grant_v1: true, welcome_free_grant_at: createdAt }
-          : meta,
+        mg_meta: {
+          ...meta,
+          createdFrom: "me",
+          welcomeCreditsGranted: welcomeCredits > 0 ? true : false,
+          welcomeCredits: welcomeCredits,
+          welcomeGrantedAt: welcomeCredits > 0 ? now : null,
+        },
 
-        mg_created_at: createdAt,
-        mg_updated_at: createdAt,
+        mg_source_system: "app",
+        mg_created_at: now,
+        mg_updated_at: now,
       };
 
-      // NOTE: If your table has NOT NULL constraints on some columns,
-      // keep the fields you already use elsewhere.
-      const { error: insErr } = await supabaseAdmin.from("mega_customers").insert(insertPayload);
+      const { error: insErr } = await supabaseAdmin.from("mega_customers").insert(payload);
       if (insErr) throw insErr;
 
-      // Write credit txn event (optional but recommended)
-      if (shouldGrantWelcome) {
-        const ts = createdAt;
-        const txRow = {
-          mg_id: `txn_${crypto.randomUUID()}`,
-          mg_record_type: "credit_transaction",
-          mg_pass_id: passId,
-          mg_delta: DEFAULT_FREE,
-          mg_reason: "welcome_free_credits",
-          mg_source: "system",
-          mg_ref_type: "welcome_grant",
-          mg_ref_id: userId || email || null,
-          mg_created_at: ts,
-          mg_updated_at: ts,
-          mg_event_at: ts,
-          mg_meta: { email: email || null, userId: userId || null },
-          mg_source_system: "app",
-        };
-        await supabaseAdmin.from("mega_generations").insert(txRow);
+      // Optional: also write an event for the welcome credit grant
+      if (welcomeCredits > 0) {
+        await supabaseAdmin
+          .from("mega_generations")
+          .insert({
+            mg_id: crypto.randomUUID(),
+            mg_record_type: "credit_transaction",
+            mg_pass_id: passId,
+            mg_delta: welcomeCredits,
+            mg_reason: "welcome",
+            mg_source: "system",
+            mg_ref_type: "welcome",
+            mg_ref_id: passId,
+            mg_created_at: now,
+            mg_updated_at: now,
+            mg_event_at: now,
+            mg_meta: { email, userId },
+            mg_source_system: "app",
+          })
+          .catch(() => {});
       }
 
       return res.json({
@@ -2229,129 +2262,83 @@ app.get("/me", async (req, res) => {
         user: { id: userId, email },
         isAdmin: false,
         passId,
-        credits: insertPayload.mg_credits,
-        expiresAt: insertPayload.mg_expires_at,
-        grantedFreeCredits: shouldGrantWelcome,
+        requestId,
       });
     }
 
-    // 5) Update existing row (fill missing + mark last_active)
+    // -----------------------------
+    // REPAIR existing row
+    // -----------------------------
     const updates = {
-      mg_updated_at: nowIso(),
-      mg_last_active: nowIso(),
+      mg_updated_at: now,
+      mg_last_active: now,
     };
 
-    if (!customer.mg_user_id) updates.mg_user_id = userId;
-    if (!customer.mg_email && email) updates.mg_email = email;
-    if (!customer.mg_pass_id) updates.mg_pass_id = passId;
-    if (!customer.mg_display_name && email) updates.mg_display_name = email;
+    // Ensure keys are filled
+    if (!existing.mg_pass_id) updates.mg_pass_id = passId;
+    if (!existing.mg_user_id) updates.mg_user_id = userId;
+    if (!existing.mg_email && email) updates.mg_email = email;
 
-    // If it’s the first “real” activity, grant welcome credits once
-    if (shouldGrantWelcome) {
-      const currentCredits = Number(customer.mg_credits || 0) || 0;
-      updates.mg_credits = Math.floor(currentCredits + DEFAULT_FREE);
+    // If old/broken row has 0 credits and never got welcome credits, grant once
+    const currentCredits = Number(existing.mg_credits || 0);
+    if (DEFAULT_FREE_CREDITS > 0 && !welcomeAlreadyGranted && currentCredits <= 0) {
+      updates.mg_credits = DEFAULT_FREE_CREDITS;
 
-      if (!customer.mg_expires_at && EXPIRE_DAYS > 0) {
-        updates.mg_expires_at = addDaysIso(EXPIRE_DAYS);
+      if (CREDITS_EXPIRE_DAYS > 0) {
+        updates.mg_expires_at = expiresAtFromDays(CREDITS_EXPIRE_DAYS);
       }
 
       updates.mg_meta = {
         ...meta,
-        welcome_free_grant_v1: true,
-        welcome_free_grant_at: nowIso(),
+        welcomeCreditsGranted: true,
+        welcomeCredits: DEFAULT_FREE_CREDITS,
+        welcomeGrantedAt: now,
       };
 
-      // Also write credit txn event
-      const ts = nowIso();
-      const txRow = {
-        mg_id: `txn_${crypto.randomUUID()}`,
-        mg_record_type: "credit_transaction",
-        mg_pass_id: passId,
-        mg_delta: DEFAULT_FREE,
-        mg_reason: "welcome_free_credits",
-        mg_source: "system",
-        mg_ref_type: "welcome_grant",
-        mg_ref_id: userId || email || null,
-        mg_created_at: ts,
-        mg_updated_at: ts,
-        mg_event_at: ts,
-        mg_meta: { email: email || null, userId: userId || null },
-        mg_source_system: "app",
-      };
-      await supabaseAdmin.from("mega_generations").insert(txRow);
+      await supabaseAdmin
+        .from("mega_generations")
+        .insert({
+          mg_id: crypto.randomUUID(),
+          mg_record_type: "credit_transaction",
+          mg_pass_id: String(existing.mg_pass_id || passId),
+          mg_delta: DEFAULT_FREE_CREDITS,
+          mg_reason: "welcome_repair",
+          mg_source: "system",
+          mg_ref_type: "welcome",
+          mg_ref_id: String(existing.mg_pass_id || passId),
+          mg_created_at: now,
+          mg_updated_at: now,
+          mg_event_at: now,
+          mg_meta: { email, userId },
+          mg_source_system: "app",
+        })
+        .catch(() => {});
+    } else {
+      updates.mg_meta = { ...meta, lastSeenAt: now };
     }
 
-    if (Object.keys(updates).length) {
-      const { error: upErr } = await supabaseAdmin
-        .from("mega_customers")
-        .update(updates)
-        .eq("mg_pass_id", customer.mg_pass_id);
+    // Update using the safest identifier we have
+    const q = supabaseAdmin.from("mega_customers").update(updates);
+    if (existing.mg_pass_id) q.eq("mg_pass_id", existing.mg_pass_id);
+    else q.eq("mg_user_id", userId);
 
-      if (upErr) throw upErr;
-    }
-
-    // Admin flag comes from the customer row
-    const isAdmin = !!customer?.mg_admin_allowlist;
+    const { error: upErr } = await q;
+    if (upErr) throw upErr;
 
     return res.json({
       ok: true,
       user: { id: userId, email },
-      isAdmin,
-      passId,
-      credits: shouldGrantWelcome
-        ? (Number(customer.mg_credits || 0) || 0) + DEFAULT_FREE
-        : Number(customer.mg_credits || 0) || 0,
-      expiresAt: shouldGrantWelcome
-        ? (customer.mg_expires_at || (EXPIRE_DAYS > 0 ? addDaysIso(EXPIRE_DAYS) : null))
-        : (customer.mg_expires_at || null),
-      grantedFreeCredits: shouldGrantWelcome,
+      isAdmin: !!existing?.mg_admin_allowlist,
+      passId: String(existing.mg_pass_id || passId),
+      requestId,
     });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "ME_FAILED", message: e?.message || String(e) });
-  }
-});
-
-
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "Mina Editorial AI API (Supabase)",
-    time: new Date().toISOString(),
-    supabase: sbEnabled(),
-  });
-});
-
-// public stats → total users on login screen
-app.get("/public/stats/total-users", async (_req, res) => {
-  const requestId = `stats_${Date.now()}`;
-
-  if (!sbEnabled()) {
-    return res.json({
+    console.error("GET /me failed", e);
+    return res.status(500).json({
       ok: false,
+      error: "ME_FAILED",
+      message: e?.message || String(e),
       requestId,
-      source: "no_supabase",
-      totalUsers: null,
-    });
-  }
-
-  try {
-    const dbCount = await sbCountCustomers();
-    const total = (dbCount ?? 0) + MINA_BASELINE_USERS;
-    return res.json({
-      ok: true,
-      requestId,
-      source: "supabase",
-      totalUsers: total,
-    });
-  } catch (err) {
-    console.error("[mina] total-users supabase error", err);
-    return res.json({
-      ok: false,
-      requestId,
-      source: "sb_error",
-      totalUsers: null,
     });
   }
 });

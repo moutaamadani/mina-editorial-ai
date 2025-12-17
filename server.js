@@ -1089,9 +1089,47 @@ async function sbGetAdminOverview() {
 // ======================================================
 // Express setup
 // ======================================================
-app.use(cors());
+
+// ✅ CORS allowlist (set in env CORS_ORIGINS or fallback defaults)
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Fallback defaults (safe for your Render setup + local dev)
+const DEFAULT_ORIGINS = [
+  "https://mina-app-bvpn.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+
+const ALLOWED_ORIGINS = CORS_ORIGINS.length ? CORS_ORIGINS : DEFAULT_ORIGINS;
+
+const corsOptions = {
+  origin: function (origin, cb) {
+    // allow server-to-server / curl / some mobile webviews (no Origin header)
+    if (!origin) return cb(null, true);
+
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+
+  // ✅ MUST be true if frontend uses credentials: "include"
+  credentials: true,
+
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
+  // ✅ include your custom headers + Authorization
+  allowedHeaders: ["Content-Type", "Authorization", "X-Mina-Pass-Id"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // ✅ handle preflight cleanly
+
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
 
 // Replicate (SeaDream + Kling)
 const replicate = new Replicate({

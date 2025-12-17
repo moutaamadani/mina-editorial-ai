@@ -1878,6 +1878,32 @@ app.get("/health", (_req, res) => {
     supabase: sbEnabled(),
   });
 });
+app.get("/history", async (req, res) => {
+  try {
+    const customerId = String(req.query.customerId || "anonymous");
+    if (!sbEnabled()) {
+      return res.status(503).json({ error: "Supabase not available" });
+    }
+
+    const history = await sbGetCustomerHistory(customerId);
+
+    return res.json({
+      ok: true,
+      customerId,
+      generations: history?.generations || [],
+      feedbacks: history?.feedbacks || [],
+      credits: history?.credits || { balance: 0, history: [] },
+    });
+  } catch (e) {
+    console.error("GET /history failed:", e);
+    res.status(500).json({
+      ok: false,
+      error: "HISTORY_FAILED",
+      message: e?.message || String(e),
+    });
+  }
+});
+
 function getBearerToken(req) {
   const raw = String(req.headers.authorization || "");
   const match = raw.match(/^Bearer\s+(.+)$/i);

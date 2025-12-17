@@ -8,9 +8,31 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
 
-// If frontend & API are same origin, you can remove cors().
-// Keep it for safety while you iterate.
-app.use(cors());
+const allowlist = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // allow server-to-server / curl (no Origin header)
+      if (!origin) return cb(null, true);
+
+      // if no allowlist configured, block (safer than accidentally allowing everyone)
+      if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
+
+      if (allowlist.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked: ${origin}`), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// (Optional but recommended)
+app.options("*", cors());
 app.use(express.json({ limit: "2mb" }));
 
 const {

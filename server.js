@@ -1096,18 +1096,23 @@ const allowlist = (process.env.CORS_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
-    if (allowlist.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS blocked: ${origin}`), false);
+    if (!origin) return cb(null, true); // curl/health checks
+    if (allowlist.length === 0) return cb(null, false); // IMPORTANT: don't throw -> avoids 500
+    return cb(null, allowlist.includes(origin));
   },
-  credentials: true,
+  credentials: false, // ✅ you are using Bearer tokens, not cookies
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Mina-Pass-Id"],
+  optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
+app.post("/auth/shopify-sync", (_req, res) => {
+  res.json({ ok: true });
+});
+
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));

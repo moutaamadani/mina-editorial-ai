@@ -184,9 +184,6 @@ function makeGptIOInput({ model, systemMessage, userContent, temperature, maxTok
   };
 }
 
-function generatePassId() {
-  return `pass_${crypto.randomUUID()}`;
-}
 // =======================
 // R2 PUBLIC (non-expiring) helpers
 // =======================
@@ -1903,82 +1900,42 @@ function getBearerToken(req) {
 
 app.get("/me", async (req, res) => {
   try {
+    const token = getBearerToken(req);
+
+    // If no token, treat as logged out (don’t 401 spam the app)
+    if (!token) {
+      return res.json({ ok: true, user: null, isAdmin: false });
+    }
+
     if (!supabaseAdmin) {
       return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
     }
 
-    const incomingPassId =
-      safeString(req.headers["x-mina-pass-id"]) || null;
-
-    const token = getBearerToken(req);
-
-    // -----------------------
-    // 1) Anonymous user
-    // -----------------------
-    if (!token) {
-      const passId = incomingPassId || generatePassId();
-      return res.json({
-        ok: true,
-        user: null,
-        isAdmin: false,
-        passId,
-      });
-    }
-
-    // -----------------------
-    // 2) Authenticated user
-    // -----------------------
     const { data, error } = await supabaseAdmin.auth.getUser(token);
     if (error || !data?.user) {
       return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
     }
 
+    const email = (data.user.email || "").toLowerCase();
     const userId = data.user.id;
-    const email = safeString(data.user.email).toLowerCase();
 
-    // -----------------------
-    // 3) Lookup existing customer
-    // -----------------------
-    const { data: existing } = await supabaseAdmin
+    // optional: check allowlist admin flag from mega_customers
+    const { data: customer } = await supabaseAdmin
       .from("mega_customers")
-      .select("mg_pass_id, mg_admin_allowlist")
+      .select("mg_admin_allowlist")
       .or(`mg_user_id.eq.${userId},mg_email.eq.${email}`)
       .limit(1)
       .maybeSingle();
 
-    let passId =
-      existing?.mg_pass_id ||
-      incomingPassId ||
-      generatePassId();
-
-    // -----------------------
-    // 4) Upsert canonical customer row
-    // -----------------------
-    await supabaseAdmin
-      .from("mega_customers")
-      .upsert(
-        {
-          mg_user_id: userId,
-          mg_email: email,
-          mg_pass_id: passId,
-          mg_updated_at: nowIso(),
-        },
-        { onConflict: "mg_user_id" }
-      );
-
     return res.json({
       ok: true,
       user: { id: userId, email },
-      isAdmin: !!existing?.mg_admin_allowlist,
-      passId,
+      isAdmin: !!customer?.mg_admin_allowlist,
     });
   } catch (e) {
-    console.error("GET /me failed:", e);
-    return res.status(500).json({
-      ok: false,
-      error: "ME_FAILED",
-      message: e?.message || String(e),
-    });
+    return res
+      .status(500)
+      .json({ ok: false, error: "ME_FAILED", message: e?.message || String(e) });
   }
 });
 

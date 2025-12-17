@@ -1113,25 +1113,17 @@ app.post("/auth/shopify-sync", (_req, res) => {
   res.json({ ok: true });
 });
 // ======================================================
-// Shopify helpers + webhooks (PASTE THIS BEFORE app.use(express.json()))
+// ✅ Shopify webhook: orders/paid → credit user + tag
+// (PLACE THIS BEFORE app.use(express.json()))
 // ======================================================
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 
-// Uses Node 18+ global fetch. If your runtime is older, you must install/import node-fetch.
-
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";      // e.g. faltastudio.com
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";        // shpat_...
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10"; // e.g. 2025-10
-
-// Webhook secret you set in Shopify when creating the webhook
 const SHOPIFY_ORDER_WEBHOOK_SECRET = process.env.SHOPIFY_ORDER_WEBHOOK_SECRET || "";
-
-// The tag you want on customers to build the "mina-users" segment
-const SHOPIFY_MINA_TAG = (process.env.SHOPIFY_MINA_TAG || "Mina_users").trim();
-
-// Matcha variant that grants +50 credits
+const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "Mina_users"; // match your segment/tag
 const SHOPIFY_WELCOME_MATCHA_VARIANT_ID = String(process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "");
 
-// Optional mapping of SKU -> credits. Example: {"MINA-50":50}
 let CREDIT_PRODUCT_MAP = {};
 try {
   CREDIT_PRODUCT_MAP = JSON.parse(process.env.CREDIT_PRODUCT_MAP || "{}");
@@ -1139,22 +1131,15 @@ try {
   CREDIT_PRODUCT_MAP = {};
 }
 
-// ✅ HMAC verify MUST use the raw request body bytes (Buffer)
-function verifyShopifyWebhook({ secret, rawBodyBuffer, hmacHeader }) {
-  if (!secret || !rawBodyBuffer || !hmacHeader) return false;
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBodyBuffer)
-    .digest("base64");
-
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(String(hmacHeader), "utf8");
+function verifyShopifyWebhook({ secret, rawBody, hmacHeader }) {
+  if (!secret || !rawBody || !hmacHeader) return false;
+  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
+  const a = Buffer.from(digest);
+  const b = Buffer.from(String(hmacHeader));
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
-// REST Admin API helper
 async function shopifyAdminFetch(path, { method = "GET", body = null } = {}) {
   if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) throw new Error("SHOPIFY_NOT_CONFIGURED");
 
@@ -1189,46 +1174,8 @@ async function shopifyAdminFetch(path, { method = "GET", body = null } = {}) {
   return json;
 }
 
-// GraphQL Admin API helper
-async function shopifyGraphQL(query, variables = {}) {
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) throw new Error("SHOPIFY_NOT_CONFIGURED");
-
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = await resp.json().catch(() => null);
-
-  if (!resp.ok) {
-    const e = new Error(`SHOPIFY_GRAPHQL_${resp.status}`);
-    e.status = resp.status;
-    e.body = json;
-    throw e;
-  }
-
-  if (json?.errors?.length) {
-    const e = new Error("SHOPIFY_GRAPHQL_ERRORS");
-    e.body = json.errors;
-    throw e;
-  }
-
-  return json?.data;
-}
-
-// Add a tag to a Shopify customer (numeric customer id)
 async function addCustomerTag(customerId, tag) {
-  const id = String(customerId).trim();
-  if (!id) throw new Error("MISSING_CUSTOMER_ID");
-  const tagClean = String(tag || "").trim();
-  if (!tagClean) throw new Error("MISSING_TAG");
+  const id = String(customerId);
 
   const get = await shopifyAdminFetch(`customers/${id}.json`);
   const existingStr = get?.customer?.tags || "";
@@ -1237,66 +1184,21 @@ async function addCustomerTag(customerId, tag) {
     .map((t) => t.trim())
     .filter(Boolean);
 
-  if (existing.includes(tagClean)) return { ok: true, already: true, tags: existing };
+  if (existing.includes(tag)) return { ok: true, already: true, tags: existing };
 
-  const nextTags = [...existing, tagClean].join(", ");
+  const nextTags = [...existing, tag].join(", ");
 
   await shopifyAdminFetch(`customers/${id}.json`, {
     method: "PUT",
     body: { customer: { id: Number(id), tags: nextTags } },
   });
 
-  return { ok: true, already: false, tags: [...existing, tagClean] };
+  return { ok: true, already: false, tags: [...existing, tag] };
 }
 
-// Find Shopify customer by email (returns numeric legacyResourceId or null)
-async function findShopifyCustomerIdByEmail(email) {
-  const clean = String(email || "").trim().toLowerCase();
-  if (!clean) return null;
-
-  const gql = `
-    query FindCustomer($first: Int!, $query: String!) {
-      customers(first: $first, query: $query) {
-        edges {
-          node {
-            legacyResourceId
-            email
-          }
-        }
-      }
-    }
-  `;
-
-  const query = `email:'${clean.replace(/'/g, "")}'`;
-  const data = await shopifyGraphQL(gql, { first: 1, query });
-  const node = data?.customers?.edges?.[0]?.node;
-  const id = node?.legacyResourceId != null ? String(node.legacyResourceId) : null;
-  return id && id !== "0" ? id : null;
-}
-
-// Create Shopify customer (minimal) and return numeric customer id
-async function createShopifyCustomer({ email, firstName = "", lastName = "" }) {
-  const cleanEmail = String(email || "").trim().toLowerCase();
-  if (!cleanEmail) throw new Error("MISSING_EMAIL");
-
-  const created = await shopifyAdminFetch("customers.json", {
-    method: "POST",
-    body: {
-      customer: {
-        email: cleanEmail,
-        first_name: String(firstName || "").trim() || undefined,
-        last_name: String(lastName || "").trim() || undefined,
-        verified_email: false,
-      },
-    },
-  });
-
-  const id = created?.customer?.id != null ? String(created.customer.id) : null;
-  if (!id) throw new Error("CREATE_CUSTOMER_FAILED");
-  return id;
-}
-
-// Compute credits from Shopify order
+// Credit rule:
+// - If SKU exists in CREDIT_PRODUCT_MAP (ex {"MINA-50":50}) then add that amount
+// - Also supports your matcha variant id special case
 function creditsFromOrder(order) {
   const items = Array.isArray(order?.line_items) ? order.line_items : [];
   let credits = 0;
@@ -1304,28 +1206,23 @@ function creditsFromOrder(order) {
   for (const li of items) {
     const sku = String(li?.sku || "").trim();
     const variantId = li?.variant_id != null ? String(li.variant_id) : "";
-    const qty = Number(li?.quantity || 1);
 
-    // Matcha variant → +50 (per quantity)
+    // Matcha variant → +50
     if (SHOPIFY_WELCOME_MATCHA_VARIANT_ID && variantId === SHOPIFY_WELCOME_MATCHA_VARIANT_ID) {
-      credits += 50 * (Number.isFinite(qty) ? Math.max(1, qty) : 1);
+      credits += 50;
       continue;
     }
 
-    // SKU map → credits (per quantity)
+    // SKU map → credits (example: MINA-50 => 50)
     if (sku && Object.prototype.hasOwnProperty.call(CREDIT_PRODUCT_MAP, sku)) {
-      const per = Number(CREDIT_PRODUCT_MAP[sku] || 0);
-      credits += per * (Number.isFinite(qty) ? Math.max(1, qty) : 1);
+      credits += Number(CREDIT_PRODUCT_MAP[sku] || 0);
     }
   }
 
   return credits;
 }
 
-// ======================================================
-// ✅ Webhook: Order paid → add credits + tag customer
-// IMPORTANT: must be express.raw and must be BEFORE express.json middleware
-// ======================================================
+// ✅ orders/paid webhook (RAW body + HMAC verify)
 app.post(
   "/api/credits/shopify-order",
   express.raw({ type: "application/json" }),
@@ -1333,43 +1230,27 @@ app.post(
     const requestId = `shopify_${Date.now()}_${crypto.randomUUID()}`;
 
     try {
-      const rawBodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
-      const rawBody = rawBodyBuffer.toString("utf8");
-
-      const hmac =
-        req.get("X-Shopify-Hmac-Sha256") ||
-        req.get("x-shopify-hmac-sha256") ||
-        "";
+      const rawBody = req.body?.toString("utf8") || "";
+      const hmac = req.get("X-Shopify-Hmac-Sha256") || req.get("x-shopify-hmac-sha256") || "";
 
       const ok = verifyShopifyWebhook({
         secret: SHOPIFY_ORDER_WEBHOOK_SECRET,
-        rawBodyBuffer,
+        rawBody,
         hmacHeader: hmac,
       });
 
-      if (!ok) {
-        return res.status(401).json({ ok: false, error: "INVALID_HMAC", requestId });
-      }
+      if (!ok) return res.status(401).json({ ok: false, error: "INVALID_HMAC", requestId });
 
       const order = rawBody ? JSON.parse(rawBody) : {};
       const orderId = order?.id != null ? String(order.id) : null;
 
-      const shopifyCustomerId =
-        order?.customer?.id != null ? String(order.customer.id) : null;
+      const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
+      const email = String(order?.email || order?.customer?.email || "").toLowerCase();
 
-      const email = String(order?.email || order?.customer?.email || "")
-        .trim()
-        .toLowerCase();
+      if (!orderId) return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID", requestId });
+      if (!supabaseAdmin) return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
 
-      if (!orderId) {
-        return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID", requestId });
-      }
-
-      if (!supabaseAdmin) {
-        return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
-      }
-
-      // ✅ Idempotency: do not process same order twice
+      // ✅ Idempotency: don’t credit same order twice
       const { data: existing, error: exErr } = await supabaseAdmin
         .from("mega_generations")
         .select("mg_id")
@@ -1379,27 +1260,12 @@ app.post(
         .limit(1);
 
       if (exErr) throw exErr;
-
       if (existing && existing.length) {
-        return res.status(200).json({
-          ok: true,
-          requestId,
-          alreadyProcessed: true,
-          orderId,
-        });
+        return res.status(200).json({ ok: true, requestId, alreadyProcessed: true, orderId });
       }
 
       const credits = creditsFromOrder(order);
       if (!credits) {
-        // still tag if you want, but usually keep it simple
-        if (shopifyCustomerId) {
-          try {
-            await addCustomerTag(shopifyCustomerId, SHOPIFY_MINA_TAG);
-          } catch (e) {
-            console.error("[shopify] add tag failed:", e?.message || e);
-          }
-        }
-
         return res.status(200).json({
           ok: true,
           requestId,
@@ -1409,9 +1275,10 @@ app.post(
         });
       }
 
-      // Use Shopify customer id when available, fallback to email
+      // Key in your DB
       const customerKey = shopifyCustomerId || email || "anonymous";
 
+      // ✅ This will ALSO ensure mega_customers row exists (via megaEnsureCustomer inside sbAdjustCredits)
       const out = await sbAdjustCredits({
         customerId: customerKey,
         delta: credits,
@@ -1423,7 +1290,7 @@ app.post(
         reqEmail: email || null,
       });
 
-      // ✅ Tag customer for your Mina segment
+      // ✅ Tag customer for Shopify segment
       if (shopifyCustomerId) {
         try {
           await addCustomerTag(shopifyCustomerId, SHOPIFY_MINA_TAG);
@@ -1452,131 +1319,6 @@ app.post(
   }
 );
 
-// ======================================================
-// ✅ Optional: When user logs in, ensure they are tagged in Shopify
-// Frontend calls this after login with { email, shopifyCustomerId?, firstName?, lastName? }
-// ======================================================
-app.post("/auth/shopify-sync", async (req, res) => {
-  try {
-    const { email, shopifyCustomerId, firstName, lastName } = req.body || {};
-    const cleanEmail = String(email || "").trim().toLowerCase();
-    const providedId = shopifyCustomerId != null ? String(shopifyCustomerId).trim() : "";
-
-    if (!cleanEmail && !providedId) {
-      return res.status(400).json({ ok: false, error: "MISSING_EMAIL_OR_CUSTOMER_ID" });
-    }
-
-    let cid = providedId || null;
-
-    // Find by email if no id
-    if (!cid && cleanEmail) {
-      cid = await findShopifyCustomerIdByEmail(cleanEmail);
-    }
-
-    // Create Shopify customer if not found
-    if (!cid && cleanEmail) {
-      cid = await createShopifyCustomer({
-        email: cleanEmail,
-        firstName,
-        lastName,
-      });
-    }
-
-    // Tag them
-    if (cid) {
-      await addCustomerTag(cid, SHOPIFY_MINA_TAG);
-    }
-
-    return res.json({ ok: true, shopifyCustomerId: cid, tagged: !!cid });
-  } catch (e) {
-    console.error("POST /auth/shopify-sync error:", e?.message || e, e?.body || "");
-    return res.status(500).json({
-      ok: false,
-      error: "SHOPIFY_SYNC_FAILED",
-      message: e?.message || String(e),
-    });
-  }
-});
-
-// ======================================================
-// Admin: list Mina users from Shopify by tag (Segment support)
-// GET /admin/shopify/mina-users?tag=Mina_users&limit=50&after=<cursor>
-// ======================================================
-app.get("/admin/shopify/mina-users", requireAdmin, async (req, res) => {
-  try {
-    const tag = String(req.query.tag || SHOPIFY_MINA_TAG || "Mina_users").trim();
-    const limit = Math.max(1, Math.min(250, Number(req.query.limit || 50)));
-    const after = req.query.after ? String(req.query.after) : null;
-
-    const gql = `
-      query Customers($first: Int!, $after: String, $query: String!) {
-        customers(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) {
-          edges {
-            cursor
-            node {
-              legacyResourceId
-              displayName
-              email
-              note
-              tags
-              updatedAt
-              emailMarketingConsent { marketingState }
-              defaultAddress { city province country }
-              ordersCount
-              totalSpent { amount currencyCode }
-            }
-          }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-    `;
-
-    const query = `tag:'${tag.replace(/'/g, "")}'`;
-
-    const data = await shopifyGraphQL(gql, {
-      first: limit,
-      after,
-      query,
-    });
-
-    const edges = data?.customers?.edges || [];
-    const pageInfo = data?.customers?.pageInfo || { hasNextPage: false, endCursor: null };
-
-    const rows = edges.map((e) => {
-      const c = e.node || {};
-      const addr = c.defaultAddress || {};
-      const location = [addr.city, addr.province, addr.country].filter(Boolean).join(", ");
-
-      return {
-        customer_id: c.legacyResourceId || null,
-        customer_name: c.displayName || "",
-        note: c.note || "",
-        email: c.email || "",
-        email_subscription_status: c.emailMarketingConsent?.marketingState || "NOT_PROVIDED",
-        location,
-        orders: Number(c.ordersCount || 0),
-        amount_spent: c.totalSpent ? `${c.totalSpent.amount} ${c.totalSpent.currencyCode}` : "0",
-        updated_at: c.updatedAt || null,
-      };
-    });
-
-    return res.json({
-      ok: true,
-      tag,
-      count: rows.length,
-      customers: rows,
-      pageInfo,
-      nextCursor: pageInfo?.hasNextPage ? pageInfo?.endCursor : null,
-    });
-  } catch (e) {
-    console.error("GET /admin/shopify/mina-users error:", e?.message || e, e?.body || "");
-    return res.status(500).json({
-      ok: false,
-      error: "SHOPIFY_MINA_USERS_FAILED",
-      message: e?.message || String(e),
-    });
-  }
-});
 
 // ======================================================
 // END Shopify block

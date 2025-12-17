@@ -1879,9 +1879,21 @@ app.get("/health", (_req, res) => {
   });
 });
 function getBearerToken(req) {
-  const h = req.headers.authorization || "";
-  const m = String(h).match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
+  const raw = String(req.headers.authorization || "");
+  const match = raw.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+
+  const token = match[1].trim();
+  const lower = token.toLowerCase();
+
+  // Some clients occasionally send placeholder strings like "null"/"undefined" which
+  // Supabase treats as invalid JWTs and returns a 401. Treat those as missing so the
+  // request is handled as anonymous instead of erroring.
+  if (!token || lower === "null" || lower === "undefined" || lower === "[object object]") {
+    return null;
+  }
+
+  return token;
 }
 
 app.get("/me", async (req, res) => {

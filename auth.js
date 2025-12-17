@@ -11,11 +11,25 @@ function normalizeEmail(email) {
 
 function normalizeBearer(token) {
   if (!token) return null;
-  const trimmed = token.trim();
-  if (trimmed.toLowerCase().startsWith("bearer ")) {
-    return trimmed.slice(7).trim();
+
+  const trimmed = String(token).trim();
+  if (!trimmed) return null;
+
+  const withoutPrefix = trimmed.toLowerCase().startsWith("bearer ")
+    ? trimmed.slice(7).trim()
+    : trimmed;
+
+  const normalized = withoutPrefix.trim();
+  const lower = normalized.toLowerCase();
+
+  // Ignore placeholder values occasionally emitted by buggy clients so we treat
+  // the request as unauthenticated instead of passing obviously invalid JWTs
+  // through to Supabase.
+  if (!normalized || lower === "null" || lower === "undefined" || lower === "[object object]") {
+    return null;
   }
-  return trimmed;
+
+  return normalized;
 }
 
 async function isAdminAllowlisted(supabase, { userId, email }) {

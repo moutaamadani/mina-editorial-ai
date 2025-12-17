@@ -16,10 +16,10 @@ CREATE TABLE IF NOT EXISTS public.mega_customers (
   mg_timezone TEXT,
   mg_marketing_opt_in BOOLEAN DEFAULT FALSE,
   mg_product_updates_opt_in BOOLEAN DEFAULT FALSE,
-  mg_credits INTEGER DEFAULT 0,
+  mg_credits INTEGER NOT NULL DEFAULT 0,
   mg_expires_at TIMESTAMPTZ,
   mg_last_active TIMESTAMPTZ,
-  mg_disabled BOOLEAN DEFAULT FALSE,
+  mg_disabled BOOLEAN NOT NULL DEFAULT FALSE,
   mg_verified_email BOOLEAN DEFAULT FALSE,
   mg_verified_google BOOLEAN DEFAULT FALSE,
   mg_verified_apple BOOLEAN DEFAULT FALSE,
@@ -31,16 +31,17 @@ CREATE TABLE IF NOT EXISTS public.mega_customers (
   mg_verification_method TEXT,
   mg_verification_at TIMESTAMPTZ,
   mg_verification_keynumber TEXT,
-  mg_topup_default_packs INTEGER DEFAULT 3 CHECK (mg_topup_default_packs >= 0),
+  mg_topup_default_packs INTEGER NOT NULL DEFAULT 3 CHECK (mg_topup_default_packs >= 0),
   mg_auto_topup_enabled BOOLEAN DEFAULT FALSE,
   mg_auto_topup_monthly_limit_packs INTEGER CHECK (mg_auto_topup_monthly_limit_packs IS NULL OR mg_auto_topup_monthly_limit_packs >= 0),
   mg_last_topup_at TIMESTAMPTZ,
   mg_topup_source TEXT,
-  mg_meta JSONB DEFAULT '{}'::jsonb,
+  mg_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
   mg_source_system TEXT,
   mg_deleted_at TIMESTAMPTZ,
-  mg_created_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW()),
-  mg_updated_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW())
+  mg_created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+  mg_updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+  mg_admin_allowlist BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS mega_customers_shopify_idx ON public.mega_customers (mg_shopify_customer_id) WHERE mg_shopify_customer_id IS NOT NULL;
@@ -85,12 +86,12 @@ CREATE TABLE IF NOT EXISTS public.mega_generations (
   mg_os TEXT,
   mg_browser TEXT,
   mg_device TEXT,
-  mg_meta JSONB DEFAULT '{}'::jsonb,
-  mg_payload JSONB,
+  mg_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  mg_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   mg_source_system TEXT,
   mg_deleted_at TIMESTAMPTZ,
-  mg_created_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW()),
-  mg_updated_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW())
+  mg_created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+  mg_updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
 );
 
 CREATE INDEX IF NOT EXISTS mega_generations_pass_idx ON public.mega_generations (mg_pass_id);
@@ -124,12 +125,12 @@ CREATE TABLE IF NOT EXISTS public.mega_admin (
   mg_runtime_flat JSONB,
   mg_key TEXT,
   mg_value JSONB,
-  mg_meta JSONB DEFAULT '{}'::jsonb,
-  mg_payload JSONB,
+  mg_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  mg_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   mg_source_system TEXT,
   mg_deleted_at TIMESTAMPTZ,
-  mg_created_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW()),
-  mg_updated_at TIMESTAMPTZ DEFAULT TIMEZONE('utc', NOW())
+  mg_created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
+  mg_updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW())
 );
 
 CREATE INDEX IF NOT EXISTS mega_admin_actor_pass_idx ON public.mega_admin (mg_actor_pass_id);

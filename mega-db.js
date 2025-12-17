@@ -204,6 +204,9 @@ async function megaUpsertLedgerRow(supabaseAdmin, row) {
     ...row,
   };
 
+  if (payload.mg_meta === undefined || payload.mg_meta === null) payload.mg_meta = {};
+  if (payload.mg_payload === undefined || payload.mg_payload === null) payload.mg_payload = {};
+
   // Best-effort upsert
   await supabaseAdmin.from("mega_generations").upsert(payload, { onConflict: "mg_id" });
 }
@@ -228,13 +231,13 @@ export async function megaWriteSessionEvent(
     mg_id: namespacedId("session", sessionId),
     mg_record_type: "session",
     mg_pass_id: passId,
-    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: String(sessionId),
     mg_platform: platform ? String(platform) : null,
     mg_title: title ? String(title) : null,
     mg_created_at: createdAt || nowIso(),
     mg_meta: { source: "legacy.sessions" },
     mg_payload: {
+      shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId),
       sessionId: String(sessionId),
       platform: platform ? String(platform) : null,
       title: title ? String(title) : null,
@@ -266,7 +269,6 @@ export async function megaWriteGenerationEvent(
     mg_id: namespacedId("generation", g.id),
     mg_record_type: "generation",
     mg_pass_id: passId,
-    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: g.sessionId ? String(g.sessionId) : null,
     mg_generation_id: g.id ? String(g.id) : null,
     mg_platform: g.platform ? String(g.platform) : null,
@@ -282,8 +284,8 @@ export async function megaWriteGenerationEvent(
     mg_status: g.meta?.status ? String(g.meta.status) : "succeeded",
     mg_error: g.meta?.error ? String(g.meta.error) : null,
     mg_created_at: g.createdAt || nowIso(),
-    mg_meta: g.meta ?? null,
-    mg_payload: g,
+    mg_meta: g.meta ?? {},
+    mg_payload: { ...g, shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId) },
   });
 
   return { passId };
@@ -310,7 +312,6 @@ export async function megaWriteFeedbackEvent(
     mg_id: namespacedId("feedback", f.id),
     mg_record_type: "feedback",
     mg_pass_id: passId,
-    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_session_id: f.sessionId ? String(f.sessionId) : null,
     mg_generation_id: f.generationId ? String(f.generationId) : null,
     mg_platform: f.platform ? String(f.platform) : null,
@@ -321,7 +322,7 @@ export async function megaWriteFeedbackEvent(
     mg_video_url: f.videoUrl ? String(f.videoUrl) : null,
     mg_created_at: f.createdAt || nowIso(),
     mg_meta: { source: "legacy.feedback" },
-    mg_payload: f,
+    mg_payload: { ...f, shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId) },
   });
 
   return { passId };
@@ -348,7 +349,6 @@ export async function megaWriteCreditTxnEvent(
     mg_id: namespacedId("credit_transaction", id || `ctx_${crypto.randomUUID()}`),
     mg_record_type: "credit_transaction",
     mg_pass_id: passId,
-    mg_shopify_customer_id: shopifyCustomerId || safeShopifyId(customerId),
     mg_delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
     mg_reason: reason ? String(reason) : null,
     mg_source: source ? String(source) : null,

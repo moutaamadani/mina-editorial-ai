@@ -796,7 +796,7 @@ async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
     .from("mega_generations")
     .select("mg_id", { count: "exact", head: true })
     .eq("mg_record_type", "credit_transaction")
-    .eq("mg_shopify_customer_id", cust.shopify_customer_id);
+    .eq("mg_pass_id", cust.passId);
 
   return {
     balance: cust.credits ?? 0,
@@ -895,11 +895,14 @@ async function sbUpsertFeedbackBusiness(fb) {
 async function sbGetLikesForCustomer(customerId, limit = 50) {
   if (!supabaseAdmin) return [];
 
+  const { passId } = (await sbEnsureCustomer({ customerId, userId: null, email: null })) || {};
+  if (!passId) return [];
+
   const { data, error } = await supabaseAdmin
     .from("mega_generations")
     .select("mg_result_type,mg_platform,mg_prompt,mg_comment,mg_image_url,mg_video_url,mg_created_at")
     .eq("mg_record_type", "feedback")
-    .eq("mg_shopify_customer_id", safeShopifyId(customerId))
+    .eq("mg_pass_id", passId)
     .order("mg_created_at", { ascending: true })
     .limit(Math.max(1, Math.min(200, Number(limit || 50))));
 
@@ -1011,33 +1014,42 @@ async function sbGetCustomerHistory(customerId) {
 
   const cid = safeShopifyId(customerId);
 
+  const cust = await sbEnsureCustomer({ customerId: cid, userId: null, email: null });
+  const passId = cust?.passId || null;
+
   const [custRes, gensRes, fbRes, txRes] = await Promise.all([
     supabaseAdmin
       .from("mega_customers")
-      .select("mg_shopify_customer_id,mg_credits")
+      .select("mg_shopify_customer_id,mg_credits,mg_pass_id")
       .eq("mg_shopify_customer_id", cid)
       .maybeSingle(),
-    supabaseAdmin
-      .from("mega_generations")
-      .select("*")
-      .eq("mg_shopify_customer_id", cid)
-      .eq("mg_record_type", "generation")
-      .order("mg_created_at", { ascending: false })
-      .limit(500),
-    supabaseAdmin
-      .from("mega_generations")
-      .select("*")
-      .eq("mg_shopify_customer_id", cid)
-      .eq("mg_record_type", "feedback")
-      .order("mg_created_at", { ascending: false })
-      .limit(500),
-    supabaseAdmin
-      .from("mega_generations")
-      .select("*")
-      .eq("mg_shopify_customer_id", cid)
-      .eq("mg_record_type", "credit_transaction")
-      .order("mg_created_at", { ascending: false })
-      .limit(500),
+    passId
+      ? supabaseAdmin
+          .from("mega_generations")
+          .select("*")
+          .eq("mg_pass_id", passId)
+          .eq("mg_record_type", "generation")
+          .order("mg_created_at", { ascending: false })
+          .limit(500)
+      : { data: [], error: null },
+    passId
+      ? supabaseAdmin
+          .from("mega_generations")
+          .select("*")
+          .eq("mg_pass_id", passId)
+          .eq("mg_record_type", "feedback")
+          .order("mg_created_at", { ascending: false })
+          .limit(500)
+      : { data: [], error: null },
+    passId
+      ? supabaseAdmin
+          .from("mega_generations")
+          .select("*")
+          .eq("mg_pass_id", passId)
+          .eq("mg_record_type", "credit_transaction")
+          .order("mg_created_at", { ascending: false })
+          .limit(500)
+      : { data: [], error: null },
   ]);
 
   if (custRes.error) throw custRes.error;

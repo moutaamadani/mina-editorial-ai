@@ -1,5 +1,8 @@
 // mega-db.js
-"use strict";
+// Supabase MEGA persistence helpers (no Prisma)
+// Tables:
+// - mega_customers (one row per customer)
+// - mega_generations (events: generation / feedback / credit_transaction / session)
 
 import crypto from "node:crypto";
 
@@ -7,409 +10,439 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function normalizeEmail(email) {
-  if (!email) return null;
-  const s = String(email).trim().toLowerCase();
-  return s || null;
+function safeString(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  return String(v).trim() || fallback;
 }
 
-function safeShopifyId(customerIdRaw) {
-  const v = customerIdRaw === null || customerIdRaw === undefined ? "" : String(customerIdRaw);
-  return v.trim() || "anonymous";
+function isRealCustomerKey(v) {
+  const s = safeString(v, "");
+  if (!s) return false;
+  if (s.toLowerCase() === "anonymous") return false;
+  return true;
 }
 
-function isAnonymousCustomerId(customerIdRaw) {
-  return safeShopifyId(customerIdRaw) === "anonymous";
+function normalizeEmail(v) {
+  const s = safeString(v, "").toLowerCase();
+  return s || "";
 }
 
-function namespacedId(prefix, value) {
-  const v = String(value || "").trim();
-  if (!v) return "";
-  if (v.startsWith(`${prefix}:`)) return v;
-  return `${prefix}:${v}`;
+function computeDisplayName(first, last, email) {
+  const f = safeString(first, "");
+  const l = safeString(last, "");
+  const n = `${f} ${l}`.trim();
+  if (n) return n;
+  return safeString(email, "");
 }
 
-/**
- * Find an existing PassID from any known identifiers (priority: user_id -> email -> shopify_customer_id).
- * Returns passId string or null.
- */
-async function megaFindPassId(supabaseAdmin, { customerId, userId, email }) {
-  if (!supabaseAdmin) return null;
+// Optional: default free credits for brand new customers
+function defaultFreeCredits() {
+  const n = Number(process.env.DEFAULT_FREE_CREDITS || 0);
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+}
 
-  const shopifyId = safeShopifyId(customerId);
-  const normEmail = normalizeEmail(email);
+// Optional: set expires_at when adding credits (only if you set env var)
+function creditsExpireDays() {
+  const n = Number(process.env.CREDITS_EXPIRE_DAYS || 0);
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+}
 
-  // 1) user_id
-  if (userId) {
-    const { data, error } = await supabaseAdmin
-      .from("mega_customers")
-      .select("mg_pass_id")
-      .eq("mg_user_id", userId)
-      .limit(1);
-
-    if (!error && Array.isArray(data) && data[0]?.mg_pass_id) return data[0].mg_pass_id;
-  }
-
-  // 2) email
-  if (normEmail) {
-    const { data, error } = await supabaseAdmin
-      .from("mega_customers")
-      .select("mg_pass_id")
-      .eq("mg_email", normEmail)
-      .limit(1);
-
-    if (!error && Array.isArray(data) && data[0]?.mg_pass_id) return data[0].mg_pass_id;
-  }
-
-  // 3) shopify_customer_id (skip "anonymous")
-  if (shopifyId && shopifyId !== "anonymous") {
-    const { data, error } = await supabaseAdmin
-      .from("mega_customers")
-      .select("mg_pass_id")
-      .eq("mg_shopify_customer_id", shopifyId)
-      .limit(1);
-
-    if (!error && Array.isArray(data) && data[0]?.mg_pass_id) return data[0].mg_pass_id;
-  }
-
-  return null;
+function addDaysIso(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
 }
 
 /**
- * Ensure MEGA customer exists and is linked to identifiers.
- * - Creates PassID if none exists
- * - Updates mapping fields if newly known
- * - Optionally syncs credits from legacy
+ * megaEnsureCustomer
+ * - Always ensures a row exists in mega_customers (unless totally anonymous)
+ * - Returns { passId, credits, shopifyCustomerId, meta }
  *
- * Returns: { passId }
+ * customerId: your main external key (usually Shopify customer id, or email fallback)
+ * userId/email: Supabase auth identity (if available)
+ * profile: optional fields to fill mega_customers (names, locale, verification flags...)
  */
 export async function megaEnsureCustomer(
   supabaseAdmin,
-  { customerId, userId, email, legacyCredits = null }
+  { customerId, userId = null, email = null, legacyCredits = null, profile = {} }
 ) {
-  if (!supabaseAdmin) return { passId: null, credits: null };
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
 
-  const shopifyId = safeShopifyId(customerId);
+  const shopifyCustomerId = safeString(customerId, "anonymous");
   const normEmail = normalizeEmail(email);
 
-  // Avoid creating infinite MEGA customers for totally anonymous users
-  // (if no email/userId, we return null passId unless you pass a non-anon customerId)
-  const hasStrongId = !!userId || !!normEmail || (shopifyId && shopifyId !== "anonymous");
-  if (!hasStrongId) {
-    return { passId: null, credits: null };
+  // If fully anonymous (no real id + no email + no userId), don't create DB junk rows
+  if (!isRealCustomerKey(shopifyCustomerId) && !normEmail && !userId) {
+    return {
+      passId: "pass_anonymous",
+      credits: 0,
+      shopifyCustomerId: "anonymous",
+      meta: {},
+    };
   }
 
-  const existingPassId = await megaFindPassId(supabaseAdmin, { customerId: shopifyId, userId, email: normEmail });
-  const ts = nowIso();
+  // Try to find an existing customer by (shopify id) OR (user id) OR (email)
+  const ors = [];
+  if (isRealCustomerKey(shopifyCustomerId)) ors.push(`mg_shopify_customer_id.eq.${shopifyCustomerId}`);
+  if (userId) ors.push(`mg_user_id.eq.${userId}`);
+  if (normEmail) ors.push(`mg_email.eq.${normEmail}`);
 
-  if (existingPassId) {
-    // Touch + attach missing mapping fields + optionally sync credits
-    const updates = {
-      mg_updated_at: ts,
-      mg_last_active: ts,
-    };
+  let existing = null;
 
-    if (userId) updates.mg_user_id = userId;
-    if (normEmail) updates.mg_email = normEmail;
-    if (shopifyId && shopifyId !== "anonymous") updates.mg_shopify_customer_id = shopifyId;
-
-    if (typeof legacyCredits === "number" && Number.isFinite(legacyCredits)) {
-      updates.mg_credits = Math.floor(legacyCredits);
-    }
-
-    // Best-effort
-    try {
-      await supabaseAdmin.from("mega_customers").update(updates).eq("mg_pass_id", existingPassId);
-    } catch (_) {}
-
-    const { data } = await supabaseAdmin
+  if (ors.length) {
+    const { data, error } = await supabaseAdmin
       .from("mega_customers")
-      .select("mg_pass_id,mg_credits,mg_shopify_customer_id,mg_user_id,mg_email,mg_meta")
-      .eq("mg_pass_id", existingPassId)
+      .select("*")
+      .or(ors.join(","))
+      .limit(1)
       .maybeSingle();
 
+    if (error) throw error;
+    existing = data || null;
+  }
+
+  const incomingFirst = safeString(profile.firstName || profile.first_name || "");
+  const incomingLast = safeString(profile.lastName || profile.last_name || "");
+  const incomingLocale = safeString(profile.locale || "");
+  const incomingTimezone = safeString(profile.timezone || "");
+  const incomingMarketingOptIn =
+    typeof profile.marketingOptIn === "boolean" ? profile.marketingOptIn : null;
+  const incomingProductUpdatesOptIn =
+    typeof profile.productUpdatesOptIn === "boolean" ? profile.productUpdatesOptIn : null;
+
+  const incomingVerifiedEmail =
+    typeof profile.verifiedEmail === "boolean" ? profile.verifiedEmail : null;
+  const incomingVerifiedGoogle =
+    typeof profile.verifiedGoogle === "boolean" ? profile.verifiedGoogle : null;
+  const incomingVerifiedApple =
+    typeof profile.verifiedApple === "boolean" ? profile.verifiedApple : null;
+  const incomingVerifiedAny =
+    typeof profile.verifiedAny === "boolean" ? profile.verifiedAny : null;
+
+  const incomingVerificationMethod = safeString(profile.verificationMethod || "");
+  const incomingVerificationAt = profile.verificationAt || null;
+  const incomingVerificationKeynumber = safeString(profile.verificationKeynumber || "");
+
+  // Create new
+  if (!existing) {
+    const passId = `pass_${crypto.randomUUID()}`;
+    const startingCredits =
+      Number.isFinite(Number(legacyCredits)) ? Number(legacyCredits) : defaultFreeCredits();
+
+    const payload = {
+      mg_pass_id: passId,
+      mg_shopify_customer_id: isRealCustomerKey(shopifyCustomerId) ? shopifyCustomerId : normEmail || "anonymous",
+      mg_user_id: userId || null,
+      mg_email: normEmail || null,
+
+      mg_first_name: incomingFirst || null,
+      mg_last_name: incomingLast || null,
+      mg_display_name: computeDisplayName(incomingFirst, incomingLast, normEmail) || null,
+
+      mg_locale: incomingLocale || null,
+      mg_timezone: incomingTimezone || null,
+      mg_marketing_opt_in: incomingMarketingOptIn === null ? false : incomingMarketingOptIn,
+      mg_product_updates_opt_in: incomingProductUpdatesOptIn === null ? false : incomingProductUpdatesOptIn,
+
+      mg_credits: Math.floor(startingCredits || 0),
+      mg_expires_at: null,
+      mg_last_active: nowIso(),
+
+      mg_disabled: false,
+
+      mg_verified_email: incomingVerifiedEmail === null ? false : incomingVerifiedEmail,
+      mg_verified_google: incomingVerifiedGoogle === null ? false : incomingVerifiedGoogle,
+      mg_verified_apple: incomingVerifiedApple === null ? false : incomingVerifiedApple,
+      mg_verified_any: incomingVerifiedAny === null ? false : incomingVerifiedAny,
+      mg_verification_method: incomingVerificationMethod || null,
+      mg_verification_at: incomingVerificationAt || null,
+      mg_verification_keynumber: incomingVerificationKeynumber || null,
+
+      mg_meta: profile.meta && typeof profile.meta === "object" ? profile.meta : {},
+      mg_source_system: safeString(profile.sourceSystem || "app"),
+      mg_created_at: nowIso(),
+      mg_updated_at: nowIso(),
+    };
+
+    const { error: insErr } = await supabaseAdmin.from("mega_customers").insert(payload);
+    if (insErr) throw insErr;
+
     return {
-      passId: existingPassId,
-      credits: data?.mg_credits ?? null,
-      shopifyCustomerId: data?.mg_shopify_customer_id || null,
-      userId: data?.mg_user_id || null,
-      email: data?.mg_email || null,
-      meta: data?.mg_meta || {},
+      passId,
+      credits: payload.mg_credits,
+      shopifyCustomerId: payload.mg_shopify_customer_id,
+      meta: payload.mg_meta || {},
     };
   }
 
-  // Create new (deterministic PassID rule)
-  const passId = isAnonymousCustomerId(shopifyId)
-    ? userId
-      ? namespacedId("pass:user", userId)
-      : namespacedId("pass:anon", crypto.randomUUID())
-    : namespacedId("pass:shopify", shopifyId);
+  // Update existing (fill missing fields + refresh last_active)
+  const passId = existing.mg_pass_id;
+  const updates = {};
 
-  const payload = {
-    mg_pass_id: passId,
-    mg_shopify_customer_id: shopifyId !== "anonymous" ? shopifyId : null,
-    mg_user_id: userId || null,
-    mg_email: normEmail,
-    mg_credits:
-      typeof legacyCredits === "number" && Number.isFinite(legacyCredits) ? Math.floor(legacyCredits) : 0,
-    mg_topup_default_packs: 3,
-    mg_created_at: ts,
-    mg_updated_at: ts,
-    mg_last_active: ts,
-    mg_disabled: false,
-    mg_meta: {},
-  };
+  // If we learned a better key, attach it (don’t overwrite real id with "anonymous")
+  if (isRealCustomerKey(shopifyCustomerId) && !isRealCustomerKey(existing.mg_shopify_customer_id)) {
+    updates.mg_shopify_customer_id = shopifyCustomerId;
+  }
 
-  const { error } = await supabaseAdmin.from("mega_customers").insert(payload);
-  if (error) {
-    // If insertion failed due to race/unique, try resolving again
-    const retry = await megaFindPassId(supabaseAdmin, { customerId: shopifyId, userId, email: normEmail });
-    if (retry) {
-      const { data } = await supabaseAdmin
-        .from("mega_customers")
-        .select("mg_pass_id,mg_credits,mg_shopify_customer_id,mg_user_id,mg_email,mg_meta")
-        .eq("mg_pass_id", retry)
-        .maybeSingle();
+  if (userId && !existing.mg_user_id) updates.mg_user_id = userId;
+  if (normEmail && !existing.mg_email) updates.mg_email = normEmail;
 
-      return {
-        passId: retry,
-        credits: data?.mg_credits ?? null,
-        shopifyCustomerId: data?.mg_shopify_customer_id || null,
-        userId: data?.mg_user_id || null,
-        email: data?.mg_email || null,
-        meta: data?.mg_meta || {},
-      };
-    }
+  if (incomingFirst && !existing.mg_first_name) updates.mg_first_name = incomingFirst;
+  if (incomingLast && !existing.mg_last_name) updates.mg_last_name = incomingLast;
 
-    return { passId: null, credits: null };
+  const nextDisplay =
+    safeString(existing.mg_display_name, "") ||
+    computeDisplayName(incomingFirst || existing.mg_first_name, incomingLast || existing.mg_last_name, normEmail || existing.mg_email);
+
+  if (nextDisplay && nextDisplay !== existing.mg_display_name) updates.mg_display_name = nextDisplay;
+
+  if (incomingLocale && !existing.mg_locale) updates.mg_locale = incomingLocale;
+  if (incomingTimezone && !existing.mg_timezone) updates.mg_timezone = incomingTimezone;
+
+  if (incomingMarketingOptIn !== null) updates.mg_marketing_opt_in = incomingMarketingOptIn;
+  if (incomingProductUpdatesOptIn !== null) updates.mg_product_updates_opt_in = incomingProductUpdatesOptIn;
+
+  if (incomingVerifiedEmail !== null) updates.mg_verified_email = incomingVerifiedEmail;
+  if (incomingVerifiedGoogle !== null) updates.mg_verified_google = incomingVerifiedGoogle;
+  if (incomingVerifiedApple !== null) updates.mg_verified_apple = incomingVerifiedApple;
+  if (incomingVerifiedAny !== null) updates.mg_verified_any = incomingVerifiedAny;
+
+  if (incomingVerificationMethod) updates.mg_verification_method = incomingVerificationMethod;
+  if (incomingVerificationAt) updates.mg_verification_at = incomingVerificationAt;
+  if (incomingVerificationKeynumber) updates.mg_verification_keynumber = incomingVerificationKeynumber;
+
+  updates.mg_last_active = nowIso();
+  updates.mg_updated_at = nowIso();
+
+  if (Object.keys(updates).length) {
+    const { error: upErr } = await supabaseAdmin
+      .from("mega_customers")
+      .update(updates)
+      .eq("mg_pass_id", passId);
+
+    if (upErr) throw upErr;
   }
 
   return {
     passId,
-    credits: payload.mg_credits,
-    shopifyCustomerId: payload.mg_shopify_customer_id,
-    userId: payload.mg_user_id,
-    email: payload.mg_email,
-    meta: payload.mg_meta,
+    credits: Number(existing.mg_credits || 0),
+    shopifyCustomerId: existing.mg_shopify_customer_id || shopifyCustomerId,
+    meta: existing.mg_meta || {},
   };
 }
 
-async function megaUpsertLedgerRow(supabaseAdmin, row) {
-  if (!supabaseAdmin) return;
-  if (!row?.mg_id || !row?.mg_record_type || !row?.mg_pass_id) return;
+// -----------------------------
+// Events writers
+// -----------------------------
 
-  const payload = {
-    mg_created_at: row.mg_created_at || nowIso(),
-    mg_updated_at: row.mg_updated_at || nowIso(),
-    ...row,
+export async function megaWriteCreditTxnEvent(
+  supabaseAdmin,
+  {
+    customerId,
+    userId = null,
+    email = null,
+    id,
+    delta,
+    reason,
+    source,
+    refType = null,
+    refId = null,
+    createdAt = null,
+    nextBalance = null,
+  }
+) {
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+
+  const cust = await megaEnsureCustomer(supabaseAdmin, { customerId, userId, email });
+
+  const txId = safeString(id, crypto.randomUUID());
+  const ts = createdAt || nowIso();
+
+  // 1) Insert transaction event
+  const row = {
+    mg_id: txId,
+    mg_record_type: "credit_transaction",
+    mg_pass_id: cust.passId,
+
+    mg_delta: Number(delta || 0),
+    mg_reason: safeString(reason, ""),
+    mg_source: safeString(source, ""),
+
+    mg_ref_type: refType ? safeString(refType) : null,
+    mg_ref_id: refId ? safeString(refId) : null,
+
+    mg_created_at: ts,
+    mg_updated_at: ts,
+    mg_event_at: ts,
+
+    mg_meta: {
+      email: normalizeEmail(email) || null,
+      userId: userId || null,
+    },
+    mg_source_system: "app",
   };
 
-  if (payload.mg_meta === undefined || payload.mg_meta === null) payload.mg_meta = {};
-  if (payload.mg_payload === undefined || payload.mg_payload === null) payload.mg_payload = {};
+  const { error: insErr } = await supabaseAdmin.from("mega_generations").insert(row);
+  if (insErr) throw insErr;
 
-  // Best-effort upsert
-  await supabaseAdmin.from("mega_generations").upsert(payload, { onConflict: "mg_id" });
+  // 2) Update customer balance
+  const updates = {
+    mg_updated_at: nowIso(),
+    mg_last_active: nowIso(),
+  };
+
+  if (Number.isFinite(Number(nextBalance))) {
+    updates.mg_credits = Math.floor(Number(nextBalance));
+  } else {
+    // fallback: add delta onto current value (best-effort)
+    updates.mg_credits = Math.floor((cust.credits || 0) + Number(delta || 0));
+  }
+
+  // Optional expiry extension if configured
+  const expDays = creditsExpireDays();
+  if (expDays > 0 && Number(delta || 0) > 0) {
+    updates.mg_expires_at = addDaysIso(expDays);
+  }
+
+  const { error: upErr } = await supabaseAdmin
+    .from("mega_customers")
+    .update(updates)
+    .eq("mg_pass_id", cust.passId);
+
+  if (upErr) throw upErr;
 }
 
-/**
- * SESSION dual-write
- */
 export async function megaWriteSessionEvent(
   supabaseAdmin,
-  { customerId, userId = null, email = null, sessionId, platform, title, createdAt }
+  { customerId, sessionId, platform, title, createdAt }
 ) {
-  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
-    customerId,
-    userId,
-    email,
-    legacyCredits: null,
-  });
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+  const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
 
-  if (!passId) return { passId: null };
+  const sid = safeString(sessionId, crypto.randomUUID());
+  const ts = createdAt || nowIso();
 
-  await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: namespacedId("session", sessionId),
+  const row = {
+    mg_id: `sess_${sid}`,
     mg_record_type: "session",
-    mg_pass_id: passId,
-    mg_session_id: String(sessionId),
-    mg_platform: platform ? String(platform) : null,
-    mg_title: title ? String(title) : null,
-    mg_created_at: createdAt || nowIso(),
-    mg_meta: { source: "legacy.sessions" },
-    mg_payload: {
-      shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId),
-      sessionId: String(sessionId),
-      platform: platform ? String(platform) : null,
-      title: title ? String(title) : null,
-      createdAt: createdAt || nowIso(),
-    },
-  });
+    mg_pass_id: cust.passId,
+    mg_session_id: sid,
+    mg_platform: safeString(platform, "tiktok"),
+    mg_title: safeString(title, "Mina session"),
+    mg_created_at: ts,
+    mg_updated_at: ts,
+    mg_event_at: ts,
+    mg_source_system: "app",
+  };
 
-  return { passId };
+  // Ignore duplicates
+  const { error } = await supabaseAdmin.from("mega_generations").insert(row);
+  if (error && !String(error.message || "").toLowerCase().includes("duplicate")) {
+    // If your table doesn’t have unique constraints, this will never happen.
+    // Safe to ignore only duplicate-like errors.
+    throw error;
+  }
 }
 
-/**
- * GENERATION dual-write
- */
 export async function megaWriteGenerationEvent(
   supabaseAdmin,
   { customerId, userId = null, email = null, generation }
 ) {
-  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+
+  const cust = await megaEnsureCustomer(supabaseAdmin, {
     customerId,
     userId,
     email,
-    legacyCredits: null,
   });
 
-  if (!passId) return { passId: null };
   const g = generation || {};
+  const ts = g.createdAt || nowIso();
 
-  await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: namespacedId("generation", g.id),
+  const row = {
+    mg_id: safeString(g.id, `gen_${crypto.randomUUID()}`),
     mg_record_type: "generation",
-    mg_pass_id: passId,
-    mg_session_id: g.sessionId ? String(g.sessionId) : null,
-    mg_generation_id: g.id ? String(g.id) : null,
-    mg_platform: g.platform ? String(g.platform) : null,
-    mg_type: g.type ? String(g.type) : null,
-    mg_prompt: g.prompt ? String(g.prompt) : null,
-    mg_output_url: g.outputUrl ? String(g.outputUrl) : null,
-    mg_output_key: g.outputKey ? String(g.outputKey) : null,
-    mg_provider: g.provider ? String(g.provider) : (g.meta?.provider ? String(g.meta.provider) : null),
-    mg_model: g.model ? String(g.model) : (g.meta?.model ? String(g.meta.model) : null),
-    mg_latency_ms: typeof g.meta?.latencyMs === "number" ? g.meta.latencyMs : null,
-    mg_input_chars: typeof g.meta?.inputChars === "number" ? g.meta.inputChars : null,
-    mg_output_chars: typeof g.meta?.outputChars === "number" ? g.meta.outputChars : null,
-    mg_status: g.meta?.status ? String(g.meta.status) : "succeeded",
-    mg_error: g.meta?.error ? String(g.meta.error) : null,
-    mg_created_at: g.createdAt || nowIso(),
-    mg_meta: g.meta ?? {},
-    mg_payload: { ...g, shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId) },
-  });
+    mg_pass_id: cust.passId,
 
-  return { passId };
-}
+    mg_session_id: safeString(g.sessionId || ""),
+    mg_generation_id: safeString(g.id || ""),
+    mg_platform: safeString(g.platform || ""),
+    mg_title: safeString(g.title || ""),
+    mg_type: safeString(g.type || "image"),
 
-/**
- * FEEDBACK dual-write
- */
-export async function megaWriteFeedbackEvent(
-  supabaseAdmin,
-  { customerId, userId = null, email = null, feedback }
-) {
-  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
-    customerId,
-    userId,
-    email,
-    legacyCredits: null,
-  });
+    mg_prompt: safeString(g.prompt || ""),
+    mg_output_url: safeString(g.outputUrl || ""),
+    mg_output_key: safeString(g.outputKey || ""),
 
-  if (!passId) return { passId: null };
-  const f = feedback || {};
+    mg_provider: safeString(g.meta?.provider || ""),
+    mg_model: safeString(g.meta?.model || ""),
+    mg_latency_ms: Number(g.meta?.latencyMs || 0) || null,
+    mg_input_chars: Number(g.meta?.inputChars || 0) || null,
+    mg_output_chars: Number(g.meta?.outputChars || 0) || null,
 
-  await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: namespacedId("feedback", f.id),
-    mg_record_type: "feedback",
-    mg_pass_id: passId,
-    mg_session_id: f.sessionId ? String(f.sessionId) : null,
-    mg_generation_id: f.generationId ? String(f.generationId) : null,
-    mg_platform: f.platform ? String(f.platform) : null,
-    mg_result_type: f.resultType ? String(f.resultType) : null,
-    mg_prompt: f.prompt ? String(f.prompt) : null,
-    mg_comment: f.comment ? String(f.comment) : null,
-    mg_image_url: f.imageUrl ? String(f.imageUrl) : null,
-    mg_video_url: f.videoUrl ? String(f.videoUrl) : null,
-    mg_created_at: f.createdAt || nowIso(),
-    mg_meta: { source: "legacy.feedback" },
-    mg_payload: { ...f, shopifyCustomerId: shopifyCustomerId || safeShopifyId(customerId) },
-  });
+    mg_status: safeString(g.meta?.status || "succeeded"),
+    mg_error: safeString(g.meta?.error || ""),
 
-  return { passId };
-}
+    mg_meta: g.meta && typeof g.meta === "object" ? g.meta : {},
+    mg_payload: g && typeof g === "object" ? g : {},
+    mg_source_system: "app",
 
-/**
- * CREDIT TXN dual-write
- * Note: id can be legacy credit txn UUID or any unique string you generate.
- */
-export async function megaWriteCreditTxnEvent(
-  supabaseAdmin,
-  { customerId, userId = null, email = null, id, delta, reason, source, refType = null, refId = null, createdAt = null, nextBalance = null }
-) {
-  const { passId, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
-    customerId,
-    userId,
-    email,
-    legacyCredits: null,
-  });
-
-  if (!passId) return { passId: null };
-
-  await megaUpsertLedgerRow(supabaseAdmin, {
-    mg_id: namespacedId("credit_transaction", id || `ctx_${crypto.randomUUID()}`),
-    mg_record_type: "credit_transaction",
-    mg_pass_id: passId,
-    mg_delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
-    mg_reason: reason ? String(reason) : null,
-    mg_source: source ? String(source) : null,
-    mg_ref_type: refType ? String(refType) : null,
-    mg_ref_id: refId ? String(refId) : null,
-    mg_created_at: createdAt || nowIso(),
-    mg_meta: { source: "legacy.credit_transactions" },
-    mg_payload: {
-      id: id || null,
-      delta: typeof delta === "number" ? Math.floor(delta) : Number(delta || 0),
-      reason: reason || null,
-      source: source || null,
-      refType: refType || null,
-      refId: refId || null,
-      createdAt: createdAt || nowIso(),
-      nextBalance: typeof nextBalance === "number" ? nextBalance : null,
-    },
-  });
-
-  if (typeof nextBalance === "number" && Number.isFinite(nextBalance)) {
-    try {
-      await supabaseAdmin
-        .from("mega_customers")
-        .update({ mg_credits: Math.floor(nextBalance), mg_updated_at: nowIso() })
-        .eq("mg_pass_id", passId);
-    } catch (_) {}
-  }
-
-  return { passId };
-}
-
-/**
- * Admin parity counts (cheap, safe)
- */
-export async function megaParityCounts(supabaseAdmin) {
-  if (!supabaseAdmin) return null;
-
-  const count = async (table, col = "*", filter = null) => {
-    let q = supabaseAdmin.from(table).select(col, { count: "exact", head: true });
-    if (filter?.eq) q = q.eq(filter.eq[0], filter.eq[1]);
-    const { count: c, error } = await q;
-    if (error) return null;
-    return c ?? 0;
+    mg_created_at: ts,
+    mg_updated_at: ts,
+    mg_event_at: ts,
   };
 
-  const [megaCustomers, megaSessions, megaGenerations, megaFeedback, megaCreditTxns] = await Promise.all([
-    count("mega_customers", "mg_pass_id"),
-    count("mega_generations", "mg_id", { eq: ["mg_record_type", "session"] }),
-    count("mega_generations", "mg_id", { eq: ["mg_record_type", "generation"] }),
-    count("mega_generations", "mg_id", { eq: ["mg_record_type", "feedback"] }),
-    count("mega_generations", "mg_id", { eq: ["mg_record_type", "credit_transaction"] }),
+  const { error } = await supabaseAdmin.from("mega_generations").insert(row);
+  if (error) throw error;
+}
+
+export async function megaWriteFeedbackEvent(
+  supabaseAdmin,
+  { customerId, feedback }
+) {
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+
+  const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
+
+  const fb = feedback || {};
+  const ts = fb.createdAt || nowIso();
+
+  const row = {
+    mg_id: safeString(fb.id, crypto.randomUUID()),
+    mg_record_type: "feedback",
+    mg_pass_id: cust.passId,
+
+    mg_session_id: safeString(fb.sessionId || ""),
+    mg_generation_id: safeString(fb.generationId || ""),
+    mg_platform: safeString(fb.platform || ""),
+    mg_result_type: safeString(fb.resultType || "image"),
+    mg_prompt: safeString(fb.prompt || ""),
+    mg_comment: safeString(fb.comment || ""),
+    mg_image_url: safeString(fb.imageUrl || ""),
+    mg_video_url: safeString(fb.videoUrl || ""),
+
+    mg_meta: fb && typeof fb === "object" ? fb : {},
+    mg_source_system: "app",
+
+    mg_created_at: ts,
+    mg_updated_at: ts,
+    mg_event_at: ts,
+  };
+
+  const { error } = await supabaseAdmin.from("mega_generations").insert(row);
+  if (error) throw error;
+}
+
+export async function megaParityCounts(supabaseAdmin) {
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+
+  const [cust, gen] = await Promise.all([
+    supabaseAdmin.from("mega_customers").select("mg_pass_id", { count: "exact", head: true }),
+    supabaseAdmin.from("mega_generations").select("mg_id", { count: "exact", head: true }),
   ]);
 
   return {
-    mega: {
-      customers: megaCustomers,
-      sessions: megaSessions,
-      generations: megaGenerations,
-      feedback: megaFeedback,
-      credit_transactions: megaCreditTxns,
-    },
-    meta: { generatedAt: nowIso() },
+    mega_customers: cust.count ?? 0,
+    mega_generations: gen.count ?? 0,
   };
 }

@@ -1112,7 +1112,209 @@ app.options("*", cors(corsOptions));
 app.post("/auth/shopify-sync", (_req, res) => {
   res.json({ ok: true });
 });
+// =======================
+// Shopify helpers + webhooks (PUT THIS BEFORE app.use(express.json()))
+// =======================
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || "";
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 
+const SHOPIFY_ORDER_WEBHOOK_SECRET = process.env.SHOPIFY_ORDER_WEBHOOK_SECRET || "";
+const SHOPIFY_MINA_TAG = process.env.SHOPIFY_MINA_TAG || "mina-users";
+const SHOPIFY_WELCOME_MATCHA_VARIANT_ID = String(process.env.SHOPIFY_WELCOME_MATCHA_VARIANT_ID || "");
+
+let CREDIT_PRODUCT_MAP = {};
+try {
+  CREDIT_PRODUCT_MAP = JSON.parse(process.env.CREDIT_PRODUCT_MAP || "{}");
+} catch {
+  CREDIT_PRODUCT_MAP = {};
+}
+
+function verifyShopifyWebhook({ secret, rawBody, hmacHeader }) {
+  if (!secret || !rawBody || !hmacHeader) return false;
+  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
+  // timing-safe compare
+  const a = Buffer.from(digest);
+  const b = Buffer.from(String(hmacHeader));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+async function shopifyAdminFetch(path, { method = "GET", body = null } = {}) {
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) throw new Error("SHOPIFY_NOT_CONFIGURED");
+
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/${String(path).replace(
+    /^\/+/,
+    ""
+  )}`;
+
+  const resp = await fetch(url, {
+    method,
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await resp.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+
+  if (!resp.ok) {
+    const err = new Error(`SHOPIFY_${resp.status}`);
+    err.status = resp.status;
+    err.body = json || text;
+    throw err;
+  }
+
+  return json;
+}
+
+async function addCustomerTag(customerId, tag) {
+  const id = String(customerId);
+
+  const get = await shopifyAdminFetch(`customers/${id}.json`);
+  const existingStr = get?.customer?.tags || "";
+  const existing = existingStr
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  if (existing.includes(tag)) return { ok: true, already: true, tags: existing };
+
+  const nextTags = [...existing, tag].join(", ");
+
+  await shopifyAdminFetch(`customers/${id}.json`, {
+    method: "PUT",
+    body: { customer: { id: Number(id), tags: nextTags } },
+  });
+
+  return { ok: true, already: false, tags: [...existing, tag] };
+}
+
+function creditsFromOrder(order) {
+  const items = Array.isArray(order?.line_items) ? order.line_items : [];
+  let credits = 0;
+
+  for (const li of items) {
+    const sku = String(li?.sku || "").trim();
+    const variantId = li?.variant_id != null ? String(li.variant_id) : "";
+
+    // Matcha variant → +50
+    if (SHOPIFY_WELCOME_MATCHA_VARIANT_ID && variantId === SHOPIFY_WELCOME_MATCHA_VARIANT_ID) {
+      credits += 50;
+      continue;
+    }
+
+    // SKU map → credits
+    if (sku && Object.prototype.hasOwnProperty.call(CREDIT_PRODUCT_MAP, sku)) {
+      credits += Number(CREDIT_PRODUCT_MAP[sku] || 0);
+    }
+  }
+
+  return credits;
+}
+
+// ✅ Order paid webhook (RAW body + HMAC verify)
+app.post(
+  "/api/credits/shopify-order",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const requestId = `shopify_${Date.now()}_${crypto.randomUUID()}`;
+
+    try {
+      const rawBody = req.body?.toString("utf8") || "";
+      const hmac = req.get("X-Shopify-Hmac-Sha256") || req.get("x-shopify-hmac-sha256") || "";
+
+      const ok = verifyShopifyWebhook({
+        secret: SHOPIFY_ORDER_WEBHOOK_SECRET,
+        rawBody,
+        hmacHeader: hmac,
+      });
+
+      if (!ok) return res.status(401).json({ ok: false, error: "INVALID_HMAC", requestId });
+
+      const order = rawBody ? JSON.parse(rawBody) : {};
+      const orderId = order?.id != null ? String(order.id) : null;
+
+      const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
+      const email = String(order?.email || order?.customer?.email || "").toLowerCase();
+
+      if (!orderId) return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID", requestId });
+
+      if (!supabaseAdmin) return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
+
+      // ✅ Idempotency: don’t credit same order twice
+      const { data: existing, error: exErr } = await supabaseAdmin
+        .from("mega_generations")
+        .select("mg_id")
+        .eq("mg_record_type", "credit_transaction")
+        .eq("mg_ref_type", "shopify_order")
+        .eq("mg_ref_id", orderId)
+        .limit(1);
+
+      if (exErr) throw exErr;
+      if (existing && existing.length) {
+        return res.status(200).json({ ok: true, requestId, alreadyProcessed: true, orderId });
+      }
+
+      const credits = creditsFromOrder(order);
+      if (!credits) {
+        return res.status(200).json({
+          ok: true,
+          requestId,
+          orderId,
+          credited: 0,
+          reason: "NO_MATCHING_PRODUCT",
+        });
+      }
+
+      // Use Shopify customer id when available (best key for your DB)
+      const customerKey = shopifyCustomerId || email || "anonymous";
+
+      const out = await sbAdjustCredits({
+        customerId: customerKey,
+        delta: credits,
+        reason: "shopify-order",
+        source: "shopify",
+        refType: "shopify_order",
+        refId: orderId,
+        reqUserId: null,
+        reqEmail: email || null,
+      });
+
+      // ✅ Tag customer for your “mina-users” segment (segment should be based on tag)
+      if (shopifyCustomerId) {
+        try {
+          await addCustomerTag(shopifyCustomerId, SHOPIFY_MINA_TAG);
+        } catch (e) {
+          console.error("[shopify] add tag failed:", e?.message || e);
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        requestId,
+        orderId,
+        customerId: customerKey,
+        credited: credits,
+        balance: out.balance,
+      });
+    } catch (e) {
+      console.error("[shopify webhook] failed", e);
+      return res.status(500).json({
+        ok: false,
+        error: "WEBHOOK_FAILED",
+        requestId,
+        message: e?.message || String(e),
+      });
+    }
+  }
+);
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));

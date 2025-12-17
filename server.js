@@ -1089,7 +1089,26 @@ async function sbGetAdminOverview() {
 // ======================================================
 // Express setup
 // ======================================================
-app.use(cors());
+const allowlist = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
+    if (allowlist.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`), false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 

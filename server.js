@@ -2115,26 +2115,72 @@ function getBearerToken(req) {
 // - Repairs old rows created by the frontend (missing last_active, credits, etc.)
 // - Grants DEFAULT_FREE_CREDITS once (optional) + sets expiry (optional)
 // ======================================================
+// =======================
+// REPLACE your whole /me route with this
+// =======================
+const crypto = require("crypto");
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function isUuid(v) {
+  const s = String(v || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+}
+
+function safeJsonParseText(v) {
+  try {
+    if (!v) return {};
+    if (typeof v === "object") return v && typeof v === "object" ? v : {};
+    const parsed = JSON.parse(String(v));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function jsonText(obj) {
+  try {
+    return JSON.stringify(obj && typeof obj === "object" ? obj : {});
+  } catch {
+    return "{}";
+  }
+}
+
+function intEnv(name, fallback = 0) {
+  const n = Number(process.env[name] ?? fallback);
+  return Number.isFinite(n) ? Math.floor(n) : fallback;
+}
+
+const DEFAULT_FREE_CREDITS = intEnv("DEFAULT_FREE_CREDITS", 0);
+const CREDITS_EXPIRE_DAYS = intEnv("CREDITS_EXPIRE_DAYS", 0);
+
+function addDaysIso(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString();
+}
+
 app.get("/me", async (req, res) => {
   const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
 
   try {
+    console.log("[/me] auth header?", !!req.headers.authorization);
+
     const token = getBearerToken(req);
 
-    // Client can send its local passId here so we keep continuity
-    const incomingPassId = String(req.get("X-Mina-Pass-Id") || "").trim() || null;
+    // client can send previous passId to keep continuity
+    const headerPass = req.get("X-Mina-Pass-Id") || req.get("x-mina-pass-id") || "";
+    const clientPassId = isUuid(headerPass) ? String(headerPass).trim() : null;
 
-    const now = new Date().toISOString();
-    const newPassId = () => crypto.randomUUID();
-
-    // If no token, user is not logged in => DO NOT write DB
-    // But still return a passId so the frontend can store it in localStorage
+    // If no token: logged out (do NOT touch DB)
     if (!token) {
       return res.json({
         ok: true,
         user: null,
         isAdmin: false,
-        passId: incomingPassId || newPassId(),
+        passId: clientPassId || crypto.randomUUID(),
         requestId,
       });
     }
@@ -2143,205 +2189,137 @@ app.get("/me", async (req, res) => {
       return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
     }
 
+    // Verify Supabase user
     const { data, error } = await supabaseAdmin.auth.getUser(token);
     if (error || !data?.user) {
       return res.status(401).json({ ok: false, error: "INVALID_TOKEN", requestId });
     }
 
-    const email = String(data.user.email || "").toLowerCase();
-    const userId = String(data.user.id || "");
+    const userId = data.user.id;
+    const email = String(data.user.email || "").toLowerCase().trim();
 
-    if (!userId) {
-      return res.status(401).json({ ok: false, error: "MISSING_USER_ID", requestId });
-    }
-
-    // Read existing customer row (if any)
-    const { data: existing, error: exErr } = await supabaseAdmin
+    // Find existing customer row
+    const { data: existing, error: selErr } = await supabaseAdmin
       .from("mega_customers")
-      .select("mg_pass_id, mg_admin_allowlist, mg_credits, mg_meta, mg_expires_at, mg_user_id, mg_email")
+      .select("*")
       .or(`mg_user_id.eq.${userId},mg_email.eq.${email}`)
       .limit(1)
       .maybeSingle();
 
-    if (exErr) throw exErr;
+    if (selErr) throw selErr;
 
-    // Decide passId:
-    // 1) DB passId (if exists)
-    // 2) incoming header passId
-    // 3) new uuid
-    let passId = String(existing?.mg_pass_id || incomingPassId || "").trim();
-    if (!passId) passId = newPassId();
+    const now = nowIso();
+    let created = false;
 
-    // meta can be json or string depending on column type/history
-    const meta = (() => {
-      const m = existing?.mg_meta;
-      if (!m) return {};
-      if (typeof m === "object") return m;
-      if (typeof m === "string") {
-        try {
-          const j = JSON.parse(m);
-          return j && typeof j === "object" ? j : {};
-        } catch {
-          return {};
-        }
-      }
-      return {};
-    })();
+    // canonical passId:
+    // - keep DB mg_pass_id if exists
+    // - else use clientPassId if valid
+    // - else generate
+    const dbPass = existing?.mg_pass_id && isUuid(existing.mg_pass_id) ? String(existing.mg_pass_id) : null;
+    const passId = dbPass || clientPassId || crypto.randomUUID();
 
-    const DEFAULT_FREE_CREDITS = Math.max(0, Number(process.env.DEFAULT_FREE_CREDITS || 0) || 0);
-    const CREDITS_EXPIRE_DAYS = Math.max(0, Number(process.env.CREDITS_EXPIRE_DAYS || 0) || 0);
+    // parse meta (IMPORTANT: your mg_meta looks like TEXT, not JSON)
+    const meta = safeJsonParseText(existing?.mg_meta);
 
-    const expiresAtFromDays = (days) => {
-      if (!days || days <= 0) return null;
-      return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    };
-
-    const welcomeAlreadyGranted = meta?.welcomeCreditsGranted === true;
-
-    // -----------------------------
-    // CREATE new row if missing
-    // -----------------------------
+    // Create row if missing
     if (!existing) {
-      const welcomeCredits = DEFAULT_FREE_CREDITS;
-      const expiresAt =
-        welcomeCredits > 0 && CREDITS_EXPIRE_DAYS > 0 ? expiresAtFromDays(CREDITS_EXPIRE_DAYS) : null;
+      created = true;
 
-      const payload = {
+      const startingCredits = Math.max(0, DEFAULT_FREE_CREDITS || 0);
+      const expiresAt =
+        startingCredits > 0 && CREDITS_EXPIRE_DAYS > 0 ? addDaysIso(CREDITS_EXPIRE_DAYS) : null;
+
+      const row = {
         mg_pass_id: passId,
         mg_user_id: userId,
         mg_email: email || null,
         mg_display_name: email || null,
-
-        mg_credits: welcomeCredits,
+        mg_credits: startingCredits,
         mg_expires_at: expiresAt,
         mg_last_active: now,
-
         mg_disabled: false,
         mg_admin_allowlist: false,
-
-        mg_meta: {
-          ...meta,
+        mg_meta: jsonText({
           createdFrom: "me",
-          welcomeCreditsGranted: welcomeCredits > 0 ? true : false,
-          welcomeCredits: welcomeCredits,
-          welcomeGrantedAt: welcomeCredits > 0 ? now : null,
-        },
-
-        mg_source_system: "app",
+          welcomeGranted: startingCredits > 0,
+          welcomeAt: startingCredits > 0 ? now : null,
+        }),
         mg_created_at: now,
         mg_updated_at: now,
       };
 
-      const { error: insErr } = await supabaseAdmin.from("mega_customers").insert(payload);
+      const { error: insErr } = await supabaseAdmin.from("mega_customers").insert(row);
       if (insErr) throw insErr;
-
-      // Optional: also write an event for the welcome credit grant
-      if (welcomeCredits > 0) {
-        await supabaseAdmin
-          .from("mega_generations")
-          .insert({
-            mg_id: crypto.randomUUID(),
-            mg_record_type: "credit_transaction",
-            mg_pass_id: passId,
-            mg_delta: welcomeCredits,
-            mg_reason: "welcome",
-            mg_source: "system",
-            mg_ref_type: "welcome",
-            mg_ref_id: passId,
-            mg_created_at: now,
-            mg_updated_at: now,
-            mg_event_at: now,
-            mg_meta: { email, userId },
-            mg_source_system: "app",
-          })
-          .catch(() => {});
-      }
-
-      return res.json({
-        ok: true,
-        user: { id: userId, email },
-        isAdmin: false,
-        passId,
-        requestId,
-      });
-    }
-
-    // -----------------------------
-    // REPAIR existing row
-    // -----------------------------
-    const updates = {
-      mg_updated_at: now,
-      mg_last_active: now,
-    };
-
-    // Ensure keys are filled
-    if (!existing.mg_pass_id) updates.mg_pass_id = passId;
-    if (!existing.mg_user_id) updates.mg_user_id = userId;
-    if (!existing.mg_email && email) updates.mg_email = email;
-
-    // If old/broken row has 0 credits and never got welcome credits, grant once
-    const currentCredits = Number(existing.mg_credits || 0);
-    if (DEFAULT_FREE_CREDITS > 0 && !welcomeAlreadyGranted && currentCredits <= 0) {
-      updates.mg_credits = DEFAULT_FREE_CREDITS;
-
-      if (CREDITS_EXPIRE_DAYS > 0) {
-        updates.mg_expires_at = expiresAtFromDays(CREDITS_EXPIRE_DAYS);
-      }
-
-      updates.mg_meta = {
-        ...meta,
-        welcomeCreditsGranted: true,
-        welcomeCredits: DEFAULT_FREE_CREDITS,
-        welcomeGrantedAt: now,
+    } else {
+      // Update / link row
+      const updates = {
+        mg_pass_id: passId,
+        mg_user_id: existing.mg_user_id || userId,
+        mg_email: existing.mg_email || email || null,
+        mg_last_active: now,
+        mg_updated_at: now,
       };
 
-      await supabaseAdmin
-        .from("mega_generations")
-        .insert({
-          mg_id: crypto.randomUUID(),
-          mg_record_type: "credit_transaction",
-          mg_pass_id: String(existing.mg_pass_id || passId),
-          mg_delta: DEFAULT_FREE_CREDITS,
-          mg_reason: "welcome_repair",
-          mg_source: "system",
-          mg_ref_type: "welcome",
-          mg_ref_id: String(existing.mg_pass_id || passId),
-          mg_created_at: now,
-          mg_updated_at: now,
-          mg_event_at: now,
-          mg_meta: { email, userId },
-          mg_source_system: "app",
-        })
-        .catch(() => {});
-    } else {
-      updates.mg_meta = { ...meta, lastSeenAt: now };
+      // OPTIONAL: grant free credits once if you want
+      const alreadyGranted = !!meta?.welcomeGranted;
+      const currentCredits = Number(existing.mg_credits || 0);
+      if (!alreadyGranted && DEFAULT_FREE_CREDITS > 0 && currentCredits <= 0) {
+        const nextCredits = currentCredits + DEFAULT_FREE_CREDITS;
+        updates.mg_credits = nextCredits;
+        if (CREDITS_EXPIRE_DAYS > 0) updates.mg_expires_at = addDaysIso(CREDITS_EXPIRE_DAYS);
+
+        updates.mg_meta = jsonText({
+          ...meta,
+          welcomeGranted: true,
+          welcomeAt: now,
+        });
+      }
+
+      const { error: upErr } = await supabaseAdmin
+        .from("mega_customers")
+        .update(updates)
+        .eq("mg_pass_id", existing.mg_pass_id);
+
+      // if row had no mg_pass_id match (rare), fallback update by userId
+      if (upErr) {
+        const { error: up2 } = await supabaseAdmin
+          .from("mega_customers")
+          .update(updates)
+          .eq("mg_user_id", userId);
+
+        if (up2) throw up2;
+      }
     }
 
-    // Update using the safest identifier we have
-    const q = supabaseAdmin.from("mega_customers").update(updates);
-    if (existing.mg_pass_id) q.eq("mg_pass_id", existing.mg_pass_id);
-    else q.eq("mg_user_id", userId);
-
-    const { error: upErr } = await q;
-    if (upErr) throw upErr;
+    // re-read lightweight flags
+    const { data: customer2 } = await supabaseAdmin
+      .from("mega_customers")
+      .select("mg_admin_allowlist, mg_credits, mg_expires_at, mg_pass_id")
+      .eq("mg_pass_id", passId)
+      .limit(1)
+      .maybeSingle();
 
     return res.json({
       ok: true,
       user: { id: userId, email },
-      isAdmin: !!existing?.mg_admin_allowlist,
-      passId: String(existing.mg_pass_id || passId),
+      isAdmin: !!customer2?.mg_admin_allowlist,
+      passId: customer2?.mg_pass_id || passId,
+      customerCreated: created,
+      credits: Number(customer2?.mg_credits || 0),
+      expiresAt: customer2?.mg_expires_at || null,
       requestId,
     });
   } catch (e) {
-    console.error("GET /me failed", e);
+    console.error("[/me] failed", requestId, e?.message || e);
     return res.status(500).json({
       ok: false,
       error: "ME_FAILED",
-      message: e?.message || String(e),
       requestId,
+      message: e?.message || String(e),
     });
   }
 });
+
 
 // Billing settings (stored in customers.meta.autoTopup)
 app.get("/billing/settings", async (req, res) => {

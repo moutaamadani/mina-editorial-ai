@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
+import crypto from "node:crypto";
 
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -14,26 +15,25 @@ const allowlist = (process.env.CORS_ORIGINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // allow server-to-server / curl (no Origin header)
-      if (!origin) return cb(null, true);
+const corsOptions = {
+  origin: (origin, cb) => {
+    // allow server-to-server / curl (no Origin header)
+    if (!origin) return cb(null, true);
 
-      // if no allowlist configured, block (safer than accidentally allowing everyone)
-      if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
+    // if no allowlist configured, block (safer than accidentally allowing everyone)
+    if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
 
-      if (allowlist.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked: ${origin}`), false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+    if (allowlist.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`), false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
 
-// (Optional but recommended)
-app.options("*", cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
 app.use(express.json({ limit: "2mb" }));
 
 const {

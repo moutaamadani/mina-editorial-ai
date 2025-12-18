@@ -2476,6 +2476,31 @@ app.post("/billing/settings", async (req, res) => {
   }
 });
 // =======================
+// Public stats: total users
+// Frontend calls: GET /public/stats/total-users
+// =======================
+app.get("/public/stats/total-users", async (_req, res) => {
+  try {
+    // If Supabase isn't configured, don't hard-fail (avoid noisy 500s)
+    if (!sbEnabled()) {
+      return res.json({ ok: true, totalUsers: 0, source: "no-supabase" });
+    }
+
+    // Uses your existing helper
+    const count = await sbCountCustomers();
+
+    return res.json({
+      ok: true,
+      totalUsers: Math.max(0, Number(count ?? 0)),
+      source: "mega_customers",
+    });
+  } catch (e) {
+    console.error("GET /public/stats/total-users failed:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "STATS_FAILED" });
+  }
+});
+
+// =======================
 // Customer history (generations + feedback + credits)
 // =======================
 app.get("/history", async (req, res) => {

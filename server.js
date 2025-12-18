@@ -2615,6 +2615,42 @@ app.get("/history", async (req, res) => {
   }
 });
 
+// =======================
+// Customer history (alias): /history/pass/:passId
+// Supports older frontend that calls /history/pass/<passId>
+// =======================
+app.get("/history/pass/:passId", async (req, res) => {
+  try {
+    const passId = String(req.params.passId || "").trim();
+    if (!passId) {
+      return res.status(400).json({ ok: false, error: "MISSING_PASS_ID" });
+    }
+
+    if (!sbEnabled()) {
+      return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
+    }
+
+    // NOTE: your history resolver treats the id as "customerId" key.
+    const history = await sbGetCustomerHistory(passId);
+
+    return res.json({
+      ok: true,
+      customerId: passId,
+      generations: history?.generations || [],
+      feedbacks: history?.feedbacks || [],
+      credits: history?.credits || { balance: 0, history: [] },
+    });
+  } catch (err) {
+    console.error("GET /history/pass/:passId error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "HISTORY_FAILED",
+      message: err?.message || "Failed to load history",
+    });
+  }
+});
+
+
 // Credits: balance
 app.get("/credits/balance", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;

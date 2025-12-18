@@ -146,6 +146,18 @@ function safeShopifyId(customerIdRaw) {
   return v.trim() || "anonymous";
 }
 
+function resolveCustomerId(req, body) {
+  const fromBody = body?.customerId;
+  if (fromBody !== null && fromBody !== undefined && String(fromBody).trim()) {
+    return String(fromBody).trim();
+  }
+
+  const fromHeader = String(req.get("X-Mina-Pass-Id") || "").trim();
+  if (fromHeader) return fromHeader;
+
+  return "anonymous";
+}
+
 // SubPart: simple UUID format check to keep session ids tidy.
 function isUuid(v) {
   return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -2186,8 +2198,8 @@ function createSession({ customerId, platform, title }) {
 
   sessions.set(sessionId, session);
 
-  // Persist to Supabase
-  if (sbEnabled()) {
+  // Persist to Supabase (skip anonymous to avoid FK)
+  if (sbEnabled() && session.customerId !== "anonymous") {
     void sbUpsertAppSession({
       id: sessionId,
       customerId: session.customerId,
@@ -2216,7 +2228,7 @@ function ensureSession(sessionIdRaw, customerId, platform) {
       createdAt: new Date().toISOString(),
     };
     sessions.set(incomingId, s);
-    if (sbEnabled()) {
+    if (sbEnabled() && s.customerId !== "anonymous") {
       void sbUpsertAppSession({
         id: incomingId,
         customerId: s.customerId,
@@ -2609,8 +2621,7 @@ app.get("/history", async (req, res) => {
 app.get("/credits/balance", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   try {
-    const customerIdRaw = req.query.customerId || "anonymous";
-    const customerId = String(customerIdRaw);
+    const customerId = resolveCustomerId(req, { customerId: req.query.customerId });
 
     // ✅ Costs should always reflect runtime config (even if SB is off)
     const cfg = await getRuntimeConfig();
@@ -2901,10 +2912,7 @@ app.post("/sessions/start", async (req, res) => {
 
   try {
     const body = req.body || {};
-    const customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
+    const customerId = resolveCustomerId(req, body);
 
     const platform = safeString(body.platform || "tiktok").toLowerCase();
     const title = safeString(body.title || "Mina session");
@@ -2981,10 +2989,7 @@ app.post("/editorial/generate", async (req, res) => {
     stylePresetKey = safeString(body.stylePresetKey || "");
     const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
 
-    customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
+    customerId = resolveCustomerId(req, body);
 
     if (!productImageUrl && !brief) {
       auditAiEvent(req, "ai_error", 400, {
@@ -3356,10 +3361,7 @@ app.post("/motion/suggest", async (req, res) => {
       ...styleImageUrls,
     ].map((u) => safeString(u, "")).filter((u) => isHttpUrl(u));
 
-    customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
+    customerId = resolveCustomerId(req, body);
 
     // Ensure customer exists
     const cust = await sbEnsureCustomer({
@@ -3472,7 +3474,6 @@ app.post("/motion/generate", async (req, res) => {
   const generationId = `gen_${uuidv4()}`;
   const startedAt = Date.now();
 
-  let customerId = "anonymous";
   let platform = "tiktok";
   let stylePresetKey = "";
 
@@ -3487,6 +3488,7 @@ app.post("/motion/generate", async (req, res) => {
     }
 
     const body = req.body || {};
+    const customerId = resolveCustomerId(req, body);
     const lastImageUrl = safeString(body.lastImageUrl);
     const motionDescription = safeString(body.motionDescription);
     const tone = safeString(body.tone);
@@ -3494,11 +3496,6 @@ app.post("/motion/generate", async (req, res) => {
     const minaVisionEnabled = !!body.minaVisionEnabled;
     stylePresetKey = safeString(body.stylePresetKey || "");
     const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
-
-    customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
 
     if (!lastImageUrl) {
       return res.status(400).json({
@@ -3756,10 +3753,7 @@ app.post("/feedback/like", async (req, res) => {
     }
 
     const body = req.body || {};
-    const customerId =
-      body.customerId !== null && body.customerId !== undefined
-        ? String(body.customerId)
-        : "anonymous";
+    const customerId = resolveCustomerId(req, body);
 
     const resultType = safeString(body.resultType || "image");
     const platform = safeString(body.platform || "tiktok").toLowerCase();

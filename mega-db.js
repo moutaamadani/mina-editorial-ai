@@ -83,6 +83,7 @@ export async function megaEnsureCustomer(
   // Try to find an existing customer by (shopify id) OR (user id) OR (email)
   const ors = [];
   if (isRealCustomerKey(shopifyCustomerId)) ors.push(`mg_shopify_customer_id.eq.${shopifyCustomerId}`);
+  if (isRealCustomerKey(shopifyCustomerId)) ors.push(`mg_pass_id.eq.${shopifyCustomerId}`);
   if (userId) ors.push(`mg_user_id.eq.${userId}`);
   if (normEmail) ors.push(`mg_email.eq.${normEmail}`);
 

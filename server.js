@@ -105,6 +105,33 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// ======================================================
+// Credits expiry policy (rolling expiry; latest wins)
+// - If credits are granted, expiry = max(current_expiry, grantedAt + N days)
+// - N defaults to 30 if env is missing/invalid
+// ======================================================
+const DEFAULT_CREDITS_EXPIRE_DAYS = (() => {
+  const raw = Number(process.env.CREDITS_EXPIRE_DAYS);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 30;
+})();
+
+function addDaysToIso(baseIso, days) {
+  const baseMs = Date.parse(String(baseIso || ""));
+  if (!Number.isFinite(baseMs)) return null;
+  const ms = baseMs + Number(days) * 24 * 60 * 60 * 1000;
+  return new Date(ms).toISOString();
+}
+
+function maxIso(aIso, bIso) {
+  const a = Date.parse(String(aIso || ""));
+  const b = Date.parse(String(bIso || ""));
+  if (!Number.isFinite(a) && !Number.isFinite(b)) return null;
+  if (!Number.isFinite(a)) return bIso || null;
+  if (!Number.isFinite(b)) return aIso || null;
+  return a >= b ? (aIso || null) : (bIso || null);
+}
+
 // SubPart: guardrail to avoid writing undefined/null into the DB.
 function safeString(value, fallback = "") {
   if (value === null || value === undefined) return fallback;
@@ -861,7 +888,17 @@ async function sbGetCredits({ customerId, reqUserId, reqEmail }) {
 }
 
 // WARNING: not fully atomic under concurrency (fine for low traffic)
-async function sbAdjustCredits({ customerId, delta, reason, source, refType, refId, reqUserId, reqEmail }) {
+async function sbAdjustCredits({
+  customerId,
+  delta,
+  reason,
+  source,
+  refType,
+  refId,
+  reqUserId,
+  reqEmail,
+  grantedAt = null, // optional ISO timestamp (ex: Shopify order processed_at)
+}) {
   if (!supabaseAdmin) return { ok: false, balance: null, source: "no-sb", passId: null };
 
   const cust = await sbEnsureCustomer({
@@ -889,6 +926,32 @@ async function sbAdjustCredits({ customerId, delta, reason, source, refType, ref
   } catch (e) {
     console.error("[mega] credits sync failed:", e?.message || e);
     throw e;
+  }
+
+  // Rolling expiry: any positive credit grant extends expiry to max(current, grantedAt + 30d)
+  if (Number(delta || 0) > 0 && cust?.passId) {
+    const grantIso = safeString(grantedAt || nowIso(), nowIso());
+    const desired = addDaysToIso(grantIso, DEFAULT_CREDITS_EXPIRE_DAYS);
+
+    // Read current expiry
+    const { data: row, error: readErr } = await supabaseAdmin
+      .from("mega_customers")
+      .select("mg_expires_at")
+      .eq("mg_pass_id", cust.passId)
+      .maybeSingle();
+
+    if (readErr) throw readErr;
+
+    const nextExp = maxIso(row?.mg_expires_at || null, desired);
+
+    if (nextExp && nextExp !== (row?.mg_expires_at || null)) {
+      const { error: upErr } = await supabaseAdmin
+        .from("mega_customers")
+        .update({ mg_expires_at: nextExp, mg_updated_at: nowIso() })
+        .eq("mg_pass_id", cust.passId);
+
+      if (upErr) throw upErr;
+    }
   }
 
   return { ok: true, balance: nextBalance, source: "mega", passId: cust?.passId || null };
@@ -1340,6 +1403,8 @@ app.post(
       // Key in your DB
       const customerKey = shopifyCustomerId || email || "anonymous";
 
+      const grantedAt = order?.processed_at || order?.created_at || nowIso();
+
       // ✅ This will ALSO ensure mega_customers row exists (via megaEnsureCustomer inside sbAdjustCredits)
       const out = await sbAdjustCredits({
         customerId: customerKey,
@@ -1350,6 +1415,7 @@ app.post(
         refId: orderId,
         reqUserId: null,
         reqEmail: email || null,
+        grantedAt,
       });
 
       // ✅ Tag customer for Shopify segment
@@ -2247,7 +2313,9 @@ app.get("/me", async (req, res) => {
     // Read existing customer row (if any)
     const { data: existing, error: exErr } = await supabaseAdmin
       .from("mega_customers")
-      .select("mg_pass_id, mg_admin_allowlist, mg_credits, mg_meta, mg_expires_at, mg_user_id, mg_email")
+      .select(
+        "mg_pass_id, mg_admin_allowlist, mg_credits, mg_meta, mg_expires_at, mg_user_id, mg_email, mg_created_at"
+      )
       .or(`mg_user_id.eq.${userId},mg_email.eq.${email}`)
       .limit(1)
       .maybeSingle();
@@ -2278,12 +2346,11 @@ app.get("/me", async (req, res) => {
     })();
 
     const DEFAULT_FREE_CREDITS = Math.max(0, Number(process.env.DEFAULT_FREE_CREDITS || 0) || 0);
-    const CREDITS_EXPIRE_DAYS = Math.max(0, Number(process.env.CREDITS_EXPIRE_DAYS || 0) || 0);
 
-    const expiresAtFromDays = (days) => {
-      if (!days || days <= 0) return null;
-      return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    };
+    // Always enforce a positive expiry window (policy = rolling 30d minimum)
+    const CREDITS_EXPIRE_DAYS = DEFAULT_CREDITS_EXPIRE_DAYS;
+
+    const expiresAtFromGrant = (grantIso) => addDaysToIso(grantIso || nowIso(), CREDITS_EXPIRE_DAYS);
 
     const welcomeAlreadyGranted = meta?.welcomeCreditsGranted === true;
 
@@ -2292,8 +2359,7 @@ app.get("/me", async (req, res) => {
     // -----------------------------
     if (!existing) {
       const welcomeCredits = DEFAULT_FREE_CREDITS;
-      const expiresAt =
-        welcomeCredits > 0 && CREDITS_EXPIRE_DAYS > 0 ? expiresAtFromDays(CREDITS_EXPIRE_DAYS) : null;
+      const expiresAt = welcomeCredits > 0 ? expiresAtFromGrant(now) : null;
 
       const payload = {
         mg_pass_id: passId,
@@ -2370,12 +2436,17 @@ app.get("/me", async (req, res) => {
 
     // If old/broken row has 0 credits and never got welcome credits, grant once
     const currentCredits = Number(existing.mg_credits || 0);
+
+    // Backfill: credits exist but expiry is missing (fixes older misconfigured rows)
+    if (currentCredits > 0 && !existing.mg_expires_at) {
+      const grantAt =
+        safeString(meta?.welcomeGrantedAt || existing?.mg_created_at || now, now);
+      updates.mg_expires_at = expiresAtFromGrant(grantAt);
+    }
     if (DEFAULT_FREE_CREDITS > 0 && !welcomeAlreadyGranted && currentCredits <= 0) {
       updates.mg_credits = DEFAULT_FREE_CREDITS;
 
-      if (CREDITS_EXPIRE_DAYS > 0) {
-        updates.mg_expires_at = expiresAtFromDays(CREDITS_EXPIRE_DAYS);
-      }
+      updates.mg_expires_at = expiresAtFromGrant(now);
 
       updates.mg_meta = {
         ...meta,

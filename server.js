@@ -2588,8 +2588,7 @@ app.get("/public/stats/total-users", async (_req, res) => {
 // =======================
 app.get("/history", async (req, res) => {
   try {
-    const customerIdRaw = req.query.customerId || "anonymous";
-    const customerId = String(customerIdRaw);
+    const customerId = resolveCustomerId(req, { customerId: req.query.customerId });
 
     if (!sbEnabled()) {
       return res.status(503).json({
@@ -2674,8 +2673,7 @@ app.post("/credits/add", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   try {
     const body = req.body || {};
-    const customerId =
-      body.customerId !== null && body.customerId !== undefined ? String(body.customerId) : "anonymous";
+    const customerId = resolveCustomerId(req, body);
     const amount = typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
     const reason = safeString(body.reason || "manual-topup");
     const source = safeString(body.source || "api");

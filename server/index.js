@@ -1,4 +1,7 @@
-//mina-editorial-ai/server/index.js
+// Hero Part 1: Simple file upload gateway using Cloudflare R2 presigned URLs
+// Part 1.1: Express server that only handles CORS + presign endpoints for the front-end.
+// Part 1.1.1: Comments mark the flow from request validation to signed URL creation.
+// mina-editorial-ai/server/index.js
 import express from "express";
 import cors from "cors";
 import path from "path";

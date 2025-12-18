@@ -1,3 +1,8 @@
+// Hero Part 1: Cloudflare R2 helper for permanent, non-expiring URLs
+// Part 1.1: This module hides the S3 client plumbing and keeps filenames safe.
+// Part 1.1.1: If anything feels off, watch for the ⚠️ comments beside tricky logic.
+// Part 1.2: Environment config (account, keys, bucket, endpoints) lives just below.
+// Part 1.3: Client + key helpers keep upload callers tiny and predictable.
 // r2.js — PUBLIC, NON-EXPIRING URLs ONLY (no presigned GET links)
 "use strict";
 

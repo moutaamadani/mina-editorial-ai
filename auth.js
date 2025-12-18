@@ -1,3 +1,6 @@
+// Hero Part 1: Lightweight admin auth middleware
+// Part 1.1: Verifies bearer tokens and records who touched admin routes.
+// Part 1.1.1: Keep requests audited so debugging access is straightforward.
 import { getSupabaseAdmin, logAdminAction, upsertProfileRow, upsertSessionRow } from "./supabase.js";
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "";

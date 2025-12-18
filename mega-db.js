@@ -1,8 +1,7 @@
-// mega-db.js
-// Supabase MEGA persistence helpers (no Prisma)
-// Tables:
-// - mega_customers (one row per customer)
-// - mega_generations (events: generation / feedback / credit_transaction / session)
+// Hero Part 1: Database helpers for MEGA tables (no Prisma)
+// Part 1.1: This module keeps Supabase write logic tidy and commented in everyday English.
+// Part 1.1.1: Tables touched — mega_customers (per customer) and mega_generations (event stream).
+// Part 1.2: Common helper utilities (timestamps, safe strings, key validation) feed into every DB write below.
 
 import crypto from "node:crypto";
 

@@ -3014,6 +3014,20 @@ app.post("/editorial/generate", async (req, res) => {
 
     const cfg = await getRuntimeConfig();
     const imageCost = Number(cfg?.credits?.imageCost ?? IMAGE_CREDITS_COST);
+    // ✅ TEMP DEBUG: remove after you see values
+    console.log("[CREDITS_DEBUG]", {
+      customerId_from_body: req.body?.customerId,
+      customerId_used: customerId,
+      auth_user: req.user || null,
+      header_pass_id: req.get("X-Mina-Pass-Id") || null,
+    });
+    
+    const creditsInfo = await sbGetCredits({
+      customerId,
+      reqUserId: req?.user?.userId,
+      reqEmail: req?.user?.email,
+    });
+
     const creditsInfo = await sbGetCredits({
       customerId,
       reqUserId: req?.user?.userId,

@@ -1149,7 +1149,7 @@ async function sbGetCustomerHistory(customerId) {
   const [custRes, gensRes, fbRes, txRes] = await Promise.all([
     supabaseAdmin
       .from("mega_customers")
-      .select("mg_shopify_customer_id,mg_credits,mg_pass_id")
+      .select("mg_shopify_customer_id,mg_credits,mg_pass_id,mg_expires_at")
       .eq("mg_shopify_customer_id", cid)
       .maybeSingle(),
     passId
@@ -1189,9 +1189,10 @@ async function sbGetCustomerHistory(customerId) {
   return {
     customerId: cid,
     credits: {
-      balance: custRes.data?.mg_credits ?? 0,
-      history: txRes.data || [],
-    },
+    balance: custRes.data?.mg_credits ?? 0,
+    expiresAt: custRes.data?.mg_expires_at ?? null,
+    history: txRes.data || [],
+  },
     generations: gensRes.data || [],
     feedbacks: fbRes.data || [],
   };

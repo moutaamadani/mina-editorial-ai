@@ -34,7 +34,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 // SubPart: We show total users with a friendly offset so numbers look nicer.
 const MINA_BASELINE_USERS = 3651; // offset we add on top of DB users
-
+// ✅ Put it RIGHT HERE (before supabase init / routes)
+console.log("ENV CHECK", {
+  SUPABASE_URL_set: !!process.env.SUPABASE_URL,
+  SUPABASE_URL_len: process.env.SUPABASE_URL?.length ?? 0,
+  SUPABASE_SERVICE_ROLE_KEY_set: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+  SUPABASE_SERVICE_ROLE_KEY_len: process.env.SUPABASE_SERVICE_ROLE_KEY?.length ?? 0,
+});
 // Part 1.2: Supabase (service role) — MEGA-first persistence
 // Part 1.2.1: Tables (MEGA-only)
 //   - mega_customers

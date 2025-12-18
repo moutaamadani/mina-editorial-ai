@@ -2588,8 +2588,7 @@ app.get("/public/stats/total-users", async (_req, res) => {
 // =======================
 app.get("/history", async (req, res) => {
   try {
-    const customerIdRaw = req.query.customerId || "anonymous";
-    const customerId = String(customerIdRaw);
+    const customerId = resolveCustomerId(req, req.query);
 
     if (!sbEnabled()) {
       return res.status(503).json({
@@ -2674,8 +2673,7 @@ app.post("/credits/add", async (req, res) => {
   const requestId = `req_${Date.now()}_${uuidv4()}`;
   try {
     const body = req.body || {};
-    const customerId =
-      body.customerId !== null && body.customerId !== undefined ? String(body.customerId) : "anonymous";
+    const customerId = resolveCustomerId(req, body);
     const amount = typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
     const reason = safeString(body.reason || "manual-topup");
     const source = safeString(body.source || "api");
@@ -2964,10 +2962,6 @@ app.post("/editorial/generate", async (req, res) => {
   const generationId = `gen_${uuidv4()}`;
   const startedAt = Date.now();
 
-  let customerId = "anonymous";
-  let platform = "tiktok";
-  let stylePresetKey = "";
-
   try {
     if (!sbEnabled()) {
       return res.status(500).json({
@@ -2979,17 +2973,16 @@ app.post("/editorial/generate", async (req, res) => {
     }
 
     const body = req.body || {};
+    let customerId = resolveCustomerId(req, body);
+    let platform = safeString(body.platform || "tiktok").toLowerCase();
+    let stylePresetKey = safeString(body.stylePresetKey || "");
     const productImageUrl = safeString(body.productImageUrl);
     const logoImageUrl = safeString(body.logoImageUrl || "");
     const styleImageUrls = Array.isArray(body.styleImageUrls) ? body.styleImageUrls : [];
     const brief = safeString(body.brief);
     const tone = safeString(body.tone);
-    platform = safeString(body.platform || "tiktok").toLowerCase();
     const minaVisionEnabled = !!body.minaVisionEnabled;
-    stylePresetKey = safeString(body.stylePresetKey || "");
     const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
-
-    customerId = resolveCustomerId(req, body);
 
     if (!productImageUrl && !brief) {
       auditAiEvent(req, "ai_error", 400, {
@@ -3307,8 +3300,6 @@ app.post("/motion/suggest", async (req, res) => {
   const generationId = `gen_${uuidv4()}`;
   const startedAt = Date.now();
 
-  let customerId = "anonymous";
-
   try {
     if (!sbEnabled()) {
       return res.status(500).json({
@@ -3361,7 +3352,7 @@ app.post("/motion/suggest", async (req, res) => {
       ...styleImageUrls,
     ].map((u) => safeString(u, "")).filter((u) => isHttpUrl(u));
 
-    customerId = resolveCustomerId(req, body);
+    const customerId = resolveCustomerId(req, body);
 
     // Ensure customer exists
     const cust = await sbEnsureCustomer({
@@ -3474,10 +3465,6 @@ app.post("/motion/generate", async (req, res) => {
   const generationId = `gen_${uuidv4()}`;
   const startedAt = Date.now();
 
-  let customerId = "anonymous";
-  let platform = "tiktok";
-  let stylePresetKey = "";
-
   try {
     if (!sbEnabled()) {
       return res.status(500).json({
@@ -3490,14 +3477,14 @@ app.post("/motion/generate", async (req, res) => {
 
     const body = req.body || {};
     const lastImageUrl = safeString(body.lastImageUrl);
-    const motionDescription = safeString(body.motionDescription);
+    const motionDescription = safeString(body.motionDescription || body.text || body.motionBrief || "");
     const tone = safeString(body.tone);
-    platform = safeString(body.platform || "tiktok").toLowerCase();
+    const platform = safeString(body.platform || "tiktok").toLowerCase();
     const minaVisionEnabled = !!body.minaVisionEnabled;
-    stylePresetKey = safeString(body.stylePresetKey || "");
+    const stylePresetKey = safeString(body.stylePresetKey || "");
     const preset = stylePresetKey ? STYLE_PRESETS[stylePresetKey] || null : null;
 
-    customerId = resolveCustomerId(req, body);
+    const customerId = resolveCustomerId(req, body);
 
     if (!lastImageUrl) {
       return res.status(400).json({

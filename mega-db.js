@@ -319,6 +319,8 @@ export async function megaWriteSessionEvent(
   if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
   const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
 
+  if (cust.passId === "pass_anonymous") return;
+
   const sid = safeString(sessionId, crypto.randomUUID());
   const ts = createdAt || nowIso();
 
@@ -355,6 +357,8 @@ export async function megaWriteGenerationEvent(
     userId,
     email,
   });
+
+  if (cust.passId === "pass_anonymous") return;
 
   const g = generation || {};
   const ts = g.createdAt || nowIso();
@@ -403,6 +407,8 @@ export async function megaWriteFeedbackEvent(
   if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
 
   const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
+
+  if (cust.passId === "pass_anonymous") return;
 
   const fb = feedback || {};
   const ts = fb.createdAt || nowIso();

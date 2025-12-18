@@ -412,6 +412,7 @@ export async function megaWriteFeedbackEvent(
 
   const fb = feedback || {};
   const ts = fb.createdAt || nowIso();
+  const meta = fb && typeof fb.meta === "object" ? fb.meta : {};
 
   const row = {
     mg_id: safeString(fb.id, crypto.randomUUID()),
@@ -420,14 +421,32 @@ export async function megaWriteFeedbackEvent(
 
     mg_session_id: safeString(fb.sessionId || ""),
     mg_generation_id: safeString(fb.generationId || ""),
-    mg_platform: safeString(fb.platform || ""),
-    mg_result_type: safeString(fb.resultType || "image"),
+    mg_platform: safeString(fb.platform || meta.platform || ""),
+    mg_title: safeString(fb.title || meta.title || ""),
+    mg_type: safeString(fb.type || fb.resultType || meta.type || meta.resultType || "image"),
+    mg_result_type: safeString(fb.resultType || meta.resultType || "image"),
     mg_prompt: safeString(fb.prompt || ""),
+    mg_content_type: safeString(fb.contentType || meta.contentType || ""),
+
+    mg_output_url: safeString(
+      fb.outputUrl || fb.imageUrl || fb.videoUrl || meta.outputUrl || ""
+    ),
+    mg_output_key: safeString(fb.outputKey || meta.outputKey || ""),
+    mg_provider: safeString(fb.provider || meta.provider || ""),
+    mg_model: safeString(fb.model || meta.model || ""),
+    mg_latency_ms: Number(meta.latencyMs ?? fb.latencyMs ?? 0) || null,
+    mg_input_chars: Number(meta.inputChars ?? fb.inputChars ?? 0) || null,
+    mg_output_chars: Number(meta.outputChars ?? fb.outputChars ?? 0) || null,
+    mg_input_tokens: Number(meta.inputTokens ?? fb.inputTokens ?? 0) || null,
+    mg_output_tokens: Number(meta.outputTokens ?? fb.outputTokens ?? 0) || null,
+    mg_status: safeString(fb.status || meta.status || "succeeded"),
+    mg_error: safeString(fb.error || meta.error || ""),
     mg_comment: safeString(fb.comment || ""),
     mg_image_url: safeString(fb.imageUrl || ""),
     mg_video_url: safeString(fb.videoUrl || ""),
 
-    mg_meta: fb && typeof fb === "object" ? fb : {},
+    mg_meta: meta,
+    mg_payload: fb && typeof fb === "object" ? fb : {},
     mg_source_system: "app",
 
     mg_created_at: ts,

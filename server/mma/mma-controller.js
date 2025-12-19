@@ -430,18 +430,34 @@ export class MmaController {
     };
   }
 
-  async runStillCreate({ customerId, email, userId, assets = {}, brief = "", settings = {} }) {
+  async runStillCreate({
+    customerId,
+    email,
+    userId,
+    assets = {},
+    inputs = {},
+    history = {},
+    brief = "",
+    settings = {},
+    meta = {},
+    feedback = {},
+  }) {
     const generationId = `mma_${crypto.randomUUID()}`;
     const cust = await megaEnsureCustomer(this.supabaseAdmin, { customerId, email, userId });
     const mmaVars = {
       assets,
+      inputs,
+      history,
+      feedback,
       prompts: {},
       scans: {},
       outputs: {},
       settings: {},
       userMessages: { scan_lines: [] },
-      meta: { ctx_versions: {}, settings_versions: {} },
+      meta: { ctx_versions: {}, settings_versions: {}, ...meta },
     };
+
+    const combinedBrief = (brief || `${inputs.userBrief || ""}\n${inputs.style || ""}`).trim();
 
     await insertGenerationRow(this.supabaseAdmin, generationId, cust.passId, "still", mmaVars);
     this.sseHub.send(generationId, "status", { status: "queued" });
@@ -458,7 +474,7 @@ export class MmaController {
     let stepNo = 0;
     const scanLine = (line) => {
       mmaVars.userMessages.scan_lines.push(line);
-      this.sseHub.send(generationId, "scan_line", { line });
+      this.sseHub.send(generationId, "scan_line", { index: mmaVars.userMessages.scan_lines.length, text: line });
       updateGenerationStatus(this.supabaseAdmin, generationId, "scanning", mmaVars).catch(() => {});
     };
 
@@ -535,7 +551,7 @@ export class MmaController {
       const promptStep = await runGptTextStep({
         openai: this.openai,
         config: configs.ctx.gpt_reader,
-        inputText: `${brief}\n${mmaVars.scans.product_crt || ""}`.trim(),
+        inputText: `${combinedBrief}\n${mmaVars.scans.product_crt || ""}`.trim(),
         stepType: "gpt_reader",
       });
       mmaVars.prompts.clean_prompt = promptStep.payload.output.text;
@@ -658,18 +674,36 @@ export class MmaController {
     }
   }
 
-  async runVideoAnimate({ customerId, email, userId, stillUrl, brief = "", settings = {} }) {
+  async runVideoAnimate({
+    customerId,
+    email,
+    userId,
+    assets = {},
+    inputs = {},
+    mode = {},
+    history = {},
+    brief = "",
+    settings = {},
+    meta = {},
+    feedback = {},
+  }) {
     const generationId = `mma_${crypto.randomUUID()}`;
     const cust = await megaEnsureCustomer(this.supabaseAdmin, { customerId, email, userId });
     const mmaVars = {
-      assets: { still_url: stillUrl },
+      assets,
+      inputs,
+      mode,
+      history,
+      feedback,
       prompts: {},
       scans: {},
       outputs: {},
       settings: {},
       userMessages: { scan_lines: [] },
-      meta: { ctx_versions: {}, settings_versions: {} },
+      meta: { ctx_versions: {}, settings_versions: {}, ...meta },
     };
+
+    const combinedBrief = (brief || `${inputs.motion_user_brief || ""}\n${inputs.movement_style || ""}`).trim();
 
     await insertGenerationRow(this.supabaseAdmin, generationId, cust.passId, "video", mmaVars);
     this.sseHub.send(generationId, "status", { status: "queued" });
@@ -689,11 +723,12 @@ export class MmaController {
     let stepNo = 0;
     const scanLine = (line) => {
       mmaVars.userMessages.scan_lines.push(line);
-      this.sseHub.send(generationId, "scan_line", { line });
+      this.sseHub.send(generationId, "scan_line", { index: mmaVars.userMessages.scan_lines.length, text: line });
       updateGenerationStatus(this.supabaseAdmin, generationId, "scanning", mmaVars).catch(() => {});
     };
 
     try {
+      const stillUrl = assets?.still_url || assets?.input_still_image_id || null;
       if (stillUrl) {
         scanLine("Scanning input still...");
         const scan = await runGptVisionStep({
@@ -722,7 +757,7 @@ export class MmaController {
       const motionSuggestion = await runGptTextStep({
         openai: this.openai,
         config: configs.ctx.motion_suggestion,
-        inputText: `${brief}\n${mmaVars.scans.still_crt || ""}`,
+        inputText: `${combinedBrief}\n${mmaVars.scans.still_crt || ""}`,
         stepType: "motion_suggestion",
       });
       mmaVars.prompts.motion_suggestion = motionSuggestion.payload.output.text;
@@ -740,7 +775,7 @@ export class MmaController {
       const motionPrompt = await runGptTextStep({
         openai: this.openai,
         config: configs.ctx.gpt_reader_motion,
-        inputText: `${mmaVars.prompts.motion_suggestion}\n${brief}`,
+        inputText: `${mmaVars.prompts.motion_suggestion}\n${combinedBrief}`,
         stepType: "gpt_reader_motion",
       });
       mmaVars.prompts.motion_prompt = motionPrompt.payload.output.text;
@@ -840,6 +875,59 @@ export class MmaController {
       await refundCredits(this.supabaseAdmin, cust, Number(process.env.MOTION_CREDITS_COST || 5), "mma_kling_generate_refund");
       throw err;
     }
+  }
+
+  async runStillTweak({ baseGenerationId, customerId, email, userId, feedback = {}, settings = {} }) {
+    const { data } = await (this.supabaseAdmin
+      ? this.supabaseAdmin
+          .from("mega_generations")
+          .select("mg_mma_vars")
+          .eq("mg_generation_id", baseGenerationId)
+          .eq("mg_record_type", "generation")
+          .maybeSingle()
+      : { data: null });
+
+    const baseVars = data?.mg_mma_vars || {};
+
+    return this.runStillCreate({
+      customerId,
+      email,
+      userId,
+      assets: baseVars.assets || {},
+      inputs: baseVars.inputs || {},
+      history: baseVars.history || {},
+      feedback: { ...baseVars.feedback, ...feedback },
+      brief: feedback.still_feedback || baseVars.inputs?.userBrief || "",
+      settings,
+      meta: { ...(baseVars.meta || {}), base_generation_id: baseGenerationId },
+    });
+  }
+
+  async runVideoTweak({ baseGenerationId, customerId, email, userId, feedback = {}, settings = {} }) {
+    const { data } = await (this.supabaseAdmin
+      ? this.supabaseAdmin
+          .from("mega_generations")
+          .select("mg_mma_vars")
+          .eq("mg_generation_id", baseGenerationId)
+          .eq("mg_record_type", "generation")
+          .maybeSingle()
+      : { data: null });
+
+    const baseVars = data?.mg_mma_vars || {};
+
+    return this.runVideoAnimate({
+      customerId,
+      email,
+      userId,
+      assets: baseVars.assets || {},
+      inputs: baseVars.inputs || {},
+      mode: baseVars.mode || {},
+      history: baseVars.history || {},
+      feedback: { ...baseVars.feedback, ...feedback },
+      brief: feedback.motion_feedback || baseVars.inputs?.motion_user_brief || "",
+      settings,
+      meta: { ...(baseVars.meta || {}), base_generation_id: baseGenerationId },
+    });
   }
 }
 

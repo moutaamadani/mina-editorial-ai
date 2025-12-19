@@ -2081,6 +2081,57 @@ Write the final video generation prompt.
   });
 }
 
+async function sbGetCustomerHistoryByPassId(passId) {
+  if (!supabaseAdmin) return null;
+
+  const [custRes, gensRes, fbRes, txRes] = await Promise.all([
+    supabaseAdmin
+      .from("mega_customers")
+      .select("mg_shopify_customer_id,mg_credits,mg_pass_id,mg_expires_at")
+      .eq("mg_pass_id", passId)
+      .maybeSingle(),
+
+    supabaseAdmin
+      .from("mega_generations")
+      .select("*")
+      .eq("mg_pass_id", passId)
+      .eq("mg_record_type", "generation")
+      .order("mg_created_at", { ascending: false })
+      .limit(500),
+
+    supabaseAdmin
+      .from("mega_generations")
+      .select("*")
+      .eq("mg_pass_id", passId)
+      .eq("mg_record_type", "feedback")
+      .order("mg_created_at", { ascending: false })
+      .limit(500),
+
+    supabaseAdmin
+      .from("mega_generations")
+      .select("*")
+      .eq("mg_pass_id", passId)
+      .eq("mg_record_type", "credit_transaction")
+      .order("mg_created_at", { ascending: false })
+      .limit(500),
+  ]);
+
+  if (custRes.error) throw custRes.error;
+  if (gensRes.error) throw gensRes.error;
+  if (fbRes.error) throw fbRes.error;
+  if (txRes.error) throw txRes.error;
+
+  return {
+    customerId: custRes.data?.mg_shopify_customer_id || passId,
+    credits: {
+      balance: custRes.data?.mg_credits ?? 0,
+      expiresAt: custRes.data?.mg_expires_at ?? null,
+      history: txRes.data || [],
+    },
+    generations: gensRes.data || [],
+    feedbacks: fbRes.data || [],
+  };
+}
 
 async function buildMotionSuggestion(options) {
   const cfg = await getRuntimeConfig();
@@ -2639,15 +2690,14 @@ app.get("/history/pass/:passId", async (req, res) => {
       return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
     }
 
-    // NOTE: your history resolver treats the id as "customerId" key.
-    const history = await sbGetCustomerHistory(passId);
+    const history = await sbGetCustomerHistoryByPassId(passId);
 
     return res.json({
       ok: true,
-      customerId: passId,
-      generations: history?.generations || [],
-      feedbacks: history?.feedbacks || [],
-      credits: history?.credits || { balance: 0, history: [] },
+      customerId: history.customerId,
+      generations: history.generations,
+      feedbacks: history.feedbacks,
+      credits: history.credits,
     });
   } catch (err) {
     console.error("GET /history/pass/:passId error:", err);
@@ -2658,6 +2708,7 @@ app.get("/history/pass/:passId", async (req, res) => {
     });
   }
 });
+
 
 
 // Credits: balance

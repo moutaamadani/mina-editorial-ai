@@ -33,6 +33,7 @@ import { parseDataUrl } from "./r2.js";
 import { logAdminAction, upsertSessionRow } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
 import { createMmaController } from "./server/mma/mma-controller.js";
+import createMmaRouter from "./server/mma/mma-router.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1415,11 +1416,28 @@ const corsOptions = {
   credentials: false, // ✅ you are using Bearer tokens, not cookies
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Mina-Pass-Id"],
+  exposedHeaders: ["X-Mina-Pass-Id"],
   optionsSuccessStatus: 204,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+app.use((req, res, next) => {
+  const existing = res.get("Access-Control-Expose-Headers");
+  const headers = existing
+    ? existing
+        .split(",")
+        .map((h) => h.trim())
+        .filter(Boolean)
+    : [];
+
+  if (!headers.some((h) => h.toLowerCase() === "x-mina-pass-id")) {
+    headers.push("X-Mina-Pass-Id");
+  }
+
+  res.set("Access-Control-Expose-Headers", headers.join(", "));
+  next();
+});
 
 app.post("/auth/shopify-sync", (_req, res) => {
   res.json({ ok: true });
@@ -1682,6 +1700,20 @@ const openai = new OpenAI({
 
 const mmaController = createMmaController({ supabaseAdmin, openai, replicate });
 const mmaHub = mmaController.getHub();
+const mmaRouter = createMmaRouter({
+  supabaseAdmin,
+  sbEnabled,
+  mmaController,
+  mmaHub,
+  resolveCustomerId,
+  normalizePassId,
+  resolvePassId,
+  sbEnsureCustomer,
+  updateMmaPreferencesForEvent,
+  requireAdmin,
+  safeString,
+  nowIso,
+});
 
 // Models
 const SEADREAM_MODEL = process.env.SEADREAM_MODEL_VERSION || "bytedance/seedream-4";
@@ -3215,6 +3247,102 @@ app.post("/sessions/start", async (req, res) => {
 });
 
 // =======================
+// ---- Mina Editorial (image) — MMA-backed shim for legacy frontend
+// =======================
+// This handler runs the MMA still pipeline so the existing Mina frontend keeps
+// writing MEGA/MMA rows (generation + steps) while preserving the legacy
+// `/editorial/generate` response shape the UI expects.
+app.post("/editorial/generate", async (req, res) => {
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
+
+  try {
+    if (!sbEnabled()) {
+      return res.status(500).json({
+        ok: false,
+        error: "NO_DB",
+        message: "Supabase not configured",
+        requestId,
+      });
+    }
+
+    const body = req.body || {};
+    const customerId = resolveCustomerId(req, body);
+    const assets = {
+      product_url: safeString(body.productImageUrl) || null,
+      logo_url: safeString(body.logoImageUrl) || null,
+      inspiration_urls: Array.isArray(body.styleImageUrls)
+        ? body.styleImageUrls.filter(Boolean)
+        : [],
+      style_hero_url: null,
+      input_still_image_id: null,
+      still_url: null,
+    };
+
+    const inputs = {
+      userBrief: safeString(body.brief),
+      style: safeString(body.tone || body.stylePresetKey || ""),
+      aspect_ratio: safeString(body.aspectRatio || ""),
+      platform: safeString(body.platform || ""),
+    };
+
+    const settings = {};
+    if (inputs.aspect_ratio) settings.seedream = { aspect_ratio: inputs.aspect_ratio };
+
+    const result = await mmaController.runStillCreate({
+      customerId,
+      email: req?.user?.email || null,
+      userId: req?.user?.userId || null,
+      assets,
+      inputs,
+      history: { vision_intelligence: !!body.minaVisionEnabled },
+      brief: safeString(body.brief || ""),
+      settings,
+    });
+
+    if (result?.passId) {
+      res.set("X-Mina-Pass-Id", result.passId);
+    }
+
+    const imageUrl = result?.outputs?.seedream_image_url || null;
+    const prompt = result?.mma_vars?.prompts?.clean_prompt || inputs.userBrief || "";
+    const creditsInfo = await sbGetCredits({
+      customerId,
+      reqUserId: req?.user?.userId,
+      reqEmail: req?.user?.email,
+    });
+
+    return res.json({
+      ok: true,
+      requestId,
+      generationId: result?.generationId,
+      passId: result?.passId || null,
+      prompt,
+      imageUrl,
+      imageUrls: imageUrl ? [imageUrl] : [],
+      sessionId: null,
+      gpt: {
+        userMessage: result?.mma_vars?.prompts?.clean_prompt || null,
+        imageTexts: result?.mma_vars?.scans?.output_still_crt
+          ? [result.mma_vars.scans.output_still_crt]
+          : undefined,
+      },
+      credits:
+        creditsInfo.balance === null || creditsInfo.balance === undefined
+          ? undefined
+          : { balance: creditsInfo.balance },
+    });
+  } catch (err) {
+    console.error("Error in /editorial/generate (mma shim):", err);
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_EDITORIAL_ERROR",
+      message: err?.message || "Unexpected error during editorial generate.",
+      requestId,
+    });
+  }
+});
+
+// =======================
 // ---- Mina Editorial (image) — R2 ONLY output (no provider URLs)
 // =======================
 app.post("/editorial/generate", async (req, res) => {
@@ -3718,6 +3846,109 @@ app.post("/motion/suggest", async (req, res) => {
 });
 
 // =======================
+// ---- Mina Motion (video) — MMA-backed shim for legacy frontend
+// =======================
+// Run the MMA video pipeline so legacy `/motion/generate` calls persist MEGA
+// generations/steps while keeping the current response contract.
+app.post("/motion/generate", async (req, res) => {
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
+
+  try {
+    if (!sbEnabled()) {
+      return res.status(500).json({
+        ok: false,
+        error: "NO_DB",
+        message: "Supabase not configured",
+        requestId,
+      });
+    }
+
+    const body = req.body || {};
+    const lastImageUrl = safeString(body.lastImageUrl);
+    const motionDescription = safeString(body.motionDescription || body.text || body.motionBrief || "");
+
+    if (!lastImageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_LAST_IMAGE",
+        message: "lastImageUrl is required to create motion.",
+        requestId,
+      });
+    }
+
+    if (!motionDescription) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_MOTION_DESCRIPTION",
+        message: "Describe how Mina should move the scene.",
+        requestId,
+      });
+    }
+
+    const customerId = resolveCustomerId(req, body);
+    const platform = safeString(body.platform || "");
+    const aspectRatio = safeString(body.aspectRatio || body.motionAspectRatio || "");
+    const motionStyles = Array.isArray(body.motionStyles || body.motionStyleKeys)
+      ? (body.motionStyles || body.motionStyleKeys).filter(Boolean)
+      : [];
+
+    const result = await mmaController.runVideoAnimate({
+      customerId,
+      email: req?.user?.email || null,
+      userId: req?.user?.userId || null,
+      assets: { input_still_image_id: lastImageUrl, still_url: lastImageUrl },
+      inputs: {
+        motion_user_brief: motionDescription,
+        movement_style: motionStyles.join(", ") || safeString(body.movementStyle || ""),
+        platform,
+        aspect_ratio: aspectRatio,
+      },
+      mode: { platform, aspect_ratio: aspectRatio },
+      history: { vision_intelligence: !!body.minaVisionEnabled },
+      brief: motionDescription,
+      settings: aspectRatio ? { kling: { aspect_ratio: aspectRatio } } : {},
+    });
+
+    if (result?.passId) {
+      res.set("X-Mina-Pass-Id", result.passId);
+    }
+
+    const videoUrl = result?.outputs?.kling_video_url || null;
+    const prompt = result?.mma_vars?.prompts?.motion_prompt || motionDescription;
+    const creditsInfo = await sbGetCredits({
+      customerId,
+      reqUserId: req?.user?.userId,
+      reqEmail: req?.user?.email,
+    });
+
+    return res.json({
+      ok: true,
+      requestId,
+      generationId: result?.generationId,
+      passId: result?.passId || null,
+      prompt,
+      videoUrl,
+      sessionId: null,
+      gpt: {
+        userMessage: result?.mma_vars?.prompts?.motion_prompt || null,
+      },
+      credits:
+        creditsInfo.balance === null || creditsInfo.balance === undefined
+          ? undefined
+          : { balance: creditsInfo.balance },
+    });
+  } catch (err) {
+    console.error("Error in /motion/generate (mma shim):", err);
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_MOTION_ERROR",
+      message: err?.message || "Unexpected error during motion generate.",
+      requestId,
+    });
+  }
+});
+
+// =======================
 // ---- Mina Motion (video) — R2 ONLY output (no provider URLs)
 // =======================
 app.post("/motion/generate", async (req, res) => {
@@ -4123,326 +4354,7 @@ app.post("/feedback/like", async (req, res) => {
 // ========================
 // MMA generation + streaming API
 // ========================
-function sendSse(res, event, data) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data || {})}\n\n`);
-}
-
-app.post("/mma/still/create", async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-
-    const body = req.body || {};
-    const assets = body.assets || {};
-    const resolvedAssets = {
-      product_url: assets.product_image_id || null,
-      logo_url: assets.logo_image_id || null,
-      inspiration_urls: Array.isArray(assets.inspiration_image_ids) ? assets.inspiration_image_ids : [],
-      style_hero_url: assets.style_hero_image_id || null,
-      input_still_image_id: assets.input_still_image_id || null,
-      still_url: assets.input_still_image_id || null,
-    };
-
-    const result = await mmaController.runStillCreate({
-      customerId: body.customer_id || resolveCustomerId(req, body),
-      email: body.email || null,
-      userId: body.user_id || body.userId || null,
-      assets: resolvedAssets,
-      inputs: body.inputs || {},
-      history: body.history || {},
-      settings: body.settings || {},
-    });
-
-    return res.json({
-      generation_id: result.generationId,
-      status: "queued",
-      sse_url: `/mma/stream/${result.generationId}`,
-    });
-  } catch (err) {
-    console.error("Error in /mma/still/create:", err);
-    return res.status(500).json({ ok: false, error: "MMA_STILL_CREATE_ERROR", message: err?.message || "" });
-  }
-});
-
-app.post("/mma/still/:generation_id/tweak", async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const body = req.body || {};
-    const baseGenerationId = req.params.generation_id;
-
-    const result = await mmaController.runStillTweak({
-      baseGenerationId,
-      customerId: body.customer_id || resolveCustomerId(req, body),
-      email: body.email || null,
-      userId: body.user_id || body.userId || null,
-      feedback: body.feedback || {},
-      settings: body.settings || {},
-    });
-
-    return res.json({
-      generation_id: result.generationId,
-      status: "queued",
-      sse_url: `/mma/stream/${result.generationId}`,
-    });
-  } catch (err) {
-    console.error("Error in /mma/still/:id/tweak:", err);
-    return res.status(500).json({ ok: false, error: "MMA_STILL_TWEAK_ERROR", message: err?.message || "" });
-  }
-});
-
-app.post("/mma/video/animate", async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const body = req.body || {};
-    const assets = body.assets || {};
-    const resolvedAssets = {
-      input_still_image_id: assets.input_still_image_id || null,
-      still_url: assets.input_still_image_id || null,
-    };
-
-    const result = await mmaController.runVideoAnimate({
-      customerId: body.customer_id || resolveCustomerId(req, body),
-      email: body.email || null,
-      userId: body.user_id || body.userId || null,
-      assets: resolvedAssets,
-      inputs: body.inputs || {},
-      mode: body.mode || {},
-      history: body.history || {},
-      settings: body.settings || {},
-    });
-
-    return res.json({
-      generation_id: result.generationId,
-      status: "queued",
-      sse_url: `/mma/stream/${result.generationId}`,
-    });
-  } catch (err) {
-    console.error("Error in /mma/video/animate:", err);
-    return res.status(500).json({ ok: false, error: "MMA_VIDEO_ANIMATE_ERROR", message: err?.message || "" });
-  }
-});
-
-app.post("/mma/video/:generation_id/tweak", async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const body = req.body || {};
-    const baseGenerationId = req.params.generation_id;
-
-    const result = await mmaController.runVideoTweak({
-      baseGenerationId,
-      customerId: body.customer_id || resolveCustomerId(req, body),
-      email: body.email || null,
-      userId: body.user_id || body.userId || null,
-      feedback: body.feedback || {},
-      settings: body.settings || {},
-    });
-
-    return res.json({
-      generation_id: result.generationId,
-      status: "queued",
-      sse_url: `/mma/stream/${result.generationId}`,
-    });
-  } catch (err) {
-    console.error("Error in /mma/video/:id/tweak:", err);
-    return res.status(500).json({ ok: false, error: "MMA_VIDEO_TWEAK_ERROR", message: err?.message || "" });
-  }
-});
-
-app.get("/mma/generations/:generation_id", async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const generationId = req.params.generation_id;
-
-    const { data, error } = await supabaseAdmin
-      .from("mega_generations")
-      .select("mg_generation_id, mg_mma_status, mg_mma_vars, mg_output_url, mg_mma_mode, mg_error, mg_status")
-      .eq("mg_generation_id", generationId)
-      .eq("mg_record_type", "generation")
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-
-    const mmaVars = data.mg_mma_vars || {};
-    const outputs = { ...(mmaVars.outputs || {}) };
-
-    if (!outputs.seedream_image_url && data.mg_output_url && data.mg_mma_mode === "still") {
-      outputs.seedream_image_url = data.mg_output_url;
-    }
-    if (!outputs.kling_video_url && data.mg_output_url && data.mg_mma_mode === "video") {
-      outputs.kling_video_url = data.mg_output_url;
-    }
-
-    return res.json({
-      generation_id: generationId,
-      status: data.mg_mma_status || data.mg_status || "unknown",
-      mma_vars: mmaVars,
-      outputs,
-      error: data.mg_error ? { message: data.mg_error } : undefined,
-    });
-  } catch (err) {
-    console.error("Error in /mma/generations/:id:", err);
-    return res.status(500).json({ ok: false, error: "MMA_GENERATION_FETCH_ERROR", message: err?.message || "" });
-  }
-});
-
-app.get("/mma/stream/:generation_id", async (req, res) => {
-  if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-  const generationId = req.params.generation_id;
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  try {
-    const { data, error } = await supabaseAdmin
-      .from("mega_generations")
-      .select("mg_mma_vars, mg_mma_status, mg_status")
-      .eq("mg_generation_id", generationId)
-      .eq("mg_record_type", "generation")
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) {
-      sendSse(res, "error", { message: "NOT_FOUND" });
-      return res.end();
-    }
-
-    const scanLines = data.mg_mma_vars?.userMessages?.scan_lines || [];
-    scanLines.forEach((line, idx) => {
-      const text = typeof line === "string" ? line : line?.text || line?.line || "";
-      sendSse(res, "scan_line", { index: idx + 1, text });
-    });
-
-    const currentStatus = data.mg_mma_status || data.mg_status || "queued";
-    sendSse(res, "status", { status: currentStatus });
-
-    if (["done", "error"].includes(currentStatus)) {
-      sendSse(res, currentStatus === "done" ? "done" : "error", { status: currentStatus });
-      return res.end();
-    }
-
-    const unsubscribe = mmaHub.subscribe(generationId, ({ event, data: payload }) => {
-      sendSse(res, event, payload);
-      if (event === "status" && payload?.status && ["done", "error"].includes(payload.status)) {
-        sendSse(res, payload.status === "done" ? "done" : "error", payload);
-        unsubscribe();
-        res.end();
-      }
-    });
-
-    req.on("close", () => {
-      unsubscribe();
-    });
-  } catch (err) {
-    console.error("Error in /mma/stream/:id:", err);
-    sendSse(res, "error", { message: err?.message || "UNKNOWN_ERROR" });
-    res.end();
-  }
-});
-
-// ========================
-// MMA events (like/dislike/download/preference_set)
-// ========================
-app.post("/mma/events", async (req, res) => {
-  const requestId = `mma_evt_${Date.now()}_${crypto.randomUUID()}`;
-
-  try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
-    }
-
-    const body = req.body || {};
-    const eventType = safeString(body.event_type || body.eventType || "");
-
-    if (!eventType) {
-      return res.status(400).json({ ok: false, error: "MISSING_EVENT_TYPE", requestId });
-    }
-
-    const incomingPassId = normalizePassId(body.pass_id || body.passId || req.get("X-Mina-Pass-Id"));
-    const customerId = resolveCustomerId(req, body);
-    const ensuredPassId =
-      incomingPassId ||
-      resolvePassId({
-        incomingPassId,
-        shopifyId: customerId,
-        userId: body.user_id || body.userId || null,
-        email: body.email || null,
-      });
-
-    const cust = await sbEnsureCustomer({
-      customerId,
-      userId: body.user_id || body.userId || null,
-      email: body.email || null,
-      passId: ensuredPassId,
-    });
-
-    const passId = cust?.passId || ensuredPassId;
-    res.set("X-Mina-Pass-Id", passId);
-
-    const eventId = safeString(body.event_id || body.eventId, crypto.randomUUID());
-    const payload = body.payload && typeof body.payload === "object" ? body.payload : {};
-    const generationId =
-      safeString(body.generation_id || body.generationId || payload.generation_id || payload.generationId || "") || null;
-    const ts = nowIso();
-
-    const row = {
-      mg_id: `mma_event:${eventId}`,
-      mg_record_type: "mma_event",
-      mg_pass_id: passId,
-      mg_generation_id: generationId,
-      mg_meta: { event_type: eventType },
-      mg_payload: payload,
-      mg_source_system: "app",
-      mg_created_at: ts,
-      mg_updated_at: ts,
-      mg_event_at: ts,
-    };
-
-    await supabaseAdmin.from("mega_generations").insert(row);
-
-    let preferences = null;
-    if (["like", "dislike", "preference_set"].includes(eventType)) {
-      preferences = await updateMmaPreferencesForEvent(passId, eventType, payload);
-    }
-
-    return res.json({ ok: true, requestId, eventId, passId, preferences });
-  } catch (err) {
-    console.error("Error in /mma/events:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "MMA_EVENT_ERROR",
-      message: err?.message || "Unexpected error while storing MMA event.",
-      requestId,
-    });
-  }
-});
-
-app.get("/mma/admin/errors", requireAdmin, async (req, res) => {
-  const limit = Number(req.query.limit || 20);
-  const { data, error } = await supabaseAdmin
-    .from("mega_admin")
-    .select("mg_id, mg_detail, mg_created_at")
-    .eq("mg_route", "mma")
-    .order("mg_created_at", { ascending: false })
-    .limit(Number.isFinite(limit) && limit > 0 ? limit : 20);
-
-  if (error) return res.status(500).json({ ok: false, error: error.message });
-  return res.json({ ok: true, errors: data || [] });
-});
-
-app.get("/mma/admin/steps", requireAdmin, async (req, res) => {
-  const limit = Number(req.query.limit || 50);
-  const { data, error } = await supabaseAdmin
-    .from("mega_generations")
-    .select("mg_id, mg_generation_id, mg_step_no, mg_step_type, mg_payload, mg_created_at")
-    .eq("mg_record_type", "mma_step")
-    .order("mg_created_at", { ascending: false })
-    .limit(Number.isFinite(limit) && limit > 0 ? limit : 50);
-
-  if (error) return res.status(500).json({ ok: false, error: error.message });
-  return res.json({ ok: true, steps: data || [] });
-});
+app.use("/mma", mmaRouter);
 // ============================
 // Store remote generation (Provider URL -> R2 PUBLIC URL)
 // ============================

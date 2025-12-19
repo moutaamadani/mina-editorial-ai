@@ -444,6 +444,7 @@ export class MmaController {
   }) {
     const generationId = `mma_${crypto.randomUUID()}`;
     const cust = await megaEnsureCustomer(this.supabaseAdmin, { customerId, email, userId });
+    const passId = cust?.passId || null;
     const mmaVars = {
       assets,
       inputs,
@@ -459,7 +460,7 @@ export class MmaController {
 
     const combinedBrief = (brief || `${inputs.userBrief || ""}\n${inputs.style || ""}`).trim();
 
-    await insertGenerationRow(this.supabaseAdmin, generationId, cust.passId, "still", mmaVars);
+    await insertGenerationRow(this.supabaseAdmin, generationId, passId, "still", mmaVars);
     this.sseHub.send(generationId, "status", { status: "queued" });
 
     const configs = await this.loadConfigs();
@@ -651,7 +652,7 @@ export class MmaController {
         mg_output_url: publicImageUrl || null,
       });
       this.sseHub.send(generationId, "status", { status: "done", output_url: publicImageUrl });
-      return { generationId, mma_vars: mmaVars, outputs: { seedream_image_url: publicImageUrl } };
+      return { generationId, passId, mma_vars: mmaVars, outputs: { seedream_image_url: publicImageUrl } };
     } catch (err) {
       await updateGenerationStatus(this.supabaseAdmin, generationId, "error", mmaVars, {
         mg_error: err?.message || "UNKNOWN_ERROR",
@@ -689,6 +690,7 @@ export class MmaController {
   }) {
     const generationId = `mma_${crypto.randomUUID()}`;
     const cust = await megaEnsureCustomer(this.supabaseAdmin, { customerId, email, userId });
+    const passId = cust?.passId || null;
     const mmaVars = {
       assets,
       inputs,
@@ -705,7 +707,7 @@ export class MmaController {
 
     const combinedBrief = (brief || `${inputs.motion_user_brief || ""}\n${inputs.movement_style || ""}`).trim();
 
-    await insertGenerationRow(this.supabaseAdmin, generationId, cust.passId, "video", mmaVars);
+    await insertGenerationRow(this.supabaseAdmin, generationId, passId, "video", mmaVars);
     this.sseHub.send(generationId, "status", { status: "queued" });
 
     const configs = await this.loadConfigs();
@@ -854,7 +856,7 @@ export class MmaController {
         mg_output_url: publicVideoUrl || null,
       });
       this.sseHub.send(generationId, "status", { status: "done", output_url: publicVideoUrl });
-      return { generationId, mma_vars: mmaVars, outputs: { kling_video_url: publicVideoUrl } };
+      return { generationId, passId, mma_vars: mmaVars, outputs: { kling_video_url: publicVideoUrl } };
     } catch (err) {
       await updateGenerationStatus(this.supabaseAdmin, generationId, "error", mmaVars, {
         mg_error: err?.message || "UNKNOWN_ERROR",

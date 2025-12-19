@@ -1031,19 +1031,22 @@ async function sbEnsureCustomer({ customerId, userId, email, passId = null }) {
     : null;
 
   const id = derivedShopify || (incomingPassId ? "anonymous" : safeShopifyId(customerId));
-  const { passId, credits = 0, shopifyCustomerId, meta } = await megaEnsureCustomer(supabaseAdmin, {
-    customerId: id,
-    userId: userId || null,
-    email: email || null,
-    legacyCredits: null,
-    passId: incomingPassId,
-  });
+  const { passId: ensuredPassId, credits = 0, shopifyCustomerId, meta } = await megaEnsureCustomer(
+    supabaseAdmin,
+    {
+      customerId: id,
+      userId: userId || null,
+      email: email || null,
+      legacyCredits: null,
+      passId: incomingPassId,
+    },
+  );
 
   return {
     shopify_customer_id: shopifyCustomerId || id,
     credits,
     meta: meta || {},
-    passId: passId || null,
+    passId: ensuredPassId || null,
   };
 }
 

@@ -41,22 +41,28 @@ CREATE TABLE IF NOT EXISTS public.mega_customers (
   mg_deleted_at TIMESTAMPTZ,
   mg_created_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
   mg_updated_at TIMESTAMPTZ NOT NULL DEFAULT TIMEZONE('utc', NOW()),
-  mg_admin_allowlist BOOLEAN NOT NULL DEFAULT FALSE
+  mg_admin_allowlist BOOLEAN NOT NULL DEFAULT FALSE,
+  mg_mma_preferences JSONB NOT NULL DEFAULT '{}'::jsonb,
+  mg_mma_preferences_updated_at TIMESTAMPTZ
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS mega_customers_shopify_idx ON public.mega_customers (mg_shopify_customer_id) WHERE mg_shopify_customer_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS mega_customers_user_idx ON public.mega_customers (mg_user_id) WHERE mg_user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS mega_customers_email_idx ON public.mega_customers (LOWER(mg_email));
+CREATE INDEX IF NOT EXISTS mega_customers_mma_preferences_gin ON public.mega_customers USING gin (mg_mma_preferences);
 
 -- =========================
 -- MEGA_GENERATIONS (event/artifact ledger)
 -- =========================
 CREATE TABLE IF NOT EXISTS public.mega_generations (
   mg_id TEXT PRIMARY KEY,
-  mg_record_type TEXT NOT NULL CHECK (mg_record_type IN ('generation', 'session', 'feedback', 'credit_transaction')),
+  mg_record_type TEXT NOT NULL CHECK (mg_record_type IN ('generation', 'session', 'feedback', 'credit_transaction', 'mma_step', 'mma_event')),
   mg_pass_id TEXT REFERENCES public.mega_customers(mg_pass_id) ON UPDATE CASCADE,
   mg_session_id TEXT,
   mg_generation_id TEXT,
+  mg_parent_id TEXT,
+  mg_step_no INTEGER,
+  mg_step_type TEXT,
   mg_platform TEXT,
   mg_title TEXT,
   mg_type TEXT,
@@ -65,6 +71,9 @@ CREATE TABLE IF NOT EXISTS public.mega_generations (
   mg_output_key TEXT,
   mg_provider TEXT,
   mg_model TEXT,
+  mg_mma_mode TEXT,
+  mg_mma_status TEXT,
+  mg_mma_vars JSONB NOT NULL DEFAULT '{}'::jsonb,
   mg_latency_ms INTEGER,
   mg_input_chars INTEGER,
   mg_output_chars INTEGER,
@@ -99,6 +108,9 @@ CREATE INDEX IF NOT EXISTS mega_generations_session_idx ON public.mega_generatio
 CREATE INDEX IF NOT EXISTS mega_generations_generation_idx ON public.mega_generations (mg_generation_id) WHERE mg_generation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS mega_generations_record_type_idx ON public.mega_generations (mg_record_type);
 CREATE INDEX IF NOT EXISTS mega_generations_created_idx ON public.mega_generations (mg_created_at DESC);
+CREATE INDEX IF NOT EXISTS mega_generations_mma_steps_lookup ON public.mega_generations (mg_generation_id, mg_step_no) WHERE mg_record_type = 'mma_step';
+CREATE INDEX IF NOT EXISTS mega_generations_mma_step_type_lookup ON public.mega_generations (mg_step_type) WHERE mg_record_type = 'mma_step';
+CREATE INDEX IF NOT EXISTS mega_generations_mma_vars_gin ON public.mega_generations USING gin (mg_mma_vars);
 
 -- =========================
 -- MEGA_ADMIN

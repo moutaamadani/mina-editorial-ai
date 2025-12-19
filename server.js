@@ -26,6 +26,7 @@ import {
   megaWriteFeedbackEvent,
   megaWriteCreditTxnEvent,
   megaParityCounts,
+  megaWriteMmaEvent,
 } from "./mega-db.js";
 
 import { parseDataUrl } from "./r2.js";
@@ -35,6 +36,7 @@ import { requireAdmin } from "./auth.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SELF_BASE_URL = process.env.SELF_BASE_URL || `http://localhost:${PORT}`;
 // SubPart: We show total users with a friendly offset so numbers look nicer.
 const MINA_BASELINE_USERS = 3651; // offset we add on top of DB users
 
@@ -158,6 +160,34 @@ function resolveCustomerId(req, body) {
   return "anonymous";
 }
 
+async function writeMmaEventSafe({
+  customerId,
+  passId = null,
+  mode = "",
+  action = "",
+  status = "",
+  vars = {},
+  requestId = null,
+  generationId = null,
+}) {
+  if (!supabaseAdmin) return;
+
+  try {
+    await megaWriteMmaEvent(supabaseAdmin, {
+      customerId,
+      passId,
+      mmaMode: mode,
+      mmaAction: action,
+      mmaStatus: status,
+      mmaVars: vars,
+      requestId,
+      generationId,
+    });
+  } catch (err) {
+    console.error("[mma] failed to write mma_event", err);
+  }
+}
+
 // SubPart: simple UUID format check to keep session ids tidy.
 function isUuid(v) {
   return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -181,6 +211,33 @@ function isHttpUrl(u) {
   } catch {
     return false;
   }
+}
+
+// Helper: proxy MMA routes to existing legacy handlers while the full MMA orchestration
+// is being rolled out. This keeps frontend contracts stable while consolidating MEGA
+// persistence paths behind the legacy endpoints.
+async function callLegacyHandler(req, { targetPath, bodyOverride = null }) {
+  const payload = bodyOverride ?? req.body ?? {};
+
+  const response = await fetch(`${SELF_BASE_URL}${targetPath}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Mina-Pass-Id": req.get("X-Mina-Pass-Id") || "",
+      Authorization: req.get("authorization") || "",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { ok: false, error: "LEGACY_NON_JSON", message: "Legacy handler did not return JSON", raw: text };
+  }
+
+  return { status: response.status, ok: response.ok, json, raw: text };
 }
 
 // Hero Part 2: File uploads to Cloudflare R2 (S3 compatible)
@@ -2997,6 +3054,90 @@ app.post("/sessions/start", async (req, res) => {
     });
   }
 });
+
+// =======================
+// ---- MMA shim routes (proxy to legacy handlers while MEGA pipeline completes)
+// =======================
+async function handleMmaProxy(req, res, { mode, action, targetPath }) {
+  const payload = { ...req.body, mmaMode: mode, mmaAction: action };
+  const requestId = `mma_${Date.now()}_${uuidv4()}`;
+  const customerId = resolveCustomerId(req, payload);
+
+  if (!sbEnabled()) {
+    return res.status(500).json({
+      ok: false,
+      error: "NO_DB",
+      message: "Supabase not configured",
+      requestId,
+    });
+  }
+
+  const cust = await sbEnsureCustomer({
+    customerId,
+    userId: req?.user?.userId || null,
+    email: req?.user?.email || null,
+  });
+
+  await writeMmaEventSafe({
+    customerId,
+    passId: cust?.passId || null,
+    mode,
+    action,
+    status: "received",
+    vars: payload,
+    requestId,
+  });
+
+  try {
+    const legacy = await callLegacyHandler(req, { targetPath, bodyOverride: payload });
+
+    await writeMmaEventSafe({
+      customerId,
+      passId: cust?.passId || null,
+      mode,
+      action,
+      status: legacy.ok ? "proxied" : "failed_proxy",
+      vars: payload,
+      requestId,
+    });
+
+    return res.status(legacy.status).json(legacy.json);
+  } catch (err) {
+    console.error(`[MMA proxy -> ${targetPath}] failed`, err);
+    await writeMmaEventSafe({
+      customerId,
+      passId: cust?.passId || null,
+      mode,
+      action,
+      status: "proxy_exception",
+      vars: { ...payload, error: err?.message },
+      requestId,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_PROXY_FAILED",
+      message: err?.message || "Failed to reach legacy handler",
+      requestId,
+    });
+  }
+}
+
+app.post("/mma/still/create", (req, res) =>
+  handleMmaProxy(req, res, { mode: "still", action: "create", targetPath: "/editorial/generate" })
+);
+
+app.post("/mma/still/tweak", (req, res) =>
+  handleMmaProxy(req, res, { mode: "still", action: "tweak", targetPath: "/editorial/generate" })
+);
+
+app.post("/mma/video/create", (req, res) =>
+  handleMmaProxy(req, res, { mode: "video", action: "create", targetPath: "/motion/generate" })
+);
+
+app.post("/mma/video/tweak", (req, res) =>
+  handleMmaProxy(req, res, { mode: "video", action: "tweak", targetPath: "/motion/generate" })
+);
 
 // =======================
 // ---- Mina Editorial (image) — R2 ONLY output (no provider URLs)

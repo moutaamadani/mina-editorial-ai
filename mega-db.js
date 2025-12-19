@@ -458,6 +458,44 @@ export async function megaWriteFeedbackEvent(
   if (error) throw error;
 }
 
+export async function megaWriteMmaEvent(
+  supabaseAdmin,
+  { customerId, passId = null, mmaMode = "", mmaAction = "", mmaStatus = "", mmaVars = {}, requestId = null, generationId = null }
+) {
+  if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
+
+  const cust = passId
+    ? { passId }
+    : await megaEnsureCustomer(supabaseAdmin, {
+        customerId,
+      });
+
+  if (!cust?.passId || cust.passId === "pass_anonymous") return;
+
+  const ts = nowIso();
+
+  const row = {
+    mg_id: `mma_event:${crypto.randomUUID()}`,
+    mg_record_type: "mma_event",
+    mg_pass_id: cust.passId,
+    mg_generation_id: safeString(generationId || ""),
+    mg_parent_id: generationId ? `generation:${generationId}` : null,
+    mg_step_type: safeString(mmaAction || ""),
+    mg_mma_mode: safeString(mmaMode || ""),
+    mg_mma_status: safeString(mmaStatus || ""),
+    mg_mma_vars: mmaVars && typeof mmaVars === "object" ? mmaVars : {},
+    mg_meta: { requestId: requestId || null },
+    mg_payload: mmaVars && typeof mmaVars === "object" ? mmaVars : {},
+    mg_source_system: "app",
+    mg_created_at: ts,
+    mg_updated_at: ts,
+    mg_event_at: ts,
+  };
+
+  const { error } = await supabaseAdmin.from("mega_generations").insert(row);
+  if (error) throw error;
+}
+
 export async function megaParityCounts(supabaseAdmin) {
   if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
 

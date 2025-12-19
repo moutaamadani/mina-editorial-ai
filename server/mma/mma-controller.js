@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import EventEmitter from "node:events";
 import OpenAI from "openai";
 import Replicate from "replicate";
+import { getActiveAppConfig } from "../app-config.js";
 import {
   megaEnsureCustomer,
   megaWriteCreditTxnEvent,
@@ -10,39 +11,6 @@ import { storeRemoteImageToR2 } from "../../r2.js";
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function safeJson(value, fallback = {}) {
-  if (!value || typeof value !== "object") return fallback;
-  if (Array.isArray(value)) return fallback;
-  return value;
-}
-
-function parseVersionFromId(mgId) {
-  const match = String(mgId || "").match(/\.v(\d+)$/);
-  return match ? Number(match[1]) : null;
-}
-
-async function fetchAppConfig(supabaseAdmin, key) {
-  if (!supabaseAdmin) return null;
-  const { data, error } = await supabaseAdmin
-    .from("mega_admin")
-    .select("mg_id, mg_value, mg_key")
-    .eq("mg_record_type", "app_config")
-    .eq("mg_key", key)
-    .order("mg_created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!data) return null;
-
-  return {
-    key,
-    id: data.mg_id,
-    version: parseVersionFromId(data.mg_id) || safeJson(data.mg_value).version || null,
-    value: safeJson(data.mg_value),
-  };
 }
 
 function withTiming(fn) {
@@ -433,17 +401,17 @@ export class MmaController {
 
   async loadConfigs() {
     const [gptReader, gptFeedbackStill, gptFeedbackMotion, gptMotion, motionSuggest, gptScan] = await Promise.all([
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.gpt_reader"),
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.gpt_feedback_still"),
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.gpt_feedback_motion"),
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.gpt_reader_motion"),
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.motion_suggestion"),
-      fetchAppConfig(this.supabaseAdmin, "mma.ctx.gpt_scanner"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.gpt_reader"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.gpt_feedback_still"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.gpt_feedback_motion"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.gpt_reader_motion"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.motion_suggestion"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.ctx.gpt_scanner"),
     ]);
 
     const [seedreamDefaults, klingDefaults] = await Promise.all([
-      fetchAppConfig(this.supabaseAdmin, "mma.provider.seedream.defaults"),
-      fetchAppConfig(this.supabaseAdmin, "mma.provider.kling.defaults"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.provider.seedream.defaults"),
+      getActiveAppConfig(this.supabaseAdmin, "mma.provider.kling.defaults"),
     ]);
 
     return {
@@ -479,14 +447,13 @@ export class MmaController {
     this.sseHub.send(generationId, "status", { status: "queued" });
 
     const configs = await this.loadConfigs();
-    if (configs.ctx.gpt_reader?.version)
-      mmaVars.meta.ctx_versions.gpt_reader = configs.ctx.gpt_reader.version;
-    if (configs.ctx.gpt_scanner?.version)
-      mmaVars.meta.ctx_versions.gpt_scanner = configs.ctx.gpt_scanner.version;
-    if (configs.ctx.gpt_feedback_still?.version)
-      mmaVars.meta.ctx_versions.gpt_feedback_still = configs.ctx.gpt_feedback_still.version;
-    if (configs.providers.seedream?.version)
-      mmaVars.meta.settings_versions.seedream = configs.providers.seedream.version;
+    for (const [ctxKey, ctxConfig] of Object.entries(configs.ctx || {})) {
+      if (ctxConfig?.version != null) mmaVars.meta.ctx_versions[ctxKey] = ctxConfig.version;
+    }
+    for (const [providerKey, providerConfig] of Object.entries(configs.providers || {})) {
+      if (providerConfig?.version != null)
+        mmaVars.meta.settings_versions[providerKey] = providerConfig.version;
+    }
 
     let stepNo = 0;
     const scanLine = (line) => {

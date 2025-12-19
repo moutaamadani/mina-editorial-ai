@@ -1423,7 +1423,19 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use((req, res, next) => {
-  res.set("Access-Control-Expose-Headers", "X-Mina-Pass-Id");
+  const existing = res.get("Access-Control-Expose-Headers");
+  const headers = existing
+    ? existing
+        .split(",")
+        .map((h) => h.trim())
+        .filter(Boolean)
+    : [];
+
+  if (!headers.some((h) => h.toLowerCase() === "x-mina-pass-id")) {
+    headers.push("X-Mina-Pass-Id");
+  }
+
+  res.set("Access-Control-Expose-Headers", headers.join(", "));
   next();
 });
 
@@ -3235,6 +3247,102 @@ app.post("/sessions/start", async (req, res) => {
 });
 
 // =======================
+// ---- Mina Editorial (image) — MMA-backed shim for legacy frontend
+// =======================
+// This handler runs the MMA still pipeline so the existing Mina frontend keeps
+// writing MEGA/MMA rows (generation + steps) while preserving the legacy
+// `/editorial/generate` response shape the UI expects.
+app.post("/editorial/generate", async (req, res) => {
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
+
+  try {
+    if (!sbEnabled()) {
+      return res.status(500).json({
+        ok: false,
+        error: "NO_DB",
+        message: "Supabase not configured",
+        requestId,
+      });
+    }
+
+    const body = req.body || {};
+    const customerId = resolveCustomerId(req, body);
+    const assets = {
+      product_url: safeString(body.productImageUrl) || null,
+      logo_url: safeString(body.logoImageUrl) || null,
+      inspiration_urls: Array.isArray(body.styleImageUrls)
+        ? body.styleImageUrls.filter(Boolean)
+        : [],
+      style_hero_url: null,
+      input_still_image_id: null,
+      still_url: null,
+    };
+
+    const inputs = {
+      userBrief: safeString(body.brief),
+      style: safeString(body.tone || body.stylePresetKey || ""),
+      aspect_ratio: safeString(body.aspectRatio || ""),
+      platform: safeString(body.platform || ""),
+    };
+
+    const settings = {};
+    if (inputs.aspect_ratio) settings.seedream = { aspect_ratio: inputs.aspect_ratio };
+
+    const result = await mmaController.runStillCreate({
+      customerId,
+      email: req?.user?.email || null,
+      userId: req?.user?.userId || null,
+      assets,
+      inputs,
+      history: { vision_intelligence: !!body.minaVisionEnabled },
+      brief: safeString(body.brief || ""),
+      settings,
+    });
+
+    if (result?.passId) {
+      res.set("X-Mina-Pass-Id", result.passId);
+    }
+
+    const imageUrl = result?.outputs?.seedream_image_url || null;
+    const prompt = result?.mma_vars?.prompts?.clean_prompt || inputs.userBrief || "";
+    const creditsInfo = await sbGetCredits({
+      customerId,
+      reqUserId: req?.user?.userId,
+      reqEmail: req?.user?.email,
+    });
+
+    return res.json({
+      ok: true,
+      requestId,
+      generationId: result?.generationId,
+      passId: result?.passId || null,
+      prompt,
+      imageUrl,
+      imageUrls: imageUrl ? [imageUrl] : [],
+      sessionId: null,
+      gpt: {
+        userMessage: result?.mma_vars?.prompts?.clean_prompt || null,
+        imageTexts: result?.mma_vars?.scans?.output_still_crt
+          ? [result.mma_vars.scans.output_still_crt]
+          : undefined,
+      },
+      credits:
+        creditsInfo.balance === null || creditsInfo.balance === undefined
+          ? undefined
+          : { balance: creditsInfo.balance },
+    });
+  } catch (err) {
+    console.error("Error in /editorial/generate (mma shim):", err);
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_EDITORIAL_ERROR",
+      message: err?.message || "Unexpected error during editorial generate.",
+      requestId,
+    });
+  }
+});
+
+// =======================
 // ---- Mina Editorial (image) — R2 ONLY output (no provider URLs)
 // =======================
 app.post("/editorial/generate", async (req, res) => {
@@ -3732,6 +3840,109 @@ app.post("/motion/suggest", async (req, res) => {
       ok: false,
       error: "MOTION_SUGGESTION_ERROR",
       message: err?.message || "Unexpected error during motion suggestion.",
+      requestId,
+    });
+  }
+});
+
+// =======================
+// ---- Mina Motion (video) — MMA-backed shim for legacy frontend
+// =======================
+// Run the MMA video pipeline so legacy `/motion/generate` calls persist MEGA
+// generations/steps while keeping the current response contract.
+app.post("/motion/generate", async (req, res) => {
+  const requestId = `req_${Date.now()}_${uuidv4()}`;
+
+  try {
+    if (!sbEnabled()) {
+      return res.status(500).json({
+        ok: false,
+        error: "NO_DB",
+        message: "Supabase not configured",
+        requestId,
+      });
+    }
+
+    const body = req.body || {};
+    const lastImageUrl = safeString(body.lastImageUrl);
+    const motionDescription = safeString(body.motionDescription || body.text || body.motionBrief || "");
+
+    if (!lastImageUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_LAST_IMAGE",
+        message: "lastImageUrl is required to create motion.",
+        requestId,
+      });
+    }
+
+    if (!motionDescription) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_MOTION_DESCRIPTION",
+        message: "Describe how Mina should move the scene.",
+        requestId,
+      });
+    }
+
+    const customerId = resolveCustomerId(req, body);
+    const platform = safeString(body.platform || "");
+    const aspectRatio = safeString(body.aspectRatio || body.motionAspectRatio || "");
+    const motionStyles = Array.isArray(body.motionStyles || body.motionStyleKeys)
+      ? (body.motionStyles || body.motionStyleKeys).filter(Boolean)
+      : [];
+
+    const result = await mmaController.runVideoAnimate({
+      customerId,
+      email: req?.user?.email || null,
+      userId: req?.user?.userId || null,
+      assets: { input_still_image_id: lastImageUrl, still_url: lastImageUrl },
+      inputs: {
+        motion_user_brief: motionDescription,
+        movement_style: motionStyles.join(", ") || safeString(body.movementStyle || ""),
+        platform,
+        aspect_ratio: aspectRatio,
+      },
+      mode: { platform, aspect_ratio: aspectRatio },
+      history: { vision_intelligence: !!body.minaVisionEnabled },
+      brief: motionDescription,
+      settings: aspectRatio ? { kling: { aspect_ratio: aspectRatio } } : {},
+    });
+
+    if (result?.passId) {
+      res.set("X-Mina-Pass-Id", result.passId);
+    }
+
+    const videoUrl = result?.outputs?.kling_video_url || null;
+    const prompt = result?.mma_vars?.prompts?.motion_prompt || motionDescription;
+    const creditsInfo = await sbGetCredits({
+      customerId,
+      reqUserId: req?.user?.userId,
+      reqEmail: req?.user?.email,
+    });
+
+    return res.json({
+      ok: true,
+      requestId,
+      generationId: result?.generationId,
+      passId: result?.passId || null,
+      prompt,
+      videoUrl,
+      sessionId: null,
+      gpt: {
+        userMessage: result?.mma_vars?.prompts?.motion_prompt || null,
+      },
+      credits:
+        creditsInfo.balance === null || creditsInfo.balance === undefined
+          ? undefined
+          : { balance: creditsInfo.balance },
+    });
+  } catch (err) {
+    console.error("Error in /motion/generate (mma shim):", err);
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_MOTION_ERROR",
+      message: err?.message || "Unexpected error during motion generate.",
       requestId,
     });
   }

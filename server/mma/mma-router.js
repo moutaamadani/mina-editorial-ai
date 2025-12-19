@@ -47,6 +47,10 @@ export default function createMmaRouter({
         settings: body.settings || {},
       });
 
+      if (result.passId) {
+        res.set("X-Mina-Pass-Id", result.passId);
+      }
+
       return res.json({
         generation_id: result.generationId,
         status: "queued",
@@ -72,6 +76,10 @@ export default function createMmaRouter({
         feedback: body.feedback || {},
         settings: body.settings || {},
       });
+
+      if (result.passId) {
+        res.set("X-Mina-Pass-Id", result.passId);
+      }
 
       return res.json({
         generation_id: result.generationId,
@@ -105,6 +113,10 @@ export default function createMmaRouter({
         settings: body.settings || {},
       });
 
+      if (result.passId) {
+        res.set("X-Mina-Pass-Id", result.passId);
+      }
+
       return res.json({
         generation_id: result.generationId,
         status: "queued",
@@ -131,6 +143,10 @@ export default function createMmaRouter({
         settings: body.settings || {},
       });
 
+      if (result.passId) {
+        res.set("X-Mina-Pass-Id", result.passId);
+      }
+
       return res.json({
         generation_id: result.generationId,
         status: "queued",
@@ -149,7 +165,9 @@ export default function createMmaRouter({
 
       const { data, error } = await supabaseAdmin
         .from("mega_generations")
-        .select("mg_generation_id, mg_mma_status, mg_mma_vars, mg_output_url, mg_mma_mode, mg_error, mg_status")
+        .select(
+          "mg_generation_id, mg_mma_status, mg_mma_vars, mg_output_url, mg_mma_mode, mg_error, mg_status, mg_pass_id",
+        )
         .eq("mg_generation_id", generationId)
         .eq("mg_record_type", "generation")
         .maybeSingle();
@@ -158,6 +176,9 @@ export default function createMmaRouter({
       if (!data) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
       const mmaVars = data.mg_mma_vars || {};
+      if (data.mg_pass_id) {
+        res.set("X-Mina-Pass-Id", data.mg_pass_id);
+      }
       const outputs = { ...(mmaVars.outputs || {}) };
 
       if (!outputs.seedream_image_url && data.mg_output_url && data.mg_mma_mode === "still") {
@@ -191,7 +212,7 @@ export default function createMmaRouter({
     try {
       const { data, error } = await supabaseAdmin
         .from("mega_generations")
-        .select("mg_mma_vars, mg_mma_status, mg_status")
+        .select("mg_mma_vars, mg_mma_status, mg_status, mg_pass_id")
         .eq("mg_generation_id", generationId)
         .eq("mg_record_type", "generation")
         .maybeSingle();
@@ -200,6 +221,10 @@ export default function createMmaRouter({
       if (!data) {
         sendSse(res, "error", { message: "NOT_FOUND" });
         return res.end();
+      }
+
+      if (data.mg_pass_id) {
+        res.set("X-Mina-Pass-Id", data.mg_pass_id);
       }
 
       const scanLines = data.mg_mma_vars?.userMessages?.scan_lines || [];

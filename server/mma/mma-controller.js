@@ -118,6 +118,8 @@ async function insertGenerationRow(supabaseAdmin, generationId, passId, mode, mm
     mg_mma_status: "queued",
     mg_status: "pending",
     mg_mma_vars: mmaVars,
+    mg_prompt: null,
+    mg_output_url: null,
     mg_meta: {},
     mg_payload: {},
     mg_created_at: nowIso(),
@@ -167,6 +169,64 @@ async function insertStepRow(
     mg_updated_at: nowIso(),
   };
   await supabaseAdmin.from("mega_generations").insert(row);
+}
+
+async function insertMmaErrorRow(supabaseAdmin, { generationId, passId = null, stepType = null, provider = null, ctxVersions = {}, settingsVersions = {}, payloadError = null, message = null }) {
+  if (!supabaseAdmin) return;
+  const detail = {
+    generation_id: generationId,
+    step_type: stepType,
+    provider,
+    ctx_versions: ctxVersions || {},
+    settings_versions: settingsVersions || {},
+    error: payloadError || null,
+    message: message || payloadError?.message || null,
+  };
+
+  const row = {
+    mg_id: `error:${crypto.randomUUID()}`,
+    mg_record_type: "error",
+    mg_actor_pass_id: passId,
+    mg_route: "mma",
+    mg_method: stepType || null,
+    mg_status: 500,
+    mg_detail: detail,
+    mg_created_at: nowIso(),
+    mg_updated_at: nowIso(),
+  };
+
+  await supabaseAdmin.from("mega_admin").insert(row);
+}
+
+async function recordMmaStep({
+  supabaseAdmin,
+  generationId,
+  stepNo,
+  stepType,
+  payload,
+  mode,
+  provider = null,
+  model = null,
+  latencyMs = null,
+  status = null,
+}) {
+  const effectiveStatus = payload?.error ? "error" : status;
+  await insertStepRow(supabaseAdmin, generationId, stepNo, stepType, payload, {
+    mode,
+    provider,
+    model,
+    latencyMs,
+    status: effectiveStatus,
+  });
+
+  if (payload?.error) {
+    const err = new Error(payload.error.message || `${stepType}_failed`);
+    err.stepType = stepType;
+    err.stepNo = stepNo;
+    err.payloadError = payload.error;
+    err.provider = provider;
+    throw err;
+  }
 }
 
 async function ensureCredits(supabaseAdmin, customer, cost, reason) {
@@ -423,6 +483,8 @@ export class MmaController {
       mmaVars.meta.ctx_versions.gpt_reader = configs.ctx.gpt_reader.version;
     if (configs.ctx.gpt_scanner?.version)
       mmaVars.meta.ctx_versions.gpt_scanner = configs.ctx.gpt_scanner.version;
+    if (configs.ctx.gpt_feedback_still?.version)
+      mmaVars.meta.ctx_versions.gpt_feedback_still = configs.ctx.gpt_feedback_still.version;
     if (configs.providers.seedream?.version)
       mmaVars.meta.settings_versions.seedream = configs.providers.seedream.version;
 
@@ -444,7 +506,12 @@ export class MmaController {
           stepType: "scan_product",
         });
         mmaVars.scans.product_crt = scan.payload.output.text;
-        await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "scan_product", scan.payload, {
+        await recordMmaStep({
+          supabaseAdmin: this.supabaseAdmin,
+          generationId,
+          stepNo: stepNo++,
+          stepType: "scan_product",
+          payload: scan.payload,
           mode: "still",
           model: scan.model,
           latencyMs: scan.latencyMs,
@@ -461,7 +528,12 @@ export class MmaController {
           stepType: "scan_logo",
         });
         mmaVars.scans.logo_crt = scan.payload.output.text;
-        await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "scan_logo", scan.payload, {
+        await recordMmaStep({
+          supabaseAdmin: this.supabaseAdmin,
+          generationId,
+          stepNo: stepNo++,
+          stepType: "scan_logo",
+          payload: scan.payload,
           mode: "still",
           model: scan.model,
           latencyMs: scan.latencyMs,
@@ -478,7 +550,12 @@ export class MmaController {
           stepType: "scan_inspiration",
         });
         mmaVars.scans.inspiration_crt = inspScan.payload.output.text;
-        await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "scan_inspiration", inspScan.payload, {
+        await recordMmaStep({
+          supabaseAdmin: this.supabaseAdmin,
+          generationId,
+          stepNo: stepNo++,
+          stepType: "scan_inspiration",
+          payload: inspScan.payload,
           mode: "still",
           model: inspScan.model,
           latencyMs: inspScan.latencyMs,
@@ -495,7 +572,12 @@ export class MmaController {
         stepType: "gpt_reader",
       });
       mmaVars.prompts.clean_prompt = promptStep.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "gpt_reader", promptStep.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_reader",
+        payload: promptStep.payload,
         mode: "still",
         model: promptStep.model,
         latencyMs: promptStep.latencyMs,
@@ -514,6 +596,7 @@ export class MmaController {
         resolved: seedreamResolved,
         model: seedreamResolved.model,
       };
+      mmaVars.meta.settings_versions.seedream = seedreamSettings.version;
       mmaVars.settings.seedream = seedreamResolved;
 
       const seedreamStep = await runSeedream({
@@ -529,7 +612,12 @@ export class MmaController {
       }
 
       mmaVars.outputs.seedream_image_url = publicImageUrl;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "seedream_generate", seedreamStep.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "seedream_generate",
+        payload: seedreamStep.payload,
         mode: "still",
         provider: seedreamStep.provider,
         model: seedreamStep.model,
@@ -546,7 +634,12 @@ export class MmaController {
         stepType: "postscan_output_still",
       });
       mmaVars.scans.output_still_crt = postscan.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "postscan_output_still", postscan.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "postscan_output_still",
+        payload: postscan.payload,
         mode: "still",
         model: postscan.model,
         latencyMs: postscan.latencyMs,
@@ -559,7 +652,12 @@ export class MmaController {
         stepType: "gpt_feedback_still",
       });
       mmaVars.prompts.feedback = feedback.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "gpt_feedback_still", feedback.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_feedback_still",
+        payload: feedback.payload,
         mode: "still",
         model: feedback.model,
         latencyMs: feedback.latencyMs,
@@ -574,6 +672,18 @@ export class MmaController {
     } catch (err) {
       await updateGenerationStatus(this.supabaseAdmin, generationId, "error", mmaVars, {
         mg_error: err?.message || "UNKNOWN_ERROR",
+        mg_prompt: mmaVars.prompts.clean_prompt || null,
+        mg_output_url: mmaVars.outputs.seedream_image_url || null,
+      });
+      await insertMmaErrorRow(this.supabaseAdmin, {
+        generationId,
+        passId: cust.passId,
+        stepType: err?.stepType || null,
+        provider: err?.provider || null,
+        ctxVersions: mmaVars.meta?.ctx_versions,
+        settingsVersions: mmaVars.meta?.settings_versions,
+        payloadError: err?.payloadError || null,
+        message: err?.message,
       });
       this.sseHub.send(generationId, "status", { status: "error", message: err?.message });
       await refundCredits(this.supabaseAdmin, cust, Number(process.env.IMAGE_CREDITS_COST || 1), "mma_seedream_generate_refund");
@@ -602,6 +712,10 @@ export class MmaController {
       mmaVars.meta.ctx_versions.gpt_reader_motion = configs.ctx.gpt_reader_motion.version;
     if (configs.ctx.motion_suggestion?.version)
       mmaVars.meta.ctx_versions.motion_suggestion = configs.ctx.motion_suggestion.version;
+    if (configs.ctx.gpt_feedback_motion?.version)
+      mmaVars.meta.ctx_versions.gpt_feedback_motion = configs.ctx.gpt_feedback_motion.version;
+    if (configs.ctx.gpt_scanner?.version)
+      mmaVars.meta.ctx_versions.gpt_scanner = configs.ctx.gpt_scanner.version;
     if (configs.providers.kling?.version)
       mmaVars.meta.settings_versions.kling = configs.providers.kling.version;
 
@@ -623,7 +737,12 @@ export class MmaController {
           stepType: "scan_input_still",
         });
         mmaVars.scans.still_crt = scan.payload.output.text;
-        await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "scan_input_still", scan.payload, {
+        await recordMmaStep({
+          supabaseAdmin: this.supabaseAdmin,
+          generationId,
+          stepNo: stepNo++,
+          stepType: "scan_input_still",
+          payload: scan.payload,
           mode: "video",
           model: scan.model,
           latencyMs: scan.latencyMs,
@@ -640,7 +759,12 @@ export class MmaController {
         stepType: "motion_suggestion",
       });
       mmaVars.prompts.motion_suggestion = motionSuggestion.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "motion_suggestion", motionSuggestion.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "motion_suggestion",
+        payload: motionSuggestion.payload,
         mode: "video",
         model: motionSuggestion.model,
         latencyMs: motionSuggestion.latencyMs,
@@ -653,7 +777,12 @@ export class MmaController {
         stepType: "gpt_reader_motion",
       });
       mmaVars.prompts.motion_prompt = motionPrompt.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "gpt_reader_motion", motionPrompt.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_reader_motion",
+        payload: motionPrompt.payload,
         mode: "video",
         model: motionPrompt.model,
         latencyMs: motionPrompt.latencyMs,
@@ -671,6 +800,7 @@ export class MmaController {
         resolved: klingResolved,
         model: klingResolved.model,
       };
+      mmaVars.meta.settings_versions.kling = klingSettings.version;
       mmaVars.settings.kling = klingResolved;
 
       const klingStep = await runKling({
@@ -686,7 +816,12 @@ export class MmaController {
       }
 
       mmaVars.outputs.kling_video_url = publicVideoUrl;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "kling_generate", klingStep.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "kling_generate",
+        payload: klingStep.payload,
         mode: "video",
         provider: klingStep.provider,
         model: klingStep.model,
@@ -701,7 +836,12 @@ export class MmaController {
         stepType: "gpt_feedback_motion",
       });
       mmaVars.prompts.motion_feedback = feedback.payload.output.text;
-      await insertStepRow(this.supabaseAdmin, generationId, stepNo++, "gpt_feedback_motion", feedback.payload, {
+      await recordMmaStep({
+        supabaseAdmin: this.supabaseAdmin,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_feedback_motion",
+        payload: feedback.payload,
         mode: "video",
         model: feedback.model,
         latencyMs: feedback.latencyMs,
@@ -716,6 +856,18 @@ export class MmaController {
     } catch (err) {
       await updateGenerationStatus(this.supabaseAdmin, generationId, "error", mmaVars, {
         mg_error: err?.message || "UNKNOWN_ERROR",
+        mg_prompt: mmaVars.prompts.motion_prompt || null,
+        mg_output_url: mmaVars.outputs.kling_video_url || null,
+      });
+      await insertMmaErrorRow(this.supabaseAdmin, {
+        generationId,
+        passId: cust.passId,
+        stepType: err?.stepType || null,
+        provider: err?.provider || null,
+        ctxVersions: mmaVars.meta?.ctx_versions,
+        settingsVersions: mmaVars.meta?.settings_versions,
+        payloadError: err?.payloadError || null,
+        message: err?.message,
       });
       this.sseHub.send(generationId, "status", { status: "error", message: err?.message });
       await refundCredits(this.supabaseAdmin, cust, Number(process.env.MOTION_CREDITS_COST || 5), "mma_kling_generate_refund");

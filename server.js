@@ -158,6 +158,30 @@ function resolveCustomerId(req, body) {
   return "anonymous";
 }
 
+function normalizePassId(passId) {
+  return safeString(passId || "", "");
+}
+
+function newAnonymousPassId() {
+  return `pass:anon:${crypto.randomUUID()}`;
+}
+
+function resolvePassId({ existingPassId = null, incomingPassId = null, shopifyId = null, userId = null, email = null }) {
+  const incoming = normalizePassId(existingPassId || incomingPassId);
+  if (incoming) return incoming;
+
+  const cleanShopify = safeString(shopifyId || "", "");
+  if (cleanShopify && cleanShopify !== "anonymous") return `pass:shopify:${cleanShopify}`;
+
+  const cleanUserId = safeString(userId || "", "");
+  if (cleanUserId) return `pass:user:${cleanUserId}`;
+
+  const normEmail = safeString(email || "", "").toLowerCase();
+  if (normEmail) return `pass:email:${normEmail}`;
+
+  return newAnonymousPassId();
+}
+
 // SubPart: simple UUID format check to keep session ids tidy.
 function isUuid(v) {
   return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
@@ -181,6 +205,139 @@ function isHttpUrl(u) {
   } catch {
     return false;
   }
+}
+
+function normalizeMmaPreferences(pref = {}) {
+  const hardBlocks = Array.isArray(pref?.hard_blocks)
+    ? pref.hard_blocks.map((v) => safeString(v, "")).filter(Boolean)
+    : [];
+
+  const tagWeights = {};
+  if (pref && typeof pref.tag_weights === "object") {
+    for (const [tag, weight] of Object.entries(pref.tag_weights)) {
+      const t = safeString(tag, "");
+      const n = Number(weight);
+      if (t && Number.isFinite(n)) tagWeights[t] = n;
+    }
+  }
+
+  return {
+    hard_blocks: Array.from(new Set(hardBlocks)),
+    tag_weights: tagWeights,
+    updated_at: pref?.updated_at || pref?.updatedAt || null,
+    source: pref?.source || "mma",
+  };
+}
+
+function mergeHardBlocks(target, additions = []) {
+  let changed = false;
+  for (const value of additions) {
+    const v = safeString(value, "");
+    if (v && !target.includes(v)) {
+      target.push(v);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function adjustTagWeights(target, tags = [], delta = 0) {
+  let changed = false;
+  for (const tag of tags) {
+    const t = safeString(tag, "");
+    if (!t) continue;
+    const current = Number(target[t] ?? 0);
+    const next = Number.isFinite(current) ? current + delta : delta;
+    target[t] = Number.isFinite(next) ? Number(next) : delta;
+    changed = true;
+  }
+  return changed;
+}
+
+function applyMmaEventToPreferences(pref, eventType, payload, updatedAt) {
+  const next = normalizeMmaPreferences(pref);
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+
+  const hardBlockPayload = [];
+  if (safePayload.hard_block) hardBlockPayload.push(safeString(safePayload.hard_block, ""));
+  if (Array.isArray(safePayload.hard_blocks)) {
+    hardBlockPayload.push(...safePayload.hard_blocks.map((v) => safeString(v, "")));
+  }
+
+  const tags = Array.isArray(safePayload.tags)
+    ? safePayload.tags.map((t) => safeString(t, "")).filter(Boolean)
+    : safePayload.tag
+      ? [safeString(safePayload.tag, "")]
+      : [];
+
+  const payloadTagWeights =
+    safePayload.tag_weights && typeof safePayload.tag_weights === "object"
+      ? safePayload.tag_weights
+      : null;
+
+  let changed = false;
+
+  if (eventType === "preference_set" || (eventType === "dislike" && hardBlockPayload.length)) {
+    changed = mergeHardBlocks(next.hard_blocks, hardBlockPayload) || changed;
+  }
+
+  if (eventType === "like" || eventType === "dislike") {
+    changed = adjustTagWeights(next.tag_weights, tags, eventType === "like" ? 1 : -1) || changed;
+  }
+
+  if (eventType === "preference_set" && payloadTagWeights) {
+    for (const [tag, weight] of Object.entries(payloadTagWeights)) {
+      const t = safeString(tag, "");
+      const n = Number(weight);
+      if (!t || !Number.isFinite(n)) continue;
+      if (next.tag_weights[t] !== n) {
+        next.tag_weights[t] = n;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    next.updated_at = updatedAt;
+    next.source = "mma";
+  }
+
+  return { next, changed };
+}
+
+async function updateMmaPreferencesForEvent(passId, eventType, payload) {
+  if (!supabaseAdmin) return null;
+  if (!eventType) return null;
+
+  const ts = nowIso();
+  const { data, error } = await supabaseAdmin
+    .from("mega_customers")
+    .select("mg_mma_preferences")
+    .eq("mg_pass_id", passId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const current = data?.mg_mma_preferences || {};
+  const { next, changed } = applyMmaEventToPreferences(current, eventType, payload, ts);
+
+  if (!changed) return current;
+
+  const updates = {
+    mg_mma_preferences: next,
+    mg_mma_preferences_updated_at: ts,
+    mg_last_active: ts,
+    mg_updated_at: ts,
+  };
+
+  const { error: upErr } = await supabaseAdmin
+    .from("mega_customers")
+    .update(updates)
+    .eq("mg_pass_id", passId);
+
+  if (upErr) throw upErr;
+
+  return next;
 }
 
 // Hero Part 2: File uploads to Cloudflare R2 (S3 compatible)
@@ -833,11 +990,18 @@ function persistSessionHash(req, token, userId, email) {
 async function sbInsertCreditTxn({ customerId, delta, reason, source, refType = null, refId = null }) {
   if (!supabaseAdmin) return { balance: null, passId: null };
 
+  const rawCustomerId = safeString(customerId, "");
+  const incomingPassId = rawCustomerId.startsWith("pass:") ? rawCustomerId : null;
+  const derivedShopify = rawCustomerId.startsWith("pass:shopify:")
+    ? rawCustomerId.slice("pass:shopify:".length)
+    : null;
+
   const { passId, credits = 0, shopifyCustomerId } = await megaEnsureCustomer(supabaseAdmin, {
-    customerId,
+    customerId: derivedShopify || (incomingPassId ? "anonymous" : customerId),
     userId: null,
     email: null,
     legacyCredits: null,
+    passId: incomingPassId,
   });
 
   const nextBalance = credits + Number(delta || 0);
@@ -857,15 +1021,22 @@ async function sbInsertCreditTxn({ customerId, delta, reason, source, refType = 
   return { balance: nextBalance, passId };
 }
 
-async function sbEnsureCustomer({ customerId, userId, email }) {
+async function sbEnsureCustomer({ customerId, userId, email, passId = null }) {
   if (!supabaseAdmin) return null;
 
-  const id = safeShopifyId(customerId);
+  const rawCustomerId = safeString(customerId, "");
+  const incomingPassId = passId || (rawCustomerId.startsWith("pass:") ? rawCustomerId : null);
+  const derivedShopify = rawCustomerId.startsWith("pass:shopify:")
+    ? rawCustomerId.slice("pass:shopify:".length)
+    : null;
+
+  const id = derivedShopify || (incomingPassId ? "anonymous" : safeShopifyId(customerId));
   const { passId, credits = 0, shopifyCustomerId, meta } = await megaEnsureCustomer(supabaseAdmin, {
     customerId: id,
     userId: userId || null,
     email: email || null,
     legacyCredits: null,
+    passId: incomingPassId,
   });
 
   return {
@@ -2319,24 +2490,22 @@ function getBearerToken(req) {
 // ======================================================
 app.get("/me", async (req, res) => {
   const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
+  const incomingPassId = normalizePassId(req.get("X-Mina-Pass-Id"));
 
   try {
     const token = getBearerToken(req);
-
-    // Client can send its local passId here so we keep continuity
-    const incomingPassId = String(req.get("X-Mina-Pass-Id") || "").trim() || null;
-
     const now = new Date().toISOString();
-    const newPassId = () => crypto.randomUUID();
 
     // If no token, user is not logged in => DO NOT write DB
     // But still return a passId so the frontend can store it in localStorage
     if (!token) {
+      const passId = resolvePassId({ incomingPassId });
+      res.set("X-Mina-Pass-Id", passId);
       return res.json({
         ok: true,
         user: null,
         isAdmin: false,
-        passId: incomingPassId || newPassId(),
+        passId,
         requestId,
       });
     }
@@ -2373,8 +2542,12 @@ app.get("/me", async (req, res) => {
     // 1) DB passId (if exists)
     // 2) incoming header passId
     // 3) new uuid
-    let passId = String(existing?.mg_pass_id || incomingPassId || "").trim();
-    if (!passId) passId = newPassId();
+    const passId = resolvePassId({
+      existingPassId: existing?.mg_pass_id,
+      incomingPassId,
+      userId,
+      email,
+    });
 
     // meta can be json or string depending on column type/history
     const meta = (() => {
@@ -2442,7 +2615,7 @@ app.get("/me", async (req, res) => {
         await supabaseAdmin
           .from("mega_generations")
           .insert({
-            mg_id: crypto.randomUUID(),
+            mg_id: `credit_transaction:${crypto.randomUUID()}`,
             mg_record_type: "credit_transaction",
             mg_pass_id: passId,
             mg_delta: welcomeCredits,
@@ -2503,9 +2676,9 @@ app.get("/me", async (req, res) => {
       };
 
       await supabaseAdmin
-        .from("mega_generations")
-        .insert({
-          mg_id: crypto.randomUUID(),
+          .from("mega_generations")
+          .insert({
+          mg_id: `credit_transaction:${crypto.randomUUID()}`,
           mg_record_type: "credit_transaction",
           mg_pass_id: String(existing.mg_pass_id || passId),
           mg_delta: DEFAULT_FREE_CREDITS,
@@ -2532,6 +2705,7 @@ app.get("/me", async (req, res) => {
     const { error: upErr } = await q;
     if (upErr) throw upErr;
 
+    res.set("X-Mina-Pass-Id", passId);
     return res.json({
       ok: true,
       user: { id: userId, email },
@@ -2543,8 +2717,8 @@ app.get("/me", async (req, res) => {
     console.error("GET /me failed", e);
     // ✅ Never break the frontend boot with a 500.
     // If Supabase/Auth has a hiccup, treat as anonymous and still return a passId.
-    const incomingPassId = String(req.get("X-Mina-Pass-Id") || "").trim() || null;
-    const fallbackPassId = incomingPassId || crypto.randomUUID();
+    const fallbackPassId = resolvePassId({ incomingPassId });
+    res.set("X-Mina-Pass-Id", fallbackPassId);
 
     return res.status(200).json({
       ok: true,
@@ -3934,6 +4108,83 @@ app.post("/feedback/like", async (req, res) => {
       ok: false,
       error: "FEEDBACK_ERROR",
       message: err?.message || "Unexpected error while saving feedback.",
+      requestId,
+    });
+  }
+});
+
+// ========================
+// MMA events (like/dislike/download/preference_set)
+// ========================
+app.post("/mma/events", async (req, res) => {
+  const requestId = `mma_evt_${Date.now()}_${crypto.randomUUID()}`;
+
+  try {
+    if (!sbEnabled()) {
+      return res.status(503).json({ ok: false, error: "NO_SUPABASE", requestId });
+    }
+
+    const body = req.body || {};
+    const eventType = safeString(body.event_type || body.eventType || "");
+
+    if (!eventType) {
+      return res.status(400).json({ ok: false, error: "MISSING_EVENT_TYPE", requestId });
+    }
+
+    const incomingPassId = normalizePassId(body.pass_id || body.passId || req.get("X-Mina-Pass-Id"));
+    const customerId = resolveCustomerId(req, body);
+    const ensuredPassId =
+      incomingPassId ||
+      resolvePassId({
+        incomingPassId,
+        shopifyId: customerId,
+        userId: body.user_id || body.userId || null,
+        email: body.email || null,
+      });
+
+    const cust = await sbEnsureCustomer({
+      customerId,
+      userId: body.user_id || body.userId || null,
+      email: body.email || null,
+      passId: ensuredPassId,
+    });
+
+    const passId = cust?.passId || ensuredPassId;
+    res.set("X-Mina-Pass-Id", passId);
+
+    const eventId = safeString(body.event_id || body.eventId, crypto.randomUUID());
+    const payload = body.payload && typeof body.payload === "object" ? body.payload : {};
+    const generationId =
+      safeString(body.generation_id || body.generationId || payload.generation_id || payload.generationId || "") || null;
+    const ts = nowIso();
+
+    const row = {
+      mg_id: `mma_event:${eventId}`,
+      mg_record_type: "mma_event",
+      mg_pass_id: passId,
+      mg_generation_id: generationId,
+      mg_meta: { event_type: eventType },
+      mg_payload: payload,
+      mg_source_system: "app",
+      mg_created_at: ts,
+      mg_updated_at: ts,
+      mg_event_at: ts,
+    };
+
+    await supabaseAdmin.from("mega_generations").insert(row);
+
+    let preferences = null;
+    if (["like", "dislike", "preference_set"].includes(eventType)) {
+      preferences = await updateMmaPreferencesForEvent(passId, eventType, payload);
+    }
+
+    return res.json({ ok: true, requestId, eventId, passId, preferences });
+  } catch (err) {
+    console.error("Error in /mma/events:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "MMA_EVENT_ERROR",
+      message: err?.message || "Unexpected error while storing MMA event.",
       requestId,
     });
   }

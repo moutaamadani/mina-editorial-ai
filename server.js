@@ -32,107 +32,7 @@ import { parseDataUrl } from "./r2.js";
 
 import { logAdminAction, upsertSessionRow } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
-import { createMmaController } from "./server/mma/mma-controller.js";
-import createMmaRouter from "./server/mma/mma-router.js";
-
-// ---------------------------------------------------------------------------
-// Environment helpers (Render-friendly; avoids scattered process.env reads)
-// ---------------------------------------------------------------------------
-const envStr = (name, fallback = "") => {
-  const raw = process.env[name];
-  if (raw === undefined || raw === null) return fallback;
-  const trimmed = String(raw).trim();
-  return trimmed.length ? trimmed : fallback;
-};
-
-const envInt = (name, fallback = 0) => {
-  const n = Number(envStr(name, ""));
-  return Number.isFinite(n) ? n : fallback;
-};
-
-const envBool = (name, fallback = false) => {
-  const val = envStr(name, "").toLowerCase();
-  if (!val) return fallback;
-  return ["1", "true", "yes", "on"].includes(val);
-};
-
-const envJson = (name, fallbackObj = {}) => {
-  const raw = envStr(name, "");
-  if (!raw) return fallbackObj;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return fallbackObj;
-  }
-};
-
-const NODE_ENV = envStr("NODE_ENV", "");
-const IS_PROD = NODE_ENV === "production";
-
-const requiredInProd = (name) => {
-  const val = envStr(name, "");
-  if (IS_PROD && !val) {
-    throw new Error(`Missing required env var ${name} in production`);
-  }
-  return val;
-};
-
-// Centralized ENV map (single source for all environment config)
-const ENV = {
-  NODE_ENV,
-  PORT: envInt("PORT", 3000),
-
-  // Supabase
-  SUPABASE_URL: requiredInProd("SUPABASE_URL"),
-  SUPABASE_SERVICE_ROLE_KEY: requiredInProd("SUPABASE_SERVICE_ROLE_KEY"),
-
-  // OpenAI / Replicate
-  OPENAI_API_KEY: envStr("OPENAI_API_KEY", ""),
-  REPLICATE_API_TOKEN: envStr("REPLICATE_API_TOKEN", ""),
-
-  // R2
-  R2_ACCOUNT_ID: envStr("R2_ACCOUNT_ID", ""),
-  R2_ACCESS_KEY_ID: envStr("R2_ACCESS_KEY_ID", ""),
-  R2_SECRET_ACCESS_KEY: envStr("R2_SECRET_ACCESS_KEY", ""),
-  R2_BUCKET: envStr("R2_BUCKET", ""),
-  R2_PUBLIC_BASE_URL: envStr("R2_PUBLIC_BASE_URL", "").replace(/\/+$/, ""),
-  R2_ENDPOINT: envStr("R2_ENDPOINT", ""),
-
-  // Shopify
-  SHOPIFY_STORE_DOMAIN: envStr("SHOPIFY_STORE_DOMAIN", ""),
-  SHOPIFY_ADMIN_TOKEN: envStr("SHOPIFY_ADMIN_TOKEN", ""),
-  SHOPIFY_API_VERSION: envStr("SHOPIFY_API_VERSION", "2025-10"),
-  SHOPIFY_ORDER_WEBHOOK_SECRET: envStr("SHOPIFY_ORDER_WEBHOOK_SECRET", ""),
-  SHOPIFY_MINA_TAG: envStr("SHOPIFY_MINA_TAG", "Mina_users"),
-  SHOPIFY_WELCOME_MATCHA_VARIANT_ID: envStr("SHOPIFY_WELCOME_MATCHA_VARIANT_ID", ""),
-  CREDIT_PRODUCT_MAP: envJson("CREDIT_PRODUCT_MAP", {}),
-
-  // App tuning / routing
-  CORS_ORIGINS: envStr("CORS_ORIGINS", ""),
-  DEFAULT_FREE_CREDITS: Math.max(0, envInt("DEFAULT_FREE_CREDITS", 0)),
-  CREDITS_EXPIRE_DAYS: envInt("CREDITS_EXPIRE_DAYS", 30),
-  IMAGE_CREDITS_COST: envInt("IMAGE_CREDITS_COST", 1),
-  MOTION_CREDITS_COST: envInt("MOTION_CREDITS_COST", 5),
-  RUNTIME_CONFIG_TTL_MS: envInt("RUNTIME_CONFIG_TTL_MS", 5000),
-  USE_MMA_SHIM: envBool("USE_MMA_SHIM", true),
-
-  // Provider overrides
-  SEADREAM_MODEL_VERSION: envStr("SEADREAM_MODEL_VERSION", "bytedance/seedream-4"),
-  KLING_MODEL_VERSION: envStr("KLING_MODEL_VERSION", "kwaivgi/kling-v2.1"),
-};
-
-// Safe boot log (no secrets)
-console.log("ENV CHECK", {
-  SUPABASE_URL_set: !!ENV.SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY_set: !!ENV.SUPABASE_SERVICE_ROLE_KEY,
-  OPENAI_API_KEY_set: !!ENV.OPENAI_API_KEY,
-  REPLICATE_API_TOKEN_set: !!ENV.REPLICATE_API_TOKEN,
-  R2_BUCKET_set: !!ENV.R2_BUCKET,
-  R2_PUBLIC_BASE_URL_len: ENV.R2_PUBLIC_BASE_URL.length,
-  SHOPIFY_STORE_DOMAIN_set: !!ENV.SHOPIFY_STORE_DOMAIN,
-  CORS_ORIGINS_len: ENV.CORS_ORIGINS.length,
-  USE_MMA_SHIM: ENV.USE_MMA_SHIM,
-});
+import mmaRouter from "./server/mma/mma-router.js";
 
 const app = express();
 const PORT = ENV.PORT;
@@ -4655,6 +4555,9 @@ app.post("/api/r2/store-remote-signed", async (req, res) => {
     });
   }
 });
+
+// Hero Part MMA: Mina Mind API router
+app.use("/mma", mmaRouter);
 
 
 // =======================

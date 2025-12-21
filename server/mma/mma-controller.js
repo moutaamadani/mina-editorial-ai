@@ -792,4 +792,18 @@ export function registerSseClient(generationId, res, initial) {
 }
 
 
- 
+
+// --- MMA controller factory (compat with server.js loader) ---
+export function createMmaController() {
+  return {
+    handleMmaCreate,
+    handleMmaEvent,
+    fetchGeneration,
+    listErrors,
+    listSteps,
+    registerSseClient,
+  };
+}
+
+export default createMmaController;
+

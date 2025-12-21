@@ -51,8 +51,8 @@ export async function logError(input = {}) {
     mg_error_message: mgErrorMessage,
     mg_error_stack: stackValue,
     mg_error_code: mgErrorCode,
-    mg_detail: safeInput.detail || null,
-    mg_payload: safeInput.payload || null,
+    mg_detail: safeInput.detail || {},
+    mg_payload: safeInput.payload || safeInput.detail || {},
     mg_source_system: safeInput.sourceSystem || "mina-editorial-ai",
     mg_event_at: new Date().toISOString(),
   };

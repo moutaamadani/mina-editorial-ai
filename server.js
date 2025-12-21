@@ -27,7 +27,7 @@ import { logAdminAction, upsertSessionRow } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
 
 // MMA (robust import: works whether module exports named factories or defaults)
-import * as mmaRouterMod from "./server/mma/mma-router.js";
+import mmaRouter from "./server/mma/mma-router.js";
 import * as mmaControllerMod from "./server/mma/mma-controller.js";
 
 // Admin MMA logs router
@@ -1027,29 +1027,6 @@ if (typeof createMmaController !== "function") {
 
 const mmaController = createMmaController({ supabaseAdmin, openai, replicate });
 const mmaHub = typeof mmaController?.getHub === "function" ? mmaController.getHub() : null;
-
-const createMmaRouter =
-  mmaRouterMod.createMmaRouter || mmaRouterMod.default;
-
-// If default export is already a router instance, it’s not a function.
-// If it’s a factory, call it.
-const mmaRouter =
-  typeof createMmaRouter === "function"
-    ? createMmaRouter({
-        supabaseAdmin,
-        sbEnabled,
-        mmaController,
-        mmaHub,
-        resolveCustomerId,
-        normalizePassId,
-        resolvePassId,
-        sbEnsureCustomer,
-        updateMmaPreferencesForEvent,
-        requireAdmin,
-        safeString,
-        nowIso,
-      })
-    : mmaRouterMod.default;
 
 // ======================================================
 // Routes

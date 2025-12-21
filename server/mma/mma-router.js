@@ -83,39 +83,54 @@ router.get("/generations/:generation_id", async (req, res) => {
 });
 
 router.get("/stream/:generation_id", async (req, res) => {
-  const supabase = getSupabaseAdmin();
-  if (!supabase) return res.status(500).end();
+  try {
+    const supabase = getSupabaseAdmin();
+    if (!supabase) return res.status(500).end();
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    Connection: "keep-alive",
-    "Cache-Control": "no-cache",
-  });
-  res.flushHeaders?.();
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
 
-  const { data } = await supabase
-    .from("mega_generations")
-    .select("mg_mma_vars, mg_mma_status")
-    .eq("mg_generation_id", req.params.generation_id)
-    .eq("mg_record_type", "generation")
-    .maybeSingle();
+    const { data, error } = await supabase
+      .from("mega_generations")
+      .select("mg_mma_vars, mg_mma_status")
+      .eq("mg_generation_id", req.params.generation_id)
+      .eq("mg_record_type", "generation")
+      .maybeSingle();
 
-  const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-  const status = data?.mg_mma_status || "queued";
+    if (error) {
+      // Send an SSE error frame then close
+      try {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: "SSE_BOOTSTRAP_FAILED" })}\n\n`);
+      } catch {}
+      return res.end();
+    }
 
-  // Keepalive (Render/proxies like this)
-  const keepAlive = setInterval(() => {
+    const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
+    const status = data?.mg_mma_status || "queued";
+
+    // Keepalive (Render/proxies like this)
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`:keepalive\n\n`);
+      } catch {}
+    }, 25000);
+
+    res.on("close", () => clearInterval(keepAlive));
+
+    registerSseClient(req.params.generation_id, res, { scanLines, status });
+  } catch (err) {
     try {
-      res.write(`:keepalive\n\n`);
+      res.status(500).end();
     } catch {}
-  }, 25000);
-
-  res.on("close", () => clearInterval(keepAlive));
-
-  registerSseClient(req.params.generation_id, res, { scanLines, status });
+  }
 });
 
-router.get("/admin/mma/errors", async (_req, res) => {
+router.get("/admin/errors", async (_req, res) => {
   try {
     const errors = await listErrors();
     res.json({ errors });
@@ -124,7 +139,7 @@ router.get("/admin/mma/errors", async (_req, res) => {
   }
 });
 
-router.get("/admin/mma/steps/:generation_id", async (req, res) => {
+router.get("/admin/steps/:generation_id", async (req, res) => {
   try {
     const steps = await listSteps(req.params.generation_id);
     res.json({ steps });

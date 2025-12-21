@@ -21,9 +21,29 @@ function isRealCustomerKey(v) {
   return true;
 }
 
+function isAnonymousPass(passId) {
+  const p = safeString(passId, "");
+  return p === "pass_anonymous" || p.startsWith("pass:anon:");
+}
+
 function normalizeEmail(v) {
   const s = safeString(v, "").toLowerCase();
   return s || "";
+}
+
+function normalizePassId(raw) {
+  return safeString(raw, "");
+}
+
+function buildPassId({ existingPassId = "", shopifyCustomerId = "", userId = "", email = "" }) {
+  const incoming = normalizePassId(existingPassId);
+  if (incoming) return incoming;
+
+  const normEmail = normalizeEmail(email);
+  if (isRealCustomerKey(shopifyCustomerId)) return `pass:shopify:${shopifyCustomerId}`;
+  if (safeString(userId, "")) return `pass:user:${userId}`;
+  if (normEmail) return `pass:email:${normEmail}`;
+  return `pass:anon:${crypto.randomUUID()}`;
 }
 
 function computeDisplayName(first, last, email) {
@@ -63,17 +83,19 @@ function addDaysIso(days) {
  */
 export async function megaEnsureCustomer(
   supabaseAdmin,
-  { customerId, userId = null, email = null, legacyCredits = null, profile = {} }
+  { customerId, userId = null, email = null, legacyCredits = null, profile = {}, passId: explicitPassId = null }
 ) {
   if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
 
-  const shopifyCustomerId = safeString(customerId, "anonymous");
+  const customerKey = safeString(customerId, "");
+  const incomingPassId = normalizePassId(explicitPassId || (customerKey.startsWith("pass:") ? customerKey : ""));
+  const shopifyCustomerId = customerKey.startsWith("pass:") ? "anonymous" : safeString(customerKey, "anonymous");
   const normEmail = normalizeEmail(email);
 
   // If fully anonymous (no real id + no email + no userId), don't create DB junk rows
-  if (!isRealCustomerKey(shopifyCustomerId) && !normEmail && !userId) {
+  if (!incomingPassId && !isRealCustomerKey(shopifyCustomerId) && !normEmail && !userId) {
     return {
-      passId: "pass_anonymous",
+      passId: buildPassId({ existingPassId: incomingPassId, shopifyCustomerId, userId, email: normEmail }),
       credits: 0,
       shopifyCustomerId: "anonymous",
       meta: {},
@@ -82,8 +104,17 @@ export async function megaEnsureCustomer(
 
   // Try to find an existing customer by (shopify id) OR (user id) OR (email)
   const ors = [];
+  const potentialPassIds = new Set();
+  if (incomingPassId) potentialPassIds.add(incomingPassId);
+  if (isRealCustomerKey(shopifyCustomerId)) potentialPassIds.add(`pass:shopify:${shopifyCustomerId}`);
+  if (userId) potentialPassIds.add(`pass:user:${userId}`);
+  if (normEmail) potentialPassIds.add(`pass:email:${normEmail}`);
+
+  for (const pid of potentialPassIds) {
+    ors.push(`mg_pass_id.eq.${pid}`);
+  }
+
   if (isRealCustomerKey(shopifyCustomerId)) ors.push(`mg_shopify_customer_id.eq.${shopifyCustomerId}`);
-  if (isRealCustomerKey(shopifyCustomerId)) ors.push(`mg_pass_id.eq.${shopifyCustomerId}`);
   if (userId) ors.push(`mg_user_id.eq.${userId}`);
   if (normEmail) ors.push(`mg_email.eq.${normEmail}`);
 
@@ -123,15 +154,22 @@ export async function megaEnsureCustomer(
   const incomingVerificationAt = profile.verificationAt || null;
   const incomingVerificationKeynumber = safeString(profile.verificationKeynumber || "");
 
+  const resolvedPassId = buildPassId({
+    existingPassId: existing?.mg_pass_id || incomingPassId,
+    shopifyCustomerId,
+    userId,
+    email: normEmail,
+  });
+
   // Create new
   if (!existing) {
-    const passId = `pass_${crypto.randomUUID()}`;
+    const passId = resolvedPassId;
     const startingCredits =
       Number.isFinite(Number(legacyCredits)) ? Number(legacyCredits) : defaultFreeCredits();
 
     const payload = {
       mg_pass_id: passId,
-      mg_shopify_customer_id: isRealCustomerKey(shopifyCustomerId) ? shopifyCustomerId : normEmail || "anonymous",
+      mg_shopify_customer_id: isRealCustomerKey(shopifyCustomerId) ? shopifyCustomerId : "anonymous",
       mg_user_id: userId || null,
       mg_email: normEmail || null,
 
@@ -158,6 +196,9 @@ export async function megaEnsureCustomer(
       mg_verification_at: incomingVerificationAt || null,
       mg_verification_keynumber: incomingVerificationKeynumber || null,
 
+      mg_mma_preferences: profile?.mmaPreferences && typeof profile.mmaPreferences === "object" ? profile.mmaPreferences : {},
+      mg_mma_preferences_updated_at: null,
+
       mg_meta: profile.meta && typeof profile.meta === "object" ? profile.meta : {},
       mg_source_system: safeString(profile.sourceSystem || "app"),
       mg_created_at: nowIso(),
@@ -176,8 +217,10 @@ export async function megaEnsureCustomer(
   }
 
   // Update existing (fill missing fields + refresh last_active)
-  const passId = existing.mg_pass_id;
+  const passId = existing.mg_pass_id || resolvedPassId;
   const updates = {};
+
+  if (!existing.mg_pass_id && passId) updates.mg_pass_id = passId;
 
   // If we learned a better key, attach it (don’t overwrite real id with "anonymous")
   if (isRealCustomerKey(shopifyCustomerId) && !isRealCustomerKey(existing.mg_shopify_customer_id)) {
@@ -260,7 +303,7 @@ export async function megaWriteCreditTxnEvent(
 
   // 1) Insert transaction event
   const row = {
-    mg_id: txId,
+    mg_id: `credit_transaction:${txId}`,
     mg_record_type: "credit_transaction",
     mg_pass_id: cust.passId,
 
@@ -291,12 +334,16 @@ export async function megaWriteCreditTxnEvent(
     mg_last_active: nowIso(),
   };
 
-  if (Number.isFinite(Number(nextBalance))) {
-    updates.mg_credits = Math.floor(Number(nextBalance));
-  } else {
-    // fallback: add delta onto current value (best-effort)
-    updates.mg_credits = Math.floor((cust.credits || 0) + Number(delta || 0));
-  }
+  const hasNextBalance =
+  nextBalance !== null && nextBalance !== undefined && Number.isFinite(Number(nextBalance));
+
+if (hasNextBalance) {
+  updates.mg_credits = Math.floor(Number(nextBalance));
+} else {
+  // fallback: add delta onto current value (best-effort)
+  updates.mg_credits = Math.floor((cust.credits || 0) + Number(delta || 0));
+}
+
 
   // Optional expiry extension if configured
   const expDays = creditsExpireDays();
@@ -319,13 +366,13 @@ export async function megaWriteSessionEvent(
   if (!supabaseAdmin) throw new Error("NO_SUPABASE_CLIENT");
   const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
 
-  if (cust.passId === "pass_anonymous") return;
+  if (isAnonymousPass(cust.passId)) return;
 
   const sid = safeString(sessionId, crypto.randomUUID());
   const ts = createdAt || nowIso();
 
   const row = {
-    mg_id: `sess_${sid}`,
+    mg_id: `session:${sid}`,
     mg_record_type: "session",
     mg_pass_id: cust.passId,
     mg_session_id: sid,
@@ -358,18 +405,20 @@ export async function megaWriteGenerationEvent(
     email,
   });
 
-  if (cust.passId === "pass_anonymous") return;
+  if (isAnonymousPass(cust.passId)) return;
 
   const g = generation || {};
   const ts = g.createdAt || nowIso();
 
+  const generationId = safeString(g.id, crypto.randomUUID());
+
   const row = {
-    mg_id: safeString(g.id, `gen_${crypto.randomUUID()}`),
+    mg_id: `generation:${generationId}`,
     mg_record_type: "generation",
     mg_pass_id: cust.passId,
 
     mg_session_id: safeString(g.sessionId || ""),
-    mg_generation_id: safeString(g.id || ""),
+    mg_generation_id: generationId,
     mg_platform: safeString(g.platform || ""),
     mg_title: safeString(g.title || ""),
     mg_type: safeString(g.type || "image"),
@@ -408,14 +457,14 @@ export async function megaWriteFeedbackEvent(
 
   const cust = await megaEnsureCustomer(supabaseAdmin, { customerId });
 
-  if (cust.passId === "pass_anonymous") return;
+  if (isAnonymousPass(cust.passId)) return;
 
   const fb = feedback || {};
   const ts = fb.createdAt || nowIso();
   const meta = fb && typeof fb.meta === "object" ? fb.meta : {};
 
   const row = {
-    mg_id: safeString(fb.id, crypto.randomUUID()),
+    mg_id: `feedback:${safeString(fb.id, crypto.randomUUID())}`,
     mg_record_type: "feedback",
     mg_pass_id: cust.passId,
 

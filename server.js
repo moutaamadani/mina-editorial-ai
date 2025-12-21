@@ -33,6 +33,7 @@ import { parseDataUrl } from "./r2.js";
 import { logAdminAction, upsertSessionRow } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
 import mmaRouter from "./server/mma/mma-router.js";
+import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 
 const app = express();
 const PORT = ENV.PORT;
@@ -4558,6 +4559,7 @@ app.post("/api/r2/store-remote-signed", async (req, res) => {
 
 // Hero Part MMA: Mina Mind API router
 app.use("/mma", mmaRouter);
+app.use("/admin/mma", mmaLogAdminRouter);
 
 
 // =======================

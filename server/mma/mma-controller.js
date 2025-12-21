@@ -397,32 +397,40 @@ async function gptMakePrompts({ mode, vars, preferences }) {
     .filter(Boolean)
     .join("\n");
 
+  const temperature = 0.4;
+  const model = cfg.gptModel;
+
   const resp = await openai.chat.completions.create({
-    model: cfg.gptModel,
+    model,
     messages: [
       { role: "system", content: sys },
       { role: "user", content: user },
     ],
-    temperature: 0.4,
+    temperature,
   });
 
   const text = resp?.choices?.[0]?.message?.content || "";
+
   // best-effort JSON parse
+  let parsed = null;
   try {
-    const parsed = JSON.parse(text);
-    return {
-      clean_prompt: typeof parsed.clean_prompt === "string" ? parsed.clean_prompt : "",
-      motion_prompt: typeof parsed.motion_prompt === "string" ? parsed.motion_prompt : "",
-      raw: text,
-    };
+    parsed = JSON.parse(text);
   } catch {
-    // fallback: treat as single prompt
-    return {
-      clean_prompt: mode === "still" ? text : "",
-      motion_prompt: mode === "video" ? text : "",
-      raw: text,
-    };
+    parsed = null;
   }
+
+  return {
+    clean_prompt: typeof parsed?.clean_prompt === "string" ? parsed.clean_prompt : mode === "still" ? text : "",
+    motion_prompt: typeof parsed?.motion_prompt === "string" ? parsed.motion_prompt : mode === "video" ? text : "",
+    raw: text,
+    request: {
+      model,
+      temperature,
+      system: sys,
+      user,
+    },
+    usage: resp?.usage || null,
+  };
 }
 
 async function runProductionPipeline({ supabase, generationId, vars, mode, preferences }) {
@@ -453,11 +461,21 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
       stepNo: 1,
       stepType: mode === "video" ? "gpt_reader_motion" : "gpt_reader",
       payload: {
+        request: prompts.request, // ✅ system + user (context) + model
         input: {
           brief: working?.inputs?.brief || working?.inputs?.motionDescription || "",
           preferences,
+          mode,
+          platform: working?.inputs?.platform || working?.settings?.platform || "default",
+          aspectRatio:
+            working?.inputs?.aspect_ratio || working?.settings?.aspectRatio || working?.settings?.aspect_ratio || "",
         },
-        output: { clean_prompt: prompts.clean_prompt, motion_prompt: prompts.motion_prompt },
+        output: {
+          clean_prompt: prompts.clean_prompt,
+          motion_prompt: prompts.motion_prompt,
+          raw: prompts.raw, // ✅ full raw GPT response text
+          usage: prompts.usage,
+        },
         timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
         error: null,
       },

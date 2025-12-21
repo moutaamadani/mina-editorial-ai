@@ -255,7 +255,7 @@ async function runGptVisionStep({
       ],
     });
     const resp = await openai.chat.completions.create({
-      model: config?.model || "gpt-4o-mini",
+      model: config?.model || "gpt-5-mini",
       messages,
       max_tokens: config?.max_tokens || 300,
     });
@@ -278,7 +278,7 @@ async function runGptVisionStep({
       timing: result.timing,
       error: result.error,
     },
-    model: config?.model || "gpt-4o-mini",
+    model: config?.model || "gpt-5-mini",
     latencyMs: result.timing?.duration_ms || null,
     rawResponse: result.output?.raw,
   };
@@ -291,7 +291,7 @@ async function runGptTextStep({ openai, config, inputText, stepType }) {
     if (config?.system) messages.push({ role: "system", content: config.system });
     messages.push({ role: "user", content: inputText || config?.prompt || "" });
     const resp = await openai.chat.completions.create({
-      model: config?.model || "gpt-4o-mini",
+      model: config?.model || "gpt-5-mini",
       messages,
       max_tokens: config?.max_tokens || 400,
     });
@@ -313,7 +313,7 @@ async function runGptTextStep({ openai, config, inputText, stepType }) {
       timing: result.timing,
       error: result.error,
     },
-    model: config?.model || "gpt-4o-mini",
+    model: config?.model || "gpt-5-mini",
     latencyMs: result.timing?.duration_ms || null,
     rawResponse: result.output?.raw,
   };

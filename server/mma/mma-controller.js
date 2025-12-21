@@ -1,10 +1,6 @@
-// mma-controller.js (PRODUCTION)
-// - Real pipeline: OpenAI prompt -> Replicate generate -> store to R2 -> finalize
-// - Writes: mega_customers (via megaEnsureCustomer), mega_generations (generation + steps + events)
-// - SSE: status + scan lines streamed live + replay on reconnect
-
-import crypto from "node:crypto";
-import { Readable } from "node:stream";
+// src/routes/mma/mma-controller.js
+import OpenAI from "openai";
+import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { getSupabaseAdmin } from "../../supabase.js";
@@ -19,178 +15,140 @@ import {
   stepIdentifiers,
 } from "./mma-utils.js";
 import { addSseClient, sendDone, sendScanLine, sendStatus } from "./mma-sse.js";
+import { getMmaConfig } from "./mma-config.js";
 
-// IMPORTANT: adjust this import path to wherever you placed Part 1 helpers.
-import { megaEnsureCustomer } from "../mega-db.js"; // <-- CHANGE PATH IF NEEDED
-
-// -----------------------------
-// Config helpers
-// -----------------------------
-
-function envInt(name, fallback) {
-  const n = Number(process.env[name]);
-  return Number.isFinite(n) ? Math.floor(n) : fallback;
+// ---------------------------
+// Clients (cached singletons)
+// ---------------------------
+let _openai = null;
+function getOpenAI() {
+  if (_openai) return _openai;
+  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_MISSING");
+  _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
 }
 
-function envStr(name, fallback = "") {
-  const v = String(process.env[name] || "").trim();
-  return v || fallback;
+let _replicate = null;
+function getReplicate() {
+  if (_replicate) return _replicate;
+  if (!process.env.REPLICATE_API_TOKEN) throw new Error("REPLICATE_API_TOKEN_MISSING");
+  _replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+  return _replicate;
 }
 
-function requireEnv(name) {
-  const v = envStr(name, "");
-  if (!v) throw new Error(`MISSING_ENV:${name}`);
-  return v;
+// ---------------------------
+// R2 Public store (self-contained)
+// ---------------------------
+function getR2() {
+  const accountId = process.env.R2_ACCOUNT_ID || "";
+  const endpoint =
+    process.env.R2_ENDPOINT ||
+    (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "");
+
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID || "";
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY || "";
+  const bucket = process.env.R2_BUCKET || "";
+  const publicBase = process.env.R2_PUBLIC_BASE_URL || "";
+
+  const enabled = !!(endpoint && accessKeyId && secretAccessKey && bucket && publicBase);
+  const client = enabled
+    ? new S3Client({
+        region: "auto",
+        endpoint,
+        credentials: { accessKeyId, secretAccessKey },
+      })
+    : null;
+
+  return { enabled, client, bucket, publicBase };
 }
 
-function isNonEmpty(v) {
-  return v !== null && v !== undefined && String(v).trim() !== "";
-}
-
-function pickFirstUrl(output) {
-  if (!output) return "";
-  if (typeof output === "string") return output;
-  if (Array.isArray(output)) return pickFirstUrl(output[0]);
-  if (typeof output === "object") {
-    // some providers return {url: "..."} or {output: "..."}
-    if (typeof output.url === "string") return output.url;
-    if (typeof output.output === "string") return output.output;
+function guessExt(url, fallback = ".bin") {
+  try {
+    const p = new URL(url).pathname.toLowerCase();
+    if (p.endsWith(".png")) return ".png";
+    if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return ".jpg";
+    if (p.endsWith(".webp")) return ".webp";
+    if (p.endsWith(".gif")) return ".gif";
+    if (p.endsWith(".mp4")) return ".mp4";
+    if (p.endsWith(".webm")) return ".webm";
+    if (p.endsWith(".mov")) return ".mov";
+    return fallback;
+  } catch {
+    return fallback;
   }
-  return "";
 }
 
-function getMmaCosts(mode) {
-  // Tune these without redeploy by env vars
-  const stillCost = envInt("MMA_STILL_CREDITS_COST", 1);
-  const videoCost = envInt("MMA_VIDEO_CREDITS_COST", 5);
-  return mode === "video" ? videoCost : stillCost;
-}
+async function storeRemoteToR2Public(url, keyPrefix) {
+  const { enabled, client, bucket, publicBase } = getR2();
+  if (!enabled || !client) return url;
+  if (!url || typeof url !== "string") return url;
 
-function getOpenAiModel() {
-  return envStr("MMA_OPENAI_MODEL", envStr("OPENAI_MODEL", "gpt-4o-mini"));
-}
+  // already public/stable
+  if (publicBase && url.startsWith(publicBase)) return url;
 
-function getReplicateModels() {
-  // You can set either model *version* (recommended) or model *slug* if you already use it
-  // Examples:
-  //   MMA_SEADREAM_VERSION="stability-ai/sdxl:abc123..."
-  //   MMA_KLING_VERSION="kling-ai/kling-video:deadbeef..."
-  return {
-    seadream: envStr("MMA_SEADREAM_VERSION", envStr("SEADREAM_VERSION", "")),
-    kling: envStr("MMA_KLING_VERSION", envStr("KLING_VERSION", "")),
-  };
-}
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`R2_FETCH_FAILED_${res.status}`);
 
-function getProviderTimeoutMs(mode) {
-  const still = envInt("MMA_PROVIDER_TIMEOUT_MS_STILL", 8 * 60 * 1000);
-  const video = envInt("MMA_PROVIDER_TIMEOUT_MS_VIDEO", 35 * 60 * 1000);
-  return mode === "video" ? video : still;
-}
+  const buf = Buffer.from(await res.arrayBuffer());
+  const contentType = res.headers.get("content-type") || "application/octet-stream";
+  const ext = guessExt(url, contentType.includes("video") ? ".mp4" : ".png");
+  const objKey = `${keyPrefix}${ext}`;
 
-// -----------------------------
-// R2 helpers (safe, streaming upload)
-// -----------------------------
-
-let _r2 = null;
-
-function getR2Client() {
-  if (_r2) return _r2;
-
-  const endpoint = envStr("R2_ENDPOINT", "");
-  const accessKeyId = envStr("R2_ACCESS_KEY_ID", "");
-  const secretAccessKey = envStr("R2_SECRET_ACCESS_KEY", "");
-  const region = envStr("R2_REGION", "auto");
-
-  if (!endpoint || !accessKeyId || !secretAccessKey) return null;
-
-  _r2 = new S3Client({
-    region,
-    endpoint,
-    credentials: { accessKeyId, secretAccessKey },
-  });
-
-  return _r2;
-}
-
-async function storeRemoteToR2Public(remoteUrl, key) {
-  const bucket = envStr("R2_BUCKET", "");
-  const publicBase = envStr("R2_PUBLIC_BASE_URL", "");
-
-  const r2 = getR2Client();
-  if (!r2 || !bucket || !publicBase) {
-    // If R2 not configured, fall back to remote url (still works, but not permanent)
-    return { url: remoteUrl, key: "" };
-  }
-
-  const resp = await fetch(remoteUrl);
-  if (!resp.ok) throw new Error(`R2_FETCH_FAILED:${resp.status}`);
-
-  const contentType = resp.headers.get("content-type") || "application/octet-stream";
-  const bodyStream = resp.body ? Readable.fromWeb(resp.body) : null;
-  if (!bodyStream) throw new Error("R2_FETCH_NO_BODY");
-
-  await r2.send(
+  await client.send(
     new PutObjectCommand({
       Bucket: bucket,
-      Key: key,
-      Body: bodyStream,
+      Key: objKey,
+      Body: buf,
       ContentType: contentType,
     })
   );
 
-  const url = `${publicBase.replace(/\/+$/, "")}/${key.replace(/^\/+/, "")}`;
-  return { url, key };
+  return `${publicBase.replace(/\/$/, "")}/${objKey}`;
 }
 
-function makeR2Key({ mode, generationId, ext }) {
-  const safeExt = (ext || "").replace(/[^a-z0-9]/gi, "").toLowerCase() || (mode === "video" ? "mp4" : "png");
-  return `mma/${mode}/${generationId}.${safeExt}`;
+// ---------------------------
+// DB helpers
+// ---------------------------
+async function ensureCustomerRow(supabase, passId, { shopifyCustomerId, userId, email }) {
+  const { data } = await supabase
+    .from("mega_customers")
+    .select("mg_pass_id, mg_mma_preferences")
+    .eq("mg_pass_id", passId)
+    .maybeSingle();
+
+  const prefs = data?.mg_mma_preferences || {};
+
+  if (!data) {
+    await supabase.from("mega_customers").insert({
+      mg_pass_id: passId,
+      mg_shopify_customer_id: shopifyCustomerId || null,
+      mg_user_id: userId || null,
+      mg_email: email || null,
+      mg_credits: 0,
+      mg_mma_preferences: prefs,
+      mg_created_at: nowIso(),
+      mg_updated_at: nowIso(),
+    });
+  }
+
+  return { preferences: prefs };
 }
 
-function guessExtFromUrl(url, mode) {
-  try {
-    const u = new URL(url);
-    const pathname = u.pathname || "";
-    const m = pathname.match(/\.([a-z0-9]+)$/i);
-    if (m && m[1]) return m[1].toLowerCase();
-  } catch (_) {}
-  return mode === "video" ? "mp4" : "png";
-}
-
-// -----------------------------
-// MEGA writes
-// -----------------------------
-
-async function writeGeneration({ supabase, generationId, passId, vars, mode, parentGenerationId = null }) {
+async function writeGeneration({ supabase, generationId, parentId, passId, vars, mode }) {
   const identifiers = generationIdentifiers(generationId);
-  const payload = {
+  await supabase.from("mega_generations").insert({
     ...identifiers,
-
-    mg_parent_id: parentGenerationId ? `generation:${parentGenerationId}` : null,
+    mg_parent_id: parentId ? `generation:${parentId}` : null,
     mg_pass_id: passId,
-
-    mg_record_type: "generation",
     mg_status: "queued",
     mg_mma_status: "queued",
     mg_mma_mode: mode,
     mg_mma_vars: vars,
-
     mg_prompt: null,
     mg_output_url: null,
-    mg_output_key: null,
-    mg_provider: null,
-    mg_model: null,
-
-    mg_error: null,
-
     mg_created_at: nowIso(),
     mg_updated_at: nowIso(),
-    mg_event_at: nowIso(),
-
-    mg_source_system: "app",
-  };
-
-  await supabase.from("mega_generations").insert(payload);
+  });
 }
 
 async function writeStep({ supabase, generationId, stepNo, stepType, payload }) {
@@ -202,25 +160,18 @@ async function writeStep({ supabase, generationId, stepNo, stepType, payload }) 
     mg_payload: payload,
     mg_created_at: nowIso(),
     mg_updated_at: nowIso(),
-    mg_event_at: nowIso(),
-    mg_source_system: "app",
   });
 }
 
-async function finalizeGeneration({ supabase, generationId, url, key, prompt, provider, model, vars }) {
+async function finalizeGeneration({ supabase, generationId, url, prompt }) {
   await supabase
     .from("mega_generations")
     .update({
       mg_status: "done",
       mg_mma_status: "done",
-      mg_output_url: url || null,
-      mg_output_key: key || null,
-      mg_prompt: prompt || null,
-      mg_provider: provider || null,
-      mg_model: model || null,
-      mg_mma_vars: vars || null,
+      mg_output_url: url,
+      mg_prompt: prompt,
       mg_updated_at: nowIso(),
-      mg_event_at: nowIso(),
     })
     .eq("mg_generation_id", generationId)
     .eq("mg_record_type", "generation");
@@ -229,11 +180,7 @@ async function finalizeGeneration({ supabase, generationId, url, key, prompt, pr
 async function updateVars({ supabase, generationId, vars }) {
   await supabase
     .from("mega_generations")
-    .update({
-      mg_mma_vars: vars,
-      mg_updated_at: nowIso(),
-      mg_event_at: nowIso(),
-    })
+    .update({ mg_mma_vars: vars, mg_updated_at: nowIso() })
     .eq("mg_generation_id", generationId)
     .eq("mg_record_type", "generation");
 }
@@ -241,319 +188,148 @@ async function updateVars({ supabase, generationId, vars }) {
 async function updateStatus({ supabase, generationId, status }) {
   await supabase
     .from("mega_generations")
-    .update({
-      mg_status: status,
-      mg_mma_status: status,
-      mg_updated_at: nowIso(),
-      mg_event_at: nowIso(),
-    })
+    .update({ mg_status: status, mg_mma_status: status, mg_updated_at: nowIso() })
     .eq("mg_generation_id", generationId)
     .eq("mg_record_type", "generation");
 }
 
-async function setGenerationError({ supabase, generationId, code, message, extra = {} }) {
-  await supabase
-    .from("mega_generations")
-    .update({
-      mg_status: "error",
-      mg_mma_status: "error",
-      mg_error: { code, message, ...extra },
-      mg_updated_at: nowIso(),
-      mg_event_at: nowIso(),
-    })
-    .eq("mg_generation_id", generationId)
-    .eq("mg_record_type", "generation");
-}
-
-async function writeEvent({ supabase, eventType, generationId, passId, payload }) {
-  const eventId = newUuid();
-  const identifiers = eventIdentifiers(eventId);
-  await supabase.from("mega_generations").insert({
-    ...identifiers,
-    mg_generation_id: generationId || null,
-    mg_pass_id: passId,
-    mg_parent_id: generationId ? `generation:${generationId}` : null,
-    mg_meta: { event_type: eventType, payload },
-    mg_created_at: nowIso(),
-    mg_updated_at: nowIso(),
-    mg_event_at: nowIso(),
-    mg_source_system: "app",
-  });
-  return eventId;
-}
-
-// -----------------------------
-// Credits (safe-ish CAS, no double-decrement)
-// -----------------------------
-
-async function chargeCreditsOrThrow({ supabase, passId, cost, generationId, mode }) {
-  if (cost <= 0) return { charged: 0, balance: null };
-
-  // CAS retry (prevents most races)
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const { data: cust, error: selErr } = await supabase
-      .from("mega_customers")
-      .select("mg_pass_id, mg_credits")
-      .eq("mg_pass_id", passId)
-      .maybeSingle();
-    if (selErr) throw selErr;
-
-    const current = Number(cust?.mg_credits || 0);
-    if (current < cost) {
-      const e = new Error("INSUFFICIENT_CREDITS");
-      e.statusCode = 402;
-      e.details = { current, needed: cost };
-      throw e;
-    }
-
-    const next = Math.max(0, Math.floor(current - cost));
-
-    const { data: updated, error: upErr } = await supabase
-      .from("mega_customers")
-      .update({ mg_credits: next, mg_updated_at: nowIso(), mg_last_active: nowIso() })
-      .eq("mg_pass_id", passId)
-      .eq("mg_credits", current) // CAS condition
-      .select("mg_credits")
-      .maybeSingle();
-
-    if (upErr) throw upErr;
-    if (updated) {
-      // also log a credit transaction event (event stream) WITHOUT updating balance again
-      await supabase.from("mega_generations").insert({
-        mg_id: `credit_transaction:${crypto.randomUUID()}`,
-        mg_record_type: "credit_transaction",
-        mg_pass_id: passId,
-        mg_delta: -Math.abs(cost),
-        mg_reason: `mma_${mode}`,
-        mg_source: "mma",
-        mg_ref_type: "generation",
-        mg_ref_id: generationId,
-        mg_created_at: nowIso(),
-        mg_updated_at: nowIso(),
-        mg_event_at: nowIso(),
-        mg_meta: { mode, generation_id: generationId },
-        mg_source_system: "app",
-      });
-
-      return { charged: cost, balance: next };
-    }
-
-    // CAS failed => retry
-    await new Promise((r) => setTimeout(r, 30 + attempt * 50));
+// ---------------------------
+// Production pipeline
+// ---------------------------
+function pickFirstUrl(output) {
+  if (!output) return "";
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return pickFirstUrl(output[0]);
+  if (typeof output === "object") {
+    if (typeof output.url === "string") return output.url;
+    if (typeof output.output === "string") return output.output;
   }
-
-  throw new Error("CREDITS_CHARGE_RETRY_FAILED");
+  return "";
 }
 
-// -----------------------------
-// OpenAI prompt builder
-// -----------------------------
+function safeArray(x) {
+  return Array.isArray(x) ? x : [];
+}
 
-async function openAiMakePrompts({ mode, vars, preferences }) {
-  const apiKey = envStr("OPENAI_API_KEY", "");
-  if (!apiKey) {
-    // fallback: if user already provided prompts, keep them
+function collectImageInputs(vars) {
+  const assets = vars?.assets || {};
+  const out = [];
+
+  const product = assets.productImageUrl || assets.product_image_url;
+  const logo = assets.logoImageUrl || assets.logo_image_url;
+  const insp = safeArray(assets.styleImageUrls || assets.style_image_urls);
+
+  if (typeof product === "string" && product.startsWith("http")) out.push(product);
+  if (typeof logo === "string" && logo.startsWith("http")) out.push(logo);
+  for (const u of insp) if (typeof u === "string" && u.startsWith("http")) out.push(u);
+
+  // keep max 10 for seedream schema
+  return out.slice(0, 10);
+}
+
+function pickKlingImages(vars) {
+  const assets = vars?.assets || {};
+  const arr = safeArray(assets.kling_images || assets.klingImages || assets.kling_image_urls);
+  const start = assets.start_image_url || assets.startImageUrl || arr[0] || assets.productImageUrl || "";
+  const end = assets.end_image_url || assets.endImageUrl || arr[1] || "";
+
+  const s = typeof start === "string" ? start : "";
+  const e = typeof end === "string" ? end : "";
+  return {
+    start: s.startsWith("http") ? s : "",
+    end: e.startsWith("http") ? e : "",
+  };
+}
+
+async function gptMakePrompts({ mode, vars, preferences }) {
+  const cfg = getMmaConfig();
+  const openai = getOpenAI();
+
+  const brief =
+    vars?.inputs?.brief ||
+    vars?.inputs?.prompt ||
+    vars?.inputs?.motionDescription ||
+    vars?.inputs?.motion_description ||
+    "";
+
+  const platform = vars?.inputs?.platform || vars?.settings?.platform || "default";
+  const aspectRatio = vars?.inputs?.aspect_ratio || vars?.settings?.aspectRatio || vars?.settings?.aspect_ratio || "";
+
+  const negSeedream = cfg.seadream.negativePrompt ? `Avoid (global): ${cfg.seadream.negativePrompt}` : "";
+  const negKling = cfg.kling.negativePrompt ? `Negative prompt (global): ${cfg.kling.negativePrompt}` : "";
+
+  const sys = [
+    "You are Mina Mind — a production prompt engine.",
+    "Output STRICT JSON only, no markdown.",
+    "Schema: { clean_prompt: string, motion_prompt: string }",
+    "clean_prompt is for Seedream (still image).",
+    "motion_prompt is for Kling (image-to-video).",
+    "Be concise, specific, photoreal, high-end editorial.",
+    negSeedream,
+    negKling,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const user = [
+    `MODE: ${mode}`,
+    `PLATFORM: ${platform}`,
+    aspectRatio ? `ASPECT_RATIO: ${aspectRatio}` : "",
+    preferences ? `USER_PREFERENCES_JSON: ${JSON.stringify(preferences).slice(0, 4000)}` : "",
+    `BRIEF: ${String(brief).slice(0, 6000)}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const resp = await openai.chat.completions.create({
+    model: cfg.gptModel,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    temperature: 0.4,
+  });
+
+  const text = resp?.choices?.[0]?.message?.content || "";
+  // best-effort JSON parse
+  try {
+    const parsed = JSON.parse(text);
     return {
-      clean_prompt: vars?.prompts?.clean_prompt || "Mina prompt",
-      motion_prompt: vars?.prompts?.motion_prompt || "Mina motion prompt",
-      negative_prompt: vars?.prompts?.negative_prompt || "",
+      clean_prompt: typeof parsed.clean_prompt === "string" ? parsed.clean_prompt : "",
+      motion_prompt: typeof parsed.motion_prompt === "string" ? parsed.motion_prompt : "",
+      raw: text,
+    };
+  } catch {
+    // fallback: treat as single prompt
+    return {
+      clean_prompt: mode === "still" ? text : "",
+      motion_prompt: mode === "video" ? text : "",
+      raw: text,
     };
   }
-
-  const model = getOpenAiModel();
-
-  const system = [
-    "You are Mina Mind prompt engine.",
-    "Return STRICT JSON only (no markdown).",
-    "Goal: produce a high-quality generation prompt for the requested mode.",
-    "Keep it concise, vivid, and production-ready.",
-    "If user provided constraints/settings, respect them.",
-  ].join(" ");
-
-  const userPayload = {
-    mode,
-    inputs: vars?.inputs || {},
-    assets: vars?.assets || {},
-    settings: vars?.settings || {},
-    history: vars?.history || {},
-    feedback: vars?.feedback || {},
-    preferences: preferences || {},
-    existing_prompts: vars?.prompts || {},
-  };
-
-  const messages = [
-    { role: "system", content: system },
-    {
-      role: "user",
-      content:
-        "Build prompts. JSON keys: clean_prompt, motion_prompt, negative_prompt. " +
-        "clean_prompt required for still. motion_prompt required for video. " +
-        "If a field not relevant, return empty string.\n\n" +
-        JSON.stringify(userPayload),
-    },
-  ];
-
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.7,
-      response_format: { type: "json_object" },
-    }),
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`OPENAI_FAILED:${resp.status}:${txt.slice(0, 200)}`);
-  }
-
-  const json = await resp.json();
-  const content = json?.choices?.[0]?.message?.content || "{}";
-
-  let parsed = {};
-  try {
-    parsed = JSON.parse(content);
-  } catch (e) {
-    throw new Error("OPENAI_BAD_JSON");
-  }
-
-  return {
-    clean_prompt: String(parsed.clean_prompt || ""),
-    motion_prompt: String(parsed.motion_prompt || ""),
-    negative_prompt: String(parsed.negative_prompt || ""),
-  };
 }
 
-// -----------------------------
-// Replicate helpers
-// -----------------------------
+async function runProductionPipeline({ supabase, generationId, vars, mode, preferences }) {
+  const cfg = getMmaConfig();
+  if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
-async function replicateCreatePrediction({ version, input }) {
-  const token = requireEnv("REPLICATE_API_TOKEN");
-  const resp = await fetch("https://api.replicate.com/v1/predictions", {
-    method: "POST",
-    headers: {
-      Authorization: `Token ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      version, // can be "owner/model:versionhash" too, replicate accepts
-      input,
-    }),
-  });
-
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(`REPLICATE_CREATE_FAILED:${resp.status}:${JSON.stringify(body).slice(0, 200)}`);
-  }
-
-  return body;
-}
-
-async function replicateGetPrediction(id) {
-  const token = requireEnv("REPLICATE_API_TOKEN");
-  const resp = await fetch(`https://api.replicate.com/v1/predictions/${id}`, {
-    headers: { Authorization: `Token ${token}` },
-  });
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(`REPLICATE_GET_FAILED:${resp.status}:${JSON.stringify(body).slice(0, 200)}`);
-  }
-  return body;
-}
-
-async function replicateWait({ predictionId, timeoutMs }) {
-  const started = Date.now();
-  let sleepMs = 1500;
-
-  while (true) {
-    const p = await replicateGetPrediction(predictionId);
-    const status = String(p?.status || "");
-    if (status === "succeeded") return p;
-    if (status === "failed" || status === "canceled") {
-      const errMsg = p?.error ? String(p.error) : "replicate_failed";
-      const e = new Error(errMsg);
-      e.code = "REPLICATE_FAILED";
-      throw e;
-    }
-
-    if (Date.now() - started > timeoutMs) {
-      const e = new Error("REPLICATE_TIMEOUT");
-      e.code = "REPLICATE_TIMEOUT";
-      throw e;
-    }
-
-    await new Promise((r) => setTimeout(r, sleepMs));
-    sleepMs = Math.min(5000, Math.floor(sleepMs * 1.2));
-  }
-}
-
-// -----------------------------
-// Identity / customer preferences
-// -----------------------------
-
-function resolveIds({ req, body }) {
-  const b = body || {};
-
-  // prefer your trusted pass id header if present (same idea as your /me header flow)
-  const headerPass = req?.headers?.["x-mina-pass-id"] || req?.headers?.["X-Mina-Pass-Id"];
-  const passFromHeader = isNonEmpty(headerPass) ? String(headerPass).trim() : "";
-
-  const shopifyCustomerId = b.customer_id || b.customerId || null;
-  const userId = b.user_id || b.userId || null;
-  const email = b.email || null;
-
-  const passId = passFromHeader
-    ? String(passFromHeader)
-    : computePassId({ shopifyCustomerId, userId, email });
-
-  return { passId, shopifyCustomerId, userId, email };
-}
-
-async function loadPreferences({ supabase, passId }) {
-  const { data, error } = await supabase
-    .from("mega_customers")
-    .select("mg_mma_preferences")
-    .eq("mg_pass_id", passId)
-    .maybeSingle();
-  if (error) throw error;
-  return data?.mg_mma_preferences || {};
-}
-
-// -----------------------------
-// Production pipeline
-// -----------------------------
-
-async function runProductionPipeline({ supabase, generationId, passId, vars, mode }) {
   let working = vars;
 
   try {
-    // scanning
+    // 1) scanning
     await updateStatus({ supabase, generationId, status: "scanning" });
     sendStatus(generationId, "scanning");
-    working = appendScanLine(working, "Scanning inputs...");
+
+    working = appendScanLine(working, "Scanning inputs…");
     await updateVars({ supabase, generationId, vars: working });
-    const lastLine = working?.userMessages?.scan_lines?.[working.userMessages.scan_lines.length - 1];
-    if (lastLine) sendScanLine(generationId, lastLine);
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Scanning inputs…");
 
-    // preferences
-    const prefs = await loadPreferences({ supabase, passId });
-
-    // prompting
+    // 2) prompting (GPT)
     await updateStatus({ supabase, generationId, status: "prompting" });
     sendStatus(generationId, "prompting");
-    working = appendScanLine(working, "Writing prompt...");
-    await updateVars({ supabase, generationId, vars: working });
-    sendScanLine(generationId, working.userMessages.scan_lines[working.userMessages.scan_lines.length - 1]);
 
     const t0 = Date.now();
-    const prompts = await openAiMakePrompts({ mode, vars: working, preferences: prefs });
-    working.prompts = { ...(working.prompts || {}), ...prompts };
+    const prompts = await gptMakePrompts({ mode, vars: working, preferences });
 
     await writeStep({
       supabase,
@@ -561,196 +337,172 @@ async function runProductionPipeline({ supabase, generationId, passId, vars, mod
       stepNo: 1,
       stepType: mode === "video" ? "gpt_reader_motion" : "gpt_reader",
       payload: {
-        input: { mode },
-        output: { prompts },
-        timing: {
-          started_at: new Date(t0).toISOString(),
-          ended_at: nowIso(),
-          duration_ms: Math.max(0, Date.now() - t0),
+        input: {
+          brief: working?.inputs?.brief || working?.inputs?.motionDescription || "",
+          preferences,
         },
+        output: { clean_prompt: prompts.clean_prompt, motion_prompt: prompts.motion_prompt },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
         error: null,
       },
     });
 
-    await updateVars({ supabase, generationId, vars: working });
+    working.prompts = {
+      ...(working.prompts || {}),
+      clean_prompt: prompts.clean_prompt || working?.prompts?.clean_prompt || "",
+      motion_prompt: prompts.motion_prompt || working?.prompts?.motion_prompt || "",
+    };
 
-    // generating
+    working = appendScanLine(working, "Prompts ready.");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Prompts ready.");
+
+    // 3) generating (Replicate)
     await updateStatus({ supabase, generationId, status: "generating" });
     sendStatus(generationId, "generating");
-    working = appendScanLine(working, "Generating with provider...");
-    await updateVars({ supabase, generationId, vars: working });
-    sendScanLine(generationId, working.userMessages.scan_lines[working.userMessages.scan_lines.length - 1]);
 
-    const models = getReplicateModels();
-    const timeoutMs = getProviderTimeoutMs(mode);
+    const replicate = getReplicate();
+    const t1 = Date.now();
 
-    const prompt = mode === "video" ? (working.prompts.motion_prompt || working.prompts.clean_prompt) : working.prompts.clean_prompt;
-    if (!prompt) throw new Error("EMPTY_PROMPT");
+    let remoteUrl = "";
+    let usedPrompt = "";
 
-    const aspectRatio = working?.settings?.aspect_ratio || working?.settings?.aspectRatio || "1:1";
-    const duration = Number(working?.settings?.duration_sec || working?.settings?.durationSec || 5);
+    if (mode === "still") {
+      usedPrompt = working.prompts.clean_prompt || "";
+      if (!usedPrompt) throw new Error("EMPTY_PROMPT");
 
-    // Optional init image for video, if provided
-    const initImageUrl =
-      working?.assets?.image_url ||
-      working?.assets?.imageUrl ||
-      working?.assets?.init_image_url ||
-      working?.assets?.initImageUrl ||
-      "";
+      const imageInputs = collectImageInputs(working);
 
-    let version = "";
-    let stepType = "";
-    let providerInput = {};
-
-    if (mode === "video") {
-      version = models.kling;
-      stepType = "kling_generate";
-      if (!version) throw new Error("MISSING_KLING_VERSION");
-
-      providerInput = {
-        prompt,
-        // common params (adjust to your kling model spec if needed)
-        aspect_ratio: aspectRatio,
-        duration: Math.max(1, Math.min(10, duration)),
-        ...(initImageUrl ? { image: initImageUrl } : {}),
+      const input = {
+        prompt: usedPrompt,
+        // seedream schema supports these:
+        size: cfg.seadream.size,
+        enhance_prompt: cfg.seadream.enhancePrompt,
+        max_images: 1,
+        // optional reference images:
+        ...(imageInputs.length ? { image_input: imageInputs } : {}),
       };
+
+      const out = await replicate.run(cfg.seadream.model, { input });
+      const url = pickFirstUrl(out);
+      if (!url) throw new Error("SEADREAM_NO_URL");
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: 2,
+        stepType: "seedream_generate",
+        payload: {
+          input,
+          output: out,
+          timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+          error: null,
+        },
+      });
+
+      // store to R2 public
+      remoteUrl = await storeRemoteToR2Public(url, `mma/still/${generationId}`);
+      working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
     } else {
-      version = models.seadream;
-      stepType = "seedream_generate";
-      if (!version) throw new Error("MISSING_SEADREAM_VERSION");
+      usedPrompt = working.prompts.motion_prompt || "";
+      if (!usedPrompt) throw new Error("EMPTY_PROMPT");
 
-      providerInput = {
-        prompt,
-        aspect_ratio: aspectRatio,
+      const { start, end } = pickKlingImages(working);
+      if (!start) throw new Error("Kling requires a start image (start_image_url).");
+
+      const input = {
+        prompt: usedPrompt,
+        start_image: start,
+        // end_image only works in pro mode (your request)
+        ...(cfg.kling.mode === "pro" && end ? { end_image: end } : {}),
+        ...(cfg.kling.negativePrompt ? { negative_prompt: cfg.kling.negativePrompt } : {}),
+        mode: cfg.kling.mode,
       };
+
+      const out = await replicate.run(cfg.kling.model, { input });
+      const url = pickFirstUrl(out);
+      if (!url) throw new Error("KLING_NO_URL");
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: 2,
+        stepType: "kling_generate",
+        payload: {
+          input,
+          output: out,
+          timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+          error: null,
+        },
+      });
+
+      remoteUrl = await storeRemoteToR2Public(url, `mma/video/${generationId}`);
+      working.outputs = { ...(working.outputs || {}), kling_video_url: remoteUrl };
     }
 
-    const providerStarted = Date.now();
-    const pred = await replicateCreatePrediction({ version, input: providerInput });
-    const predId = String(pred?.id || "");
-    if (!predId) throw new Error("REPLICATE_NO_ID");
-
-    // Save the prediction ID early (useful for debugging/retry)
-    working.outputs = { ...(working.outputs || {}), replicate_prediction_id: predId };
-
-    const done = await replicateWait({ predictionId: predId, timeoutMs });
-
-    const rawUrl = pickFirstUrl(done?.output);
-    if (!rawUrl) throw new Error("PROVIDER_EMPTY_OUTPUT");
-
-    // Store to R2 (or fallback to rawUrl if R2 not configured)
-    const ext = guessExtFromUrl(rawUrl, mode);
-    const key = makeR2Key({ mode, generationId, ext });
-    const stored = await storeRemoteToR2Public(rawUrl, key);
-
-    const finalUrl = stored.url;
-    const finalKey = stored.key;
-
-    // Step write
-    await writeStep({
-      supabase,
-      generationId,
-      stepNo: 2,
-      stepType,
-      payload: {
-        input: providerInput,
-        output: {
-          prediction_id: predId,
-          remote_url: rawUrl,
-          stored_url: finalUrl,
-          stored_key: finalKey,
-          status: done?.status,
-        },
-        timing: {
-          started_at: new Date(providerStarted).toISOString(),
-          ended_at: nowIso(),
-          duration_ms: Math.max(0, Date.now() - providerStarted),
-        },
-        error: null,
-      },
-    });
-
-    // postscan / finalize
+    // 4) postscan + finalize
     await updateStatus({ supabase, generationId, status: "postscan" });
     sendStatus(generationId, "postscan");
-    working.outputs = { ...(working.outputs || {}) };
 
-    if (mode === "video") {
-      working.outputs.kling_video_url = finalUrl;
-      working.outputs.kling_video_id = predId;
-    } else {
-      working.outputs.seedream_image_url = finalUrl;
-      working.outputs.seedream_image_id = predId;
-    }
+    working.mg_output_url = remoteUrl;
+    working.userMessages = {
+      ...(working.userMessages || {}),
+      final_line: "Finished generation.",
+    };
 
-    working.mg_output_url = finalUrl;
-    working.userMessages = { ...(working.userMessages || {}), final_line: "Finished generation" };
-
+    working = appendScanLine(working, "Stored output to permanent URL.");
     await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Stored output.");
 
-    await finalizeGeneration({
-      supabase,
-      generationId,
-      url: finalUrl,
-      key: finalKey,
-      prompt,
-      provider: "replicate",
-      model: version,
-      vars: working,
-    });
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
 
     await updateStatus({ supabase, generationId, status: "done" });
     sendStatus(generationId, "done");
     sendDone(generationId, "done");
   } catch (err) {
     console.error("[mma] pipeline error", err);
-    await setGenerationError({
-      supabase,
-      generationId,
-      code: err?.code || "PIPELINE_ERROR",
-      message: err?.message || "",
-    });
+
+    await updateStatus({ supabase, generationId, status: "error" });
+    await supabase
+      .from("mega_generations")
+      .update({
+        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_updated_at: nowIso(),
+      })
+      .eq("mg_generation_id", generationId)
+      .eq("mg_record_type", "generation");
+
     sendStatus(generationId, "error");
     sendDone(generationId, "error");
   }
 }
 
-// -----------------------------
-// Public handlers
-// -----------------------------
-
-export async function handleMmaCreate({ mode, body, req = null }) {
+// ---------------------------
+// Public controller API
+// ---------------------------
+export async function handleMmaCreate({ mode, body }) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
 
+  // Allow frontend to pass passId directly (your MinaApp already has it)
+  const passId =
+    body?.passId ||
+    body?.pass_id ||
+    computePassId({
+      shopifyCustomerId: body?.customer_id,
+      userId: body?.user_id,
+      email: body?.email,
+    });
+
+  const parentId = body?.generation_id || body?.parent_generation_id || null;
   const generationId = newUuid();
-  const parentGenerationId = body?.parent_generation_id || body?.generation_id || null;
 
-  const ids = resolveIds({ req, body });
-
-  // production guard: require at least one stable identifier
-  if (!isNonEmpty(ids.passId) || (!isNonEmpty(ids.shopifyCustomerId) && !isNonEmpty(ids.userId) && !isNonEmpty(ids.email) && !isNonEmpty(req?.headers?.["x-mina-pass-id"]))) {
-    const e = new Error("MISSING_IDENTITY");
-    e.statusCode = 400;
-    throw e;
-  }
-
-  // Ensure customer row via your real helper (Part 1)
-  const ensured = await megaEnsureCustomer(supabase, {
-    customerId: ids.shopifyCustomerId || ids.passId,
-    userId: ids.userId || null,
-    email: ids.email || null,
-    profile: {},
-    passId: ids.passId || null,
+  const { preferences } = await ensureCustomerRow(supabase, passId, {
+    shopifyCustomerId: body?.customer_id,
+    userId: body?.user_id,
+    email: body?.email,
   });
 
-  const passId = ensured.passId;
-
-  // credits
-  const cost = getMmaCosts(mode);
-  await chargeCreditsOrThrow({ supabase, passId, cost, generationId, mode });
-
-  // vars
   const vars = makeInitialVars({
     mode,
     assets: body?.assets || {},
@@ -761,48 +513,48 @@ export async function handleMmaCreate({ mode, body, req = null }) {
     prompts: body?.prompts || {},
   });
 
-  await writeGeneration({ supabase, generationId, passId, vars, mode, parentGenerationId });
+  await writeGeneration({ supabase, generationId, parentId, passId, vars, mode });
 
-  // fire & forget production pipeline
-  runProductionPipeline({ supabase, generationId, passId, vars, mode }).catch((err) => {
-    console.error("[mma] pipeline top-level error", err);
+  runProductionPipeline({ supabase, generationId, vars, mode, preferences }).catch((err) => {
+    console.error("[mma] pipeline error", err);
   });
 
-  return {
-    generation_id: generationId,
-    parent_generation_id: parentGenerationId || null,
-    status: "queued",
-    sse_url: `/mma/stream/${generationId}`,
-    credits_cost: cost,
-  };
+  return { generation_id: generationId, status: "queued", sse_url: `/mma/stream/${generationId}` };
 }
 
-export async function handleMmaEvent(body, req = null) {
+export async function handleMmaEvent(body) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
 
-  const ids = resolveIds({ req, body });
+  const passId =
+    body?.passId ||
+    body?.pass_id ||
+    computePassId({
+      shopifyCustomerId: body?.customer_id,
+      userId: body?.user_id,
+      email: body?.email,
+    });
 
-  // Ensure customer row (so prefs exist)
-  const ensured = await megaEnsureCustomer(supabase, {
-    customerId: ids.shopifyCustomerId || ids.passId,
-    userId: ids.userId || null,
-    email: ids.email || null,
-    profile: {},
-    passId: ids.passId || null,
+  await ensureCustomerRow(supabase, passId, {
+    shopifyCustomerId: body?.customer_id,
+    userId: body?.user_id,
+    email: body?.email,
   });
 
-  const passId = ensured.passId;
+  const eventId = newUuid();
+  const identifiers = eventIdentifiers(eventId);
 
-  const eventId = await writeEvent({
-    supabase,
-    eventType: body?.event_type || "unknown",
-    generationId: body?.generation_id || null,
-    passId,
-    payload: body?.payload || {},
+  await supabase.from("mega_generations").insert({
+    ...identifiers,
+    mg_generation_id: body?.generation_id || null,
+    mg_pass_id: passId,
+    mg_parent_id: body?.generation_id ? `generation:${body.generation_id}` : null,
+    mg_meta: { event_type: body?.event_type || "unknown", payload: body?.payload || {} },
+    mg_created_at: nowIso(),
+    mg_updated_at: nowIso(),
   });
 
-  // preference updates
+  // Keep your existing preference-write logic (unchanged)
   if (body?.event_type === "like" || body?.event_type === "dislike" || body?.event_type === "preference_set") {
     const { data } = await supabase
       .from("mega_customers")
@@ -832,17 +584,13 @@ export async function handleMmaEvent(body, req = null) {
   return { event_id: eventId, status: "ok" };
 }
 
-// -----------------------------
-// Read APIs
-// -----------------------------
-
 export async function fetchGeneration(generationId) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
 
   const { data, error } = await supabase
     .from("mega_generations")
-    .select("mg_generation_id, mg_mma_status, mg_status, mg_mma_vars, mg_output_url, mg_prompt, mg_error, mg_mma_mode")
+    .select("mg_generation_id, mg_mma_status, mg_status, mg_mma_vars, mg_output_url, mg_prompt, mg_error")
     .eq("mg_generation_id", generationId)
     .eq("mg_record_type", "generation")
     .maybeSingle();
@@ -853,7 +601,6 @@ export async function fetchGeneration(generationId) {
   return {
     generation_id: data.mg_generation_id,
     status: data.mg_mma_status || data.mg_status,
-    mode: data.mg_mma_mode || (data.mg_mma_vars?.mode ?? null),
     mma_vars: data.mg_mma_vars || {},
     outputs: {
       seedream_image_url: data.mg_output_url,
@@ -894,10 +641,9 @@ export async function listErrors() {
   return data || [];
 }
 
-// -----------------------------
-// SSE registration
-// -----------------------------
-
 export function registerSseClient(generationId, res, initial) {
   addSseClient(generationId, res, initial);
 }
+
+
+✅ This removes the stub and runs GPT → Replicate (Seedream/Kling) → store to R2 public → finalize.

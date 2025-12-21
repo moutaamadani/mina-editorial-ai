@@ -85,6 +85,7 @@ router.get("/generations/:generation_id", async (req, res) => {
 router.get("/stream/:generation_id", async (req, res) => {
   const supabase = getSupabaseAdmin();
   if (!supabase) return res.status(500).end();
+
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     Connection: "keep-alive",
@@ -101,6 +102,15 @@ router.get("/stream/:generation_id", async (req, res) => {
 
   const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
   const status = data?.mg_mma_status || "queued";
+
+  // Keepalive (Render/proxies like this)
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(`:keepalive\n\n`);
+    } catch {}
+  }, 25000);
+
+  res.on("close", () => clearInterval(keepAlive));
 
   registerSseClient(req.params.generation_id, res, { scanLines, status });
 });

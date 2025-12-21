@@ -211,33 +211,112 @@ function safeArray(x) {
   return Array.isArray(x) ? x : [];
 }
 
-function collectImageInputs(vars) {
+function buildSeedreamImageInputs(vars) {
   const assets = vars?.assets || {};
-  const out = [];
+  const product = assets.product_image_url || assets.productImageUrl || "";
+  const logo = assets.logo_image_url || assets.logoImageUrl || "";
+  const inspiration = safeArray(
+    assets.inspiration_image_urls || assets.inspirationImageUrls || assets.style_image_urls || assets.styleImageUrls
+  );
 
-  const product = assets.productImageUrl || assets.product_image_url;
-  const logo = assets.logoImageUrl || assets.logo_image_url;
-  const insp = safeArray(assets.styleImageUrls || assets.style_image_urls);
-
-  if (typeof product === "string" && product.startsWith("http")) out.push(product);
-  if (typeof logo === "string" && logo.startsWith("http")) out.push(logo);
-  for (const u of insp) if (typeof u === "string" && u.startsWith("http")) out.push(u);
-
-  // keep max 10 for seedream schema
-  return out.slice(0, 10);
+  return []
+    .concat(typeof product === "string" ? [product] : [])
+    .concat(inspiration)
+    .concat(typeof logo === "string" ? [logo] : [])
+    .filter((u) => typeof u === "string" && u.startsWith("http"))
+    .slice(0, 10);
 }
 
-function pickKlingImages(vars) {
+function getKlingFrames(vars) {
   const assets = vars?.assets || {};
   const arr = safeArray(assets.kling_images || assets.klingImages || assets.kling_image_urls);
-  const start = assets.start_image_url || assets.startImageUrl || arr[0] || assets.productImageUrl || "";
+  const start = assets.start_image_url || assets.startImageUrl || arr[0] || assets.product_image_url || assets.productImageUrl || "";
   const end = assets.end_image_url || assets.endImageUrl || arr[1] || "";
 
-  const s = typeof start === "string" ? start : "";
-  const e = typeof end === "string" ? end : "";
+  const clean = (url) => (typeof url === "string" && url.startsWith("http") ? url : "");
+  return { start: clean(start), end: clean(end) };
+}
+
+async function runSeedream({ prompt, aspectRatio, imageInputs = [] }) {
+  const replicate = getReplicate();
+
+  const size = process.env.MMA_SEADREAM_SIZE || "2K";
+  const enhancePromptRaw = process.env.MMA_SEADREAM_ENHANCE_PROMPT;
+  const enhance_prompt = enhancePromptRaw === undefined ? true : String(enhancePromptRaw).toLowerCase() === "true";
+
+  const defaultAspect = process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
+  const version =
+    process.env.MMA_SEADREAM_VERSION || process.env.MMA_SEADREAM_MODEL_VERSION || "bytedance/seedream-4";
+
+  const neg =
+    process.env.NEGATIVE_PROMPT_SEADREAM ||
+    process.env.MMA_NEGATIVE_PROMPT_SEADREAM ||
+    "";
+
+  const finalPrompt = neg ? `${prompt}\n\nAvoid: ${neg}` : prompt;
+
+  const cleanedInputs = Array.isArray(imageInputs)
+    ? imageInputs.filter((u) => typeof u === "string" && u.startsWith("http")).slice(0, 10)
+    : [];
+
+  const input = {
+    prompt: finalPrompt,
+    size,
+    aspect_ratio: aspectRatio || defaultAspect,
+    enhance_prompt,
+    sequential_image_generation: "disabled",
+    max_images: 1,
+    image_input: cleanedInputs,
+  };
+
+  const t0 = Date.now();
+  const out = await replicate.run(version, { input });
+
   return {
-    start: s.startsWith("http") ? s : "",
-    end: e.startsWith("http") ? e : "",
+    input,
+    out,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+  };
+}
+
+async function runKling({ prompt, startImage, endImage }) {
+  const replicate = getReplicate();
+
+  const duration = Number(process.env.MMA_KLING_DURATION || 5);
+  const version = process.env.MMA_KLING_VERSION || process.env.MMA_KLING_MODEL_VERSION || "kwaivgi/kling-v2.1";
+
+  const neg =
+    process.env.NEGATIVE_PROMPT_KLING ||
+    process.env.MMA_NEGATIVE_PROMPT_KLING ||
+    "";
+
+  const mode = endImage ? "pro" : process.env.MMA_KLING_MODE || "standard";
+
+  const input = {
+    mode,
+    prompt,
+    duration,
+    start_image: startImage,
+    ...(endImage ? { end_image: endImage } : {}),
+    ...(neg ? { negative_prompt: neg } : {}),
+  };
+
+  const t0 = Date.now();
+  const out = await replicate.run(version, { input });
+
+  return {
+    input,
+    out,
+    usedEnd: !!endImage,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
   };
 }
 
@@ -361,9 +440,6 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
     await updateStatus({ supabase, generationId, status: "generating" });
     sendStatus(generationId, "generating");
 
-    const replicate = getReplicate();
-    const t1 = Date.now();
-
     let remoteUrl = "";
     let usedPrompt = "";
 
@@ -371,19 +447,13 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
       usedPrompt = working.prompts.clean_prompt || "";
       if (!usedPrompt) throw new Error("EMPTY_PROMPT");
 
-      const imageInputs = collectImageInputs(working);
+      const imageInputs = buildSeedreamImageInputs(working);
 
-      const input = {
+      const { input, out, timing } = await runSeedream({
         prompt: usedPrompt,
-        // seedream schema supports these:
-        size: cfg.seadream.size,
-        enhance_prompt: cfg.seadream.enhancePrompt,
-        max_images: 1,
-        // optional reference images:
-        ...(imageInputs.length ? { image_input: imageInputs } : {}),
-      };
-
-      const out = await replicate.run(cfg.seadream.model, { input });
+        aspectRatio: working?.inputs?.aspect_ratio || "",
+        imageInputs,
+      });
       const url = pickFirstUrl(out);
       if (!url) throw new Error("SEADREAM_NO_URL");
 
@@ -395,7 +465,7 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
         payload: {
           input,
           output: out,
-          timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+          timing,
           error: null,
         },
       });
@@ -407,19 +477,14 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
       usedPrompt = working.prompts.motion_prompt || "";
       if (!usedPrompt) throw new Error("EMPTY_PROMPT");
 
-      const { start, end } = pickKlingImages(working);
-      if (!start) throw new Error("Kling requires a start image (start_image_url).");
+      const { start, end } = getKlingFrames(working);
+      if (!start) throw new Error("MISSING_START_IMAGE");
 
-      const input = {
+      const { input, out, usedEnd, timing } = await runKling({
         prompt: usedPrompt,
-        start_image: start,
-        // end_image only works in pro mode (your request)
-        ...(cfg.kling.mode === "pro" && end ? { end_image: end } : {}),
-        ...(cfg.kling.negativePrompt ? { negative_prompt: cfg.kling.negativePrompt } : {}),
-        mode: cfg.kling.mode,
-      };
-
-      const out = await replicate.run(cfg.kling.model, { input });
+        startImage: start,
+        endImage: end || null,
+      });
       const url = pickFirstUrl(out);
       if (!url) throw new Error("KLING_NO_URL");
 
@@ -429,9 +494,9 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
         stepNo: 2,
         stepType: "kling_generate",
         payload: {
-          input,
+          input: { ...input, used_end: usedEnd },
           output: out,
-          timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+          timing,
           error: null,
         },
       });

@@ -54,7 +54,7 @@ export function getSupabaseAdmin() {
   }
 }
 
-export async function upsertProfileRow({ userId, email, shopifyCustomerId }) {
+export async function upsertProfileRow({ userId, email, shopifyCustomerId /* unused for MMA */ }) {
   try {
     const supabase = getSupabaseAdmin();
     if (!supabase) return;
@@ -65,31 +65,40 @@ export async function upsertProfileRow({ userId, email, shopifyCustomerId }) {
     const now = new Date().toISOString();
     const mgId = userId ? `profile:${userId}` : `profile:${normalizedEmail}`;
 
+    // Preserve original created_at if row already exists
+    const { data: existing, error: readErr } = await supabase
+      .from("mega_admin")
+      .select("mg_created_at")
+      .eq("mg_id", mgId)
+      .maybeSingle();
+
+    if (readErr) console.error("[supabase] upsertProfileRow read error", readErr);
+
     const payload = {
       mg_id: mgId,
       mg_record_type: "profile",
       mg_user_id: userId && UUID_REGEX.test(userId) ? userId : null,
       mg_email: normalizedEmail,
-      mg_shopify_customer_id: shopifyCustomerId || null,
-      mg_created_at: now,
+
+      // MMA: do NOT write mg_shopify_customer_id (unused)
+      mg_created_at: existing?.mg_created_at || now,
       mg_updated_at: now,
+      mg_event_at: now,
+      mg_source_system: "app",
     };
 
-    const { error } = await supabase
-      .from("mega_admin")
-      .upsert(payload, { onConflict: "mg_id" });
-    if (error) {
-      console.error("[supabase] upsertProfileRow error", error);
-    }
+    const { error } = await supabase.from("mega_admin").upsert(payload, { onConflict: "mg_id" });
+    if (error) console.error("[supabase] upsertProfileRow error", error);
   } catch (err) {
     console.error("[supabase] upsertProfileRow failed", err);
   }
 }
 
-export async function upsertSessionRow({ userId, email, token, ip, userAgent }) {
+export async function upsertSessionRow({ userId, email, token, ip /* unused */, userAgent /* unused */ }) {
   try {
     const supabase = getSupabaseAdmin();
     if (!supabase) return;
+
     if (!token) {
       console.error("[supabase] upsertSessionRow missing token");
       return;
@@ -97,29 +106,43 @@ export async function upsertSessionRow({ userId, email, token, ip, userAgent }) 
 
     const normalizedEmail = normalizeEmail(email);
     const validUserId = userId && UUID_REGEX.test(userId) ? userId : null;
+
     const hash = crypto.createHash("sha256").update(String(token)).digest("hex");
     const now = new Date().toISOString();
 
+    const mgId = `admin_session:${hash}`;
+
+    // Preserve first_seen_at (+ created_at) so we don't reset it on every upsert
+    const { data: existing, error: readErr } = await supabase
+      .from("mega_admin")
+      .select("mg_first_seen_at, mg_created_at")
+      .eq("mg_id", mgId)
+      .maybeSingle();
+
+    if (readErr) console.error("[supabase] upsertSessionRow read error", readErr);
+
+    const firstSeenAt = existing?.mg_first_seen_at || now;
+    const createdAt = existing?.mg_created_at || now;
+
     const payload = {
-      mg_id: `admin_session:${hash}`,
+      mg_id: mgId,
       mg_record_type: "admin_session",
       mg_session_hash: hash,
       mg_user_id: validUserId,
       mg_email: normalizedEmail,
-      mg_ip: safeIp(ip),
-      mg_user_agent: safeUserAgent(userAgent),
-      mg_first_seen_at: now,
+
+      // MMA: do NOT write mg_ip / mg_user_agent (unused)
+      mg_first_seen_at: firstSeenAt,
       mg_last_seen_at: now,
-      mg_created_at: now,
+
+      mg_created_at: createdAt,
       mg_updated_at: now,
+      mg_event_at: now,
+      mg_source_system: "app",
     };
 
-    const { error } = await supabase
-      .from("mega_admin")
-      .upsert(payload, { onConflict: "mg_id" });
-    if (error) {
-      console.error("[supabase] upsertSessionRow error", error);
-    }
+    const { error } = await supabase.from("mega_admin").upsert(payload, { onConflict: "mg_id" });
+    if (error) console.error("[supabase] upsertSessionRow error", error);
   } catch (err) {
     console.error("[supabase] upsertSessionRow failed", err);
   }
@@ -129,11 +152,12 @@ export async function logAdminAction({
   userId,
   email,
   action,
-  route,
-  method,
+  route /* unused for MMA */,
+  method /* unused for MMA */,
   status,
   detail,
   id,
+  actorPassId = null,
 }) {
   try {
     const supabase = getSupabaseAdmin();
@@ -146,21 +170,25 @@ export async function logAdminAction({
     const payload = {
       mg_id: id ? `admin_audit:${id}` : `admin_audit:${crypto.randomUUID()}`,
       mg_record_type: "admin_audit",
+
+      // Optional but supported by your schema
+      mg_actor_pass_id: actorPassId ? String(actorPassId) : null,
+
       mg_user_id: validUserId,
       mg_email: normalizedEmail,
       mg_action: action || null,
-      mg_route: route || null,
-      mg_method: method || null,
       mg_status: typeof status === "number" ? status : null,
       mg_detail: detail ?? null,
+
+      // MMA: do NOT write mg_route / mg_method (unused)
       mg_created_at: now,
       mg_updated_at: now,
+      mg_event_at: now,
+      mg_source_system: "app",
     };
 
     const { error } = await supabase.from("mega_admin").upsert(payload, { onConflict: "mg_id" });
-    if (error) {
-      console.error("[supabase] logAdminAction error", error);
-    }
+    if (error) console.error("[supabase] logAdminAction error", error);
   } catch (err) {
     console.error("[supabase] logAdminAction failed", err);
   }

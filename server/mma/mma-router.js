@@ -15,47 +15,55 @@ const router = express.Router();
 
 router.post("/still/create", async (req, res) => {
   try {
-    const result = await handleMmaCreate({ mode: "still", body: req.body });
+    const result = await handleMmaCreate({ mode: "still", body: req.body, req });
     res.json(result);
   } catch (err) {
     console.error("[mma] still/create error", err);
-    res.status(500).json({ error: "MMA_CREATE_FAILED", message: err?.message });
+    res.status(err?.statusCode || 500).json({ error: "MMA_CREATE_FAILED", message: err?.message });
   }
 });
 
 router.post("/still/:generation_id/tweak", async (req, res) => {
   try {
-    const result = await handleMmaCreate({ mode: "still", body: { ...req.body, generation_id: req.params.generation_id } });
+    const result = await handleMmaCreate({
+      mode: "still",
+      body: { ...req.body, parent_generation_id: req.params.generation_id },
+      req,
+    });
     res.json(result);
   } catch (err) {
     console.error("[mma] still tweak error", err);
-    res.status(500).json({ error: "MMA_TWEAK_FAILED", message: err?.message });
+    res.status(err?.statusCode || 500).json({ error: "MMA_TWEAK_FAILED", message: err?.message });
   }
 });
 
 router.post("/video/animate", async (req, res) => {
   try {
-    const result = await handleMmaCreate({ mode: "video", body: req.body });
+    const result = await handleMmaCreate({ mode: "video", body: req.body, req });
     res.json(result);
   } catch (err) {
     console.error("[mma] video animate error", err);
-    res.status(500).json({ error: "MMA_ANIMATE_FAILED", message: err?.message });
+    res.status(err?.statusCode || 500).json({ error: "MMA_ANIMATE_FAILED", message: err?.message });
   }
 });
 
 router.post("/video/:generation_id/tweak", async (req, res) => {
   try {
-    const result = await handleMmaCreate({ mode: "video", body: { ...req.body, generation_id: req.params.generation_id } });
+    const result = await handleMmaCreate({
+      mode: "video",
+      body: { ...req.body, parent_generation_id: req.params.generation_id },
+      req,
+    });
     res.json(result);
   } catch (err) {
     console.error("[mma] video tweak error", err);
-    res.status(500).json({ error: "MMA_VIDEO_TWEAK_FAILED", message: err?.message });
+    res.status(err?.statusCode || 500).json({ error: "MMA_VIDEO_TWEAK_FAILED", message: err?.message });
   }
 });
 
 router.post("/events", async (req, res) => {
   try {
-    const result = await handleMmaEvent(req.body || {});
+    const result = await handleMmaEvent(req.body || {}, req);
     res.json(result);
   } catch (err) {
     console.error("[mma] events error", err);

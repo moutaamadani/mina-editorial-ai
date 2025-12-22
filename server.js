@@ -35,9 +35,6 @@ import mmaRouter from "./server/mma/mma-router.js";
 
 // Admin MMA logs router (optional, your existing file)
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
-import { registerShopifySync } from "./shopifySyncRoute.js";
-
-registerShopifySync(app);
 
 // ======================================================
 // Env / app boot
@@ -48,6 +45,9 @@ const PORT = Number(ENV.PORT || 8080);
 
 const app = express();
 app.set("trust proxy", 1);
+
+import { registerShopifySync } from "./shopifySyncRoute.js";
+registerShopifySync(app);
 
 function nowIso() {
   return new Date().toISOString();

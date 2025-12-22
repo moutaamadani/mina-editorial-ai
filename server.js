@@ -30,11 +30,19 @@ import {
 
 import { requireAdmin } from "./auth.js";
 
-// MMA router (your Part 3 router)
 import mmaRouter from "./server/mma/mma-router.js";
-
-// Admin MMA logs router (optional, your existing file)
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
+
+import { registerShopifySync } from "./shopifySyncRoute.js";
+
+// R2 helpers (you already have this file)
+import {
+  makeKey,
+  publicUrlForKey,
+  putBufferToR2,
+  storeRemoteImageToR2,
+  parseDataUrl,
+} from "./r2.js";
 
 // ======================================================
 // Env / app boot
@@ -46,8 +54,6 @@ const PORT = Number(ENV.PORT || 8080);
 const app = express();
 app.set("trust proxy", 1);
 
-
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -57,6 +63,65 @@ function safeString(v, fallback = "") {
   const s = typeof v === "string" ? v : String(v);
   const t = s.trim();
   return t ? t : fallback;
+}
+
+// ======================================================
+// PassId normalization (FIX for your 500)
+// DB: mega_customers.mg_pass_id is UUID
+// Frontend sometimes sends passId like "pass:anon:<uuid>"
+// ======================================================
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function canonicalizeToUuidPassId(raw) {
+  const s = safeString(raw, "").trim();
+  if (!s) return crypto.randomUUID();
+
+  if (UUID_RE.test(s)) return s;
+
+  const m = s.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i
+  );
+  if (m?.[0]) return m[0];
+
+  return crypto.randomUUID();
+}
+
+function setPassIdHeader(res, passId) {
+  if (passId) res.set("X-Mina-Pass-Id", passId);
+}
+
+async function resolvePassIdForAuthUser({ userId, email }) {
+  if (!sbEnabled()) return null;
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  // Prefer mg_user_id match (stable)
+  if (userId) {
+    const { data } = await supabase
+      .from("mega_customers")
+      .select("mg_pass_id")
+      .eq("mg_user_id", userId)
+      .maybeSingle();
+    if (data?.mg_pass_id) return String(data.mg_pass_id);
+  }
+
+  // Fallback to email match
+  if (email) {
+    const { data } = await supabase
+      .from("mega_customers")
+      .select("mg_pass_id")
+      .eq("mg_email", String(email).toLowerCase())
+      .maybeSingle();
+    if (data?.mg_pass_id) return String(data.mg_pass_id);
+  }
+
+  return null;
+}
+
+function resolvePassIdForRequest(req, bodyLike = {}) {
+  const raw = megaResolvePassId(req, bodyLike);
+  return canonicalizeToUuidPassId(raw);
 }
 
 // ======================================================
@@ -131,38 +196,6 @@ app.use((_req, res, next) => {
   res.set("Access-Control-Expose-Headers", headers.join(", "));
   next();
 });
-// ======================================================
-// Public stats (used by AuthGate UI)
-// ======================================================
-app.get("/public/stats/total-users", async (_req, res) => {
-  try {
-    // If Supabase isn't configured, still return a valid response
-    if (!sbEnabled()) {
-      return res.status(200).json({ ok: true, totalUsers: 0, degraded: true });
-    }
-
-    const supabase = getSupabaseAdmin();
-    const { count, error } = await supabase
-      .from("mega_customers")
-      .select("mg_pass_id", { count: "exact", head: true });
-
-    if (error) throw error;
-
-    return res.status(200).json({
-      ok: true,
-      totalUsers: count ?? 0,
-      source: "mega_customers",
-    });
-  } catch (e) {
-    console.error("GET /public/stats/total-users failed", e);
-    return res.status(200).json({
-      ok: true,
-      totalUsers: 0,
-      degraded: true,
-      degradedReason: e?.message || String(e),
-    });
-  }
-});
 
 // ======================================================
 // Shopify webhook (RAW body + HMAC verify) — MEGA credits
@@ -225,6 +258,7 @@ async function shopifyAdminFetch(path, { method = "GET", body = null } = {}) {
 
   return json;
 }
+
 async function resolveExistingPassIdForOrder({ shopifyCustomerId, email }) {
   try {
     const supabase = getSupabaseAdmin();
@@ -318,7 +352,6 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const orderId = order?.id != null ? String(order.id) : null;
     if (!orderId) return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID", requestId });
 
-    // idempotency
     const already = await megaHasCreditRef({ refType: "shopify_order", refId: orderId });
     if (already) return res.status(200).json({ ok: true, requestId, alreadyProcessed: true, orderId });
 
@@ -338,14 +371,14 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
 
     const existingPassId = await resolveExistingPassIdForOrder({ shopifyCustomerId, email });
 
-const passId =
-  existingPassId ||
-  (shopifyCustomerId
-    ? `pass:shopify:${shopifyCustomerId}`
-    : email
-      ? `pass:email:${email}`
-      : `pass:anon:${crypto.randomUUID()}`);
-
+    const passId = canonicalizeToUuidPassId(
+      existingPassId ||
+        (shopifyCustomerId
+          ? `pass:shopify:${shopifyCustomerId}`
+          : email
+            ? `pass:email:${email}`
+            : `pass:anon:${crypto.randomUUID()}`)
+    );
 
     await megaEnsureCustomer({
       passId,
@@ -393,7 +426,6 @@ const passId =
     });
   }
 });
-import { registerShopifySync } from "./shopifySyncRoute.js";
 
 // ======================================================
 // Standard body parsers
@@ -402,9 +434,188 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // ======================================================
-// Shopify lead capture (optional) — does NOT affect auth UI
+// Public stats (used by frontend on login) — FIX 404
+// ======================================================
+app.get("/public/stats/total-users", async (_req, res) => {
+  try {
+    if (!sbEnabled()) return res.status(200).json({ ok: true, totalUsers: 0, degraded: true });
+
+    const supabase = getSupabaseAdmin();
+    const { count, error } = await supabase
+      .from("mega_customers")
+      .select("mg_pass_id", { count: "exact", head: true });
+
+    if (error) throw error;
+
+    return res.status(200).json({ ok: true, totalUsers: count ?? 0, source: "mega_customers" });
+  } catch (e) {
+    console.error("GET /public/stats/total-users failed", e);
+    return res.status(200).json({ ok: true, totalUsers: 0, degraded: true });
+  }
+});
+
+// ======================================================
+// Shopify lead capture (your /auth/shopify-sync etc)
 // ======================================================
 registerShopifySync(app);
+
+// ======================================================
+// REAL R2 signed upload (fixes /api/r2/upload-signed 404)
+// ======================================================
+function assertR2Env() {
+  const need = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"];
+  const missing = need.filter((k) => !safeString(process.env[k], ""));
+  if (missing.length) {
+    const err = new Error(`R2_MISSING_ENV: ${missing.join(", ")}`);
+    err.status = 500;
+    throw err;
+  }
+}
+
+function r2Endpoint() {
+  const account = safeString(process.env.R2_ACCOUNT_ID, "");
+  const override = safeString(process.env.R2_ENDPOINT, "");
+  return override || (account ? `https://${account}.r2.cloudflarestorage.com` : "");
+}
+
+async function presignPutUrl({ key, contentType, expiresIn = 600 }) {
+  assertR2Env();
+
+  const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
+  // IMPORTANT: this dependency must exist (see package.json step below)
+  const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+
+  const client = new S3Client({
+    region: "auto",
+    endpoint: r2Endpoint(),
+    credentials: {
+      accessKeyId: safeString(process.env.R2_ACCESS_KEY_ID, ""),
+      secretAccessKey: safeString(process.env.R2_SECRET_ACCESS_KEY, ""),
+    },
+  });
+
+  const Bucket = safeString(process.env.R2_BUCKET, "");
+  const cmd = new PutObjectCommand({
+    Bucket,
+    Key: key,
+    ContentType: contentType || "application/octet-stream",
+    CacheControl: "public, max-age=31536000, immutable",
+    ContentDisposition: "inline",
+  });
+
+  const signedUrl = await getSignedUrl(client, cmd, { expiresIn });
+  return signedUrl;
+}
+
+// Browser uses this: get signed PUT URL, then uploads directly to R2
+app.post("/api/r2/upload-signed", async (req, res) => {
+  const requestId = `r2sign_${Date.now()}_${crypto.randomUUID()}`;
+  try {
+    const body = req.body || {};
+
+    // Determine passId (UUID)
+    const passId = resolvePassIdForRequest(req, body);
+    setPassIdHeader(res, passId);
+
+    // If frontend sends dataUrl/base64, we can upload server-side too
+    const dataUrl = safeString(body.dataUrl || body.data_url, "");
+    const base64 = safeString(body.base64 || body.fileBase64 || body.file_base64, "");
+    const contentTypeFromBody = safeString(body.contentType || body.content_type, "");
+
+    if (dataUrl) {
+      const parsed = parseDataUrl(dataUrl);
+      const key = makeKey({
+        kind: safeString(body.kind, "uploads"),
+        customerId: passId,
+        filename: safeString(body.filename, `upload.${parsed.ext || "bin"}`),
+        contentType: parsed.contentType,
+      });
+
+      const stored = await putBufferToR2({ key, buffer: parsed.buffer, contentType: parsed.contentType });
+      return res.status(200).json({ ok: true, requestId, passId, key: stored.key, publicUrl: stored.publicUrl, url: stored.publicUrl });
+    }
+
+    if (base64) {
+      const buf = Buffer.from(base64, "base64");
+      const ct = contentTypeFromBody || "application/octet-stream";
+      const key = makeKey({
+        kind: safeString(body.kind, "uploads"),
+        customerId: passId,
+        filename: safeString(body.filename, "upload"),
+        contentType: ct,
+      });
+
+      const stored = await putBufferToR2({ key, buffer: buf, contentType: ct });
+      return res.status(200).json({ ok: true, requestId, passId, key: stored.key, publicUrl: stored.publicUrl, url: stored.publicUrl });
+    }
+
+    // Signed upload (normal flow)
+    const filename = safeString(body.filename, "upload");
+    const contentType = contentTypeFromBody || "application/octet-stream";
+    const kind = safeString(body.kind, "uploads");
+
+    const key = makeKey({ kind, customerId: passId, filename, contentType });
+    const publicUrl = publicUrlForKey(key);
+
+    const uploadUrl = await presignPutUrl({ key, contentType, expiresIn: 600 });
+
+    return res.status(200).json({
+      ok: true,
+      requestId,
+      passId,
+      key,
+      uploadUrl,      // frontend should PUT to this
+      putUrl: uploadUrl,
+      signedUrl: uploadUrl,
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      publicUrl,      // permanent read URL
+      url: publicUrl,
+      expiresIn: 600,
+    });
+  } catch (e) {
+    console.error("POST /api/r2/upload-signed failed", e);
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "R2_SIGN_FAILED",
+      message: e?.message || String(e),
+    });
+  }
+});
+
+// Store remote URL into R2 (optional but useful)
+app.post("/api/r2/store-remote-signed", async (req, res) => {
+  const requestId = `r2remote_${Date.now()}_${crypto.randomUUID()}`;
+  try {
+    const body = req.body || {};
+    const passId = resolvePassIdForRequest(req, body);
+    setPassIdHeader(res, passId);
+
+    const remoteUrl = safeString(body.url || body.remoteUrl || body.remote_url, "");
+    if (!remoteUrl) return res.status(400).json({ ok: false, requestId, error: "MISSING_URL" });
+
+    const kind = safeString(body.kind, "generations");
+    const stored = await storeRemoteImageToR2({ url: remoteUrl, kind, customerId: passId });
+
+    return res.status(200).json({
+      ok: true,
+      requestId,
+      passId,
+      key: stored.key,
+      publicUrl: stored.publicUrl,
+      url: stored.publicUrl,
+    });
+  } catch (e) {
+    console.error("POST /api/r2/store-remote-signed failed", e);
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "R2_STORE_REMOTE_FAILED",
+      message: e?.message || String(e),
+    });
+  }
+});
 
 // ======================================================
 // Auth helper (service role validates a user token)
@@ -437,19 +648,9 @@ async function getAuthUser(req) {
   return { userId, email, token };
 }
 
-function resolvePassIdForRequest(req, bodyLike = {}) {
-  // Uses YOUR mega-db.js resolver: body.customerId -> header x-mina-pass-id -> anon
-  return megaResolvePassId(req, bodyLike);
-}
-
-function setPassIdHeader(res, passId) {
-  if (passId) res.set("X-Mina-Pass-Id", passId);
-}
-
 // ======================================================
 // Core routes (MEGA-only)
 // ======================================================
-
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -466,10 +667,17 @@ app.get("/me", async (req, res) => {
   try {
     const authUser = await getAuthUser(req);
 
-    // passId: header/body -> anon, but if authed and no header, stabilize to pass:user:<id>
-    const incomingHeader = safeString(req.get("x-mina-pass-id"), "");
-    let passId = resolvePassIdForRequest(req, {});
-    if (authUser?.userId && !incomingHeader) passId = `pass:user:${authUser.userId}`;
+    // If client already has a passId header, use it (but normalize to UUID)
+    const incoming = safeString(req.get("x-mina-pass-id"), "");
+    let passId = incoming ? canonicalizeToUuidPassId(incoming) : null;
+
+    // If authed and no header, reuse existing customer UUID (by userId/email)
+    if (!passId && authUser?.userId) {
+      passId = await resolvePassIdForAuthUser({ userId: authUser.userId, email: authUser.email });
+    }
+
+    // Otherwise, fall back to resolver (then normalize)
+    if (!passId) passId = resolvePassIdForRequest(req, {});
 
     setPassIdHeader(res, passId);
 
@@ -719,7 +927,7 @@ app.post("/feedback", async (req, res) => {
 // ======================================================
 app.use("/mma", mmaRouter);
 
-// Optional: separate admin log router (your file)
+// Optional: separate admin log router
 app.use("/admin/mma", mmaLogAdminRouter);
 
 // ======================================================
@@ -766,10 +974,10 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
       return res.status(400).json({ ok: false, requestId, error: "passId and numeric delta are required" });
     }
 
-    await megaEnsureCustomer({ passId: String(passId) });
+    await megaEnsureCustomer({ passId: canonicalizeToUuidPassId(passId) });
 
     const out = await megaAdjustCredits({
-      passId: String(passId),
+      passId: canonicalizeToUuidPassId(passId),
       delta,
       reason: safeString(reason, "admin-adjust"),
       source: "admin",
@@ -781,7 +989,7 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
     res.json({
       ok: true,
       requestId,
-      passId: String(passId),
+      passId: canonicalizeToUuidPassId(passId),
       creditsBefore: out.creditsBefore,
       creditsAfter: out.creditsAfter,
       expiresAt: out.expiresAt,

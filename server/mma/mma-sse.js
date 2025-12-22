@@ -1,4 +1,4 @@
-// Hero Part 4: Tiny in-memory SSE hub for MMA streams
+// ./server/mma/mma-sse.js Part 4: Tiny in-memory SSE hub for MMA streams
 // Part 4.1: Manages per-generation subscribers and forwards pipeline events.
 const clients = new Map();
 

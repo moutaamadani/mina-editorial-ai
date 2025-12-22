@@ -1,4 +1,4 @@
-// server.js — Pure MMA + MEGA wired (Supabase service role). Includes R2 signed upload + public stats.
+// server.js — MMA + MEGA only (no /me dependency). Includes R2 signed upload + history + feedback/like + Shopify sync no-404.
 "use strict";
 
 import "dotenv/config";
@@ -13,13 +13,11 @@ import { normalizeError } from "./server/logging/normalizeError.js";
 import { logError } from "./server/logging/logError.js";
 import { errorMiddleware } from "./server/logging/errorMiddleware.js";
 
-import {
-  getSupabaseAdmin,
-  sbEnabled,
-  logAdminAction,
-  upsertSessionRow,
-  upsertProfileRow,
-} from "./supabase.js";
+import { getSupabaseAdmin, sbEnabled, logAdminAction } from "./supabase.js";
+import { requireAdmin } from "./auth.js";
+
+import mmaRouter from "./server/mma/mma-router.js";
+import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 
 import {
   resolvePassId as megaResolvePassId,
@@ -30,11 +28,6 @@ import {
   megaWriteSession,
   megaWriteFeedback,
 } from "./mega-db.js";
-
-import { requireAdmin } from "./auth.js";
-
-import mmaRouter from "./server/mma/mma-router.js";
-import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 
 import {
   makeKey,
@@ -65,12 +58,17 @@ function safeString(v, fallback = "") {
   return t ? t : fallback;
 }
 
-// Frontend sometimes sends pass:anon:<uuid> but DB stores just <uuid>
+// Keep pass:user:* intact.
+// For pass:anon:* you can choose to store full or short; this keeps your old behavior (short) to match existing DB.
 function normalizeIncomingPassId(raw) {
   const s = safeString(raw, "");
   if (!s) return "";
   if (s.startsWith("pass:anon:")) return s.slice("pass:anon:".length).trim();
   return s;
+}
+
+function setPassIdHeader(res, passId) {
+  if (passId) res.set("X-Mina-Pass-Id", passId);
 }
 
 // ======================================================
@@ -109,7 +107,7 @@ process.on("uncaughtException", async (err) => {
 });
 
 // ======================================================
-// CORS (your API CORS, NOT R2 CORS)
+// CORS
 // ======================================================
 const defaultAllowlist = ["https://mina.faltastudio.com", "https://mina-app-bvpn.onrender.com"];
 const envAllowlist = (ENV.CORS_ORIGINS || "")
@@ -166,7 +164,6 @@ app.get("/public/stats/total-users", async (_req, res) => {
     return res.status(200).json({ ok: true, totalUsers: 0, degraded: true });
   }
 });
-
 
 // ======================================================
 // Shopify webhook (RAW body + HMAC verify) — MEGA credits
@@ -298,7 +295,6 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
-    // keep your existing scheme; megaEnsureCustomer will merge by email/userId when it can
     const passId =
       shopifyCustomerId
         ? `pass:shopify:${shopifyCustomerId}`
@@ -350,123 +346,6 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // ======================================================
-// R2 signed upload endpoints (fixes /api/r2/upload-signed 404)
-// ======================================================
-const R2_ACCOUNT_ID = ENV.R2_ACCOUNT_ID || "";
-const R2_ACCESS_KEY_ID = ENV.R2_ACCESS_KEY_ID || "";
-const R2_SECRET_ACCESS_KEY = ENV.R2_SECRET_ACCESS_KEY || "";
-const R2_BUCKET = ENV.R2_BUCKET || "";
-
-function r2Enabled() {
-  return Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
-}
-
-function getR2S3Client() {
-  if (!r2Enabled()) return null;
-
-  const endpoint = `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-
-  // forcePathStyle makes the URL: https://<account>.r2.cloudflarestorage.com/<bucket>/<key>
-  // This avoids bucket-subdomain signing issues and is the most reliable for R2.
-  return new S3Client({
-    region: "auto",
-    endpoint,
-    forcePathStyle: true,
-    credentials: {
-      accessKeyId: R2_ACCESS_KEY_ID,
-      secretAccessKey: R2_SECRET_ACCESS_KEY,
-    },
-  });
-}
-
-// Create signed PUT URL for browser upload
-app.post("/api/r2/upload-signed", async (req, res) => {
-  try {
-    if (!r2Enabled()) return res.status(503).json({ ok: false, error: "R2_NOT_CONFIGURED" });
-
-    const body = req.body || {};
-    const kind = safeString(body.kind, "uploads");
-    const filename = safeString(body.filename, "upload");
-    const contentType = safeString(body.contentType, "application/octet-stream");
-
-    const rawPass =
-      body.passId || body.customerId || req.get("x-mina-pass-id") || req.query.passId || req.query.customerId;
-    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
-
-    const key = makeKey({ kind, customerId: passId, filename, contentType });
-
-    const client = getR2S3Client();
-    const cmd = new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-      ContentType: contentType,   // ok if client sends same Content-Type (you do)
-
-      // IMPORTANT: do NOT set ContentDisposition/CacheControl here,
-      // otherwise the browser must send matching headers and CORS/preflight becomes painful.
-    });
-
-    const uploadUrl = await getSignedUrl(client, cmd, { expiresIn: 600 });
-
-    const publicUrl = publicUrlForKey(key);
-
-    return res.status(200).json({
-      ok: true,
-      key,
-      uploadUrl,
-      publicUrl,
-      url: publicUrl,
-      expiresIn: 600,
-    });
-  } catch (e) {
-    console.error("POST /api/r2/upload-signed failed", e);
-    return res.status(500).json({ ok: false, error: "UPLOAD_SIGN_FAILED", message: e?.message || String(e) });
-  }
-});
-
-// Store a remote URL into R2 server-side (no browser CORS involved)
-app.post("/api/r2/store-remote-signed", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const url = safeString(body.url, "");
-    if (!url) return res.status(400).json({ ok: false, error: "MISSING_URL" });
-
-    const kind = safeString(body.kind, "generations");
-    const rawPass = body.passId || body.customerId || req.get("x-mina-pass-id");
-    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
-
-    const out = await storeRemoteImageToR2({ url, kind, customerId: passId });
-
-    return res.status(200).json({ ok: true, key: out.key, publicUrl: out.publicUrl, url: out.publicUrl });
-  } catch (e) {
-    console.error("POST /api/r2/store-remote-signed failed", e);
-    return res.status(500).json({ ok: false, error: "STORE_REMOTE_FAILED", message: e?.message || String(e) });
-  }
-});
-
-// Optional: accept base64 dataUrl and upload server-side (also avoids browser→R2 CORS)
-app.post("/api/r2/upload-dataurl", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const dataUrl = safeString(body.dataUrl, "");
-    if (!dataUrl) return res.status(400).json({ ok: false, error: "MISSING_DATAURL" });
-
-    const kind = safeString(body.kind, "uploads");
-    const filename = safeString(body.filename, "upload");
-    const rawPass = body.passId || body.customerId || req.get("x-mina-pass-id");
-    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
-
-    const parsed = parseDataUrl(dataUrl);
-    const key = makeKey({ kind, customerId: passId, filename, contentType: parsed.contentType });
-
-    const out = await putBufferToR2({ key, buffer: parsed.buffer, contentType: parsed.contentType });
-    return res.status(200).json({ ok: true, key: out.key, publicUrl: out.publicUrl, url: out.publicUrl });
-  } catch (e) {
-    console.error("POST /api/r2/upload-dataurl failed", e);
-    return res.status(500).json({ ok: false, error: "UPLOAD_DATAURL_FAILED", message: e?.message || String(e) });
-  }
-});
-
-// ======================================================
 // Auth helper (service role validates a user token)
 // ======================================================
 function getBearerToken(req) {
@@ -501,70 +380,47 @@ function resolvePassIdForRequest(req, bodyLike = {}) {
   return megaResolvePassId(req, bodyLike);
 }
 
-function setPassIdHeader(res, passId) {
-  if (passId) res.set("X-Mina-Pass-Id", passId);
-}
-
 // ======================================================
-// Core routes (MEGA-only)
+// Health
 // ======================================================
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    service: "Mina MMA API (MEGA-only)",
+    service: "Mina MMA API (MMA+MEGA)",
     time: nowIso(),
     supabase: sbEnabled(),
     env: IS_PROD ? "production" : "development",
   });
 });
 
-app.get("/me", async (req, res) => {
-  const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
-
+// ======================================================
+// Shopify sync (frontend calls this; must NOT 404)
+// NOTE: NO /me required. This is a tiny helper only.
+// ======================================================
+app.post("/auth/shopify-sync", async (req, res) => {
   try {
     const authUser = await getAuthUser(req);
 
-    const incomingHeader = safeString(req.get("x-mina-pass-id"), "");
-    let passId = normalizeIncomingPassId(resolvePassIdForRequest(req, {}));
-    if (authUser?.userId && !incomingHeader) passId = normalizeIncomingPassId(`pass:user:${authUser.userId}`);
+    if (!authUser?.userId) {
+      return res.status(200).json({ ok: true, loggedIn: false });
+    }
 
+    const passId = normalizeIncomingPassId(`pass:user:${authUser.userId}`);
     setPassIdHeader(res, passId);
 
-    if (!sbEnabled()) {
-      return res.json({
-        ok: true,
-        requestId,
-        user: authUser ? { id: authUser.userId, email: authUser.email } : null,
-        passId,
-        degraded: true,
-        degradedReason: "Supabase not configured",
-      });
+    if (sbEnabled()) {
+      await megaEnsureCustomer({ passId, userId: authUser.userId, email: authUser.email || null });
     }
 
-    if (authUser) {
-      void upsertProfileRow({ userId: authUser.userId, email: authUser.email });
-      void upsertSessionRow({
-        userId: authUser.userId,
-        email: authUser.email,
-        token: authUser.token,
-        ip: req.ip,
-        userAgent: req.get("user-agent"),
-      });
-
-      await megaEnsureCustomer({ passId, userId: authUser.userId, email: authUser.email });
-    } else {
-      await megaEnsureCustomer({ passId });
-    }
-
-    return res.json({ ok: true, requestId, user: authUser ? { id: authUser.userId, email: authUser.email } : null, passId });
-  } catch (e) {
-    console.error("GET /me failed", e);
-    const fallback = normalizeIncomingPassId(resolvePassIdForRequest(req, {}));
-    setPassIdHeader(res, fallback);
-    return res.status(200).json({ ok: true, requestId, user: null, passId: fallback, degraded: true });
+    return res.status(200).json({ ok: true, loggedIn: true, passId, email: authUser.email || null });
+  } catch {
+    return res.status(200).json({ ok: true, loggedIn: false, degraded: true });
   }
 });
 
+// ======================================================
+// Credits / Sessions / History / Feedback (MEGA)
+// ======================================================
 app.get("/credits/balance", async (req, res) => {
   const requestId = `credits_${Date.now()}_${crypto.randomUUID()}`;
 
@@ -573,54 +429,16 @@ app.get("/credits/balance", async (req, res) => {
 
     const q = normalizeIncomingPassId(req.query.customerId || req.query.passId || "");
     const passId = q || normalizeIncomingPassId(resolvePassIdForRequest(req, { customerId: q }));
-
     setPassIdHeader(res, passId);
 
     const authUser = await getAuthUser(req);
     await megaEnsureCustomer({ passId, userId: authUser?.userId || null, email: authUser?.email || null });
 
     const { credits, expiresAt } = await megaGetCredits(passId);
-
     return res.json({ ok: true, requestId, passId, balance: credits, expiresAt, source: "mega_customers" });
   } catch (e) {
     console.error("GET /credits/balance failed", e);
     return res.status(500).json({ ok: false, requestId, error: "CREDITS_FAILED", message: e?.message || String(e) });
-  }
-});
-
-app.post("/credits/add", async (req, res) => {
-  const requestId = `add_${Date.now()}_${crypto.randomUUID()}`;
-
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-
-    const body = req.body || {};
-    const amount = typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
-
-    if (!Number.isFinite(amount) || amount === 0) {
-      return res.status(400).json({ ok: false, requestId, error: "INVALID_AMOUNT" });
-    }
-
-    const passId = normalizeIncomingPassId(resolvePassIdForRequest(req, body));
-    setPassIdHeader(res, passId);
-
-    const authUser = await getAuthUser(req);
-    await megaEnsureCustomer({ passId, userId: authUser?.userId || null, email: authUser?.email || null });
-
-    const out = await megaAdjustCredits({
-      passId,
-      delta: amount,
-      reason: safeString(body.reason, "manual-topup"),
-      source: safeString(body.source, "api"),
-      refType: "manual",
-      refId: requestId,
-      grantedAt: nowIso(),
-    });
-
-    return res.json({ ok: true, requestId, passId, creditsBefore: out.creditsBefore, creditsAfter: out.creditsAfter, expiresAt: out.expiresAt });
-  } catch (e) {
-    console.error("POST /credits/add failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "CREDITS_ADD_FAILED", message: e?.message || String(e) });
   }
 });
 
@@ -649,15 +467,132 @@ app.post("/sessions/start", async (req, res) => {
       meta: { requestId, ip: req.ip, userAgent: req.get("user-agent") },
     });
 
-    return res.json({ ok: true, requestId, passId, session: { id: sessionId, platform, title, createdAt: nowIso() } });
+    return res.json({
+      ok: true,
+      requestId,
+      passId,
+      sessionId,
+      session: { id: sessionId, platform, title, createdAt: nowIso() },
+    });
   } catch (e) {
     console.error("POST /sessions/start failed", e);
     return res.status(500).json({ ok: false, requestId, error: "SESSION_FAILED", message: e?.message || String(e) });
   }
 });
 
-app.post("/feedback", async (req, res) => {
-  const requestId = `fb_${Date.now()}_${crypto.randomUUID()}`;
+// ✅ Matches your frontend: GET /history/pass/:passId
+app.get("/history/pass/:passId", async (req, res) => {
+  const requestId = `hist_${Date.now()}_${crypto.randomUUID()}`;
+
+  try {
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
+
+    const raw = safeString(req.params.passId, "");
+    const passId = normalizeIncomingPassId(raw);
+    setPassIdHeader(res, passId);
+
+    const authUser = await getAuthUser(req);
+    await megaEnsureCustomer({ passId, userId: authUser?.userId || null, email: authUser?.email || null });
+
+    const { credits, expiresAt } = await megaGetCredits(passId);
+
+    // These table names are the standard MEGA setup.
+    // If your DB uses slightly different names, change ONLY these 2 strings.
+    const supabase = getSupabaseAdmin();
+
+    const { data: gensRaw, error: gensErr } = await supabase
+      .from("mega_generations")
+      .select("*")
+      .eq("pass_id", passId)
+      .order("created_at", { ascending: false });
+
+    if (gensErr) throw gensErr;
+
+    const { data: fbsRaw, error: fbsErr } = await supabase
+      .from("mega_feedback")
+      .select("*")
+      .eq("pass_id", passId)
+      .order("created_at", { ascending: false });
+
+    if (fbsErr) {
+      // tolerate if feedback table is named differently
+      // (frontend still works with empty feedback list)
+      console.warn("[history] mega_feedback query failed:", fbsErr?.message || fbsErr);
+    }
+
+    const generations = (gensRaw || []).map((r) => ({
+      id: String(r.id ?? r.generation_id ?? r.mg_id ?? ""),
+      type: String(r.type ?? r.result_type ?? "image"),
+      sessionId: String(r.session_id ?? r.sessionId ?? ""),
+      passId: String(r.pass_id ?? passId),
+      platform: String(r.platform ?? "web"),
+      prompt: String(r.prompt ?? ""),
+      outputUrl: String(r.output_url ?? r.outputUrl ?? r.public_url ?? r.url ?? ""),
+      createdAt: String(r.created_at ?? r.createdAt ?? nowIso()),
+      meta: r.meta ?? null,
+    }));
+
+    const feedbacks = (fbsRaw || []).map((r) => ({
+      id: String(r.id ?? r.fb_id ?? ""),
+      passId: String(r.pass_id ?? passId),
+      resultType: String(r.result_type ?? r.resultType ?? "image"),
+      platform: String(r.platform ?? "web"),
+      prompt: String(r.prompt ?? ""),
+      comment: String(r.comment ?? ""),
+      imageUrl: r.image_url ? String(r.image_url) : undefined,
+      videoUrl: r.video_url ? String(r.video_url) : undefined,
+      createdAt: String(r.created_at ?? r.createdAt ?? nowIso()),
+    }));
+
+    return res.json({
+      ok: true,
+      passId,
+      credits: { balance: credits, expiresAt },
+      generations,
+      feedbacks,
+    });
+  } catch (e) {
+    console.error("GET /history/pass/:passId failed", e);
+    return res.status(500).json({ ok: false, error: "HISTORY_FAILED", requestId, message: e?.message || String(e) });
+  }
+});
+
+// ✅ Matches your frontend: DELETE /history/:id
+app.delete("/history/:id", async (req, res) => {
+  const requestId = `del_${Date.now()}_${crypto.randomUUID()}`;
+
+  try {
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
+
+    const id = safeString(req.params.id, "");
+    if (!id) return res.status(400).json({ ok: false, requestId, error: "MISSING_ID" });
+
+    const supabase = getSupabaseAdmin();
+
+    // Try delete from generations first
+    const genDel = await supabase.from("mega_generations").delete().eq("id", id).select("id");
+    const genCount = Array.isArray(genDel.data) ? genDel.data.length : 0;
+
+    if (genDel.error && genCount === 0) {
+      // if the column isn't `id` in your DB, adjust here
+      console.warn("[history delete] mega_generations delete warning:", genDel.error?.message || genDel.error);
+    }
+
+    // Also try delete from feedback table (safe if not found)
+    try {
+      await supabase.from("mega_feedback").delete().eq("id", id);
+    } catch {}
+
+    return res.json({ ok: true, requestId, deleted: true });
+  } catch (e) {
+    console.error("DELETE /history/:id failed", e);
+    return res.status(500).json({ ok: false, requestId, error: "DELETE_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// ✅ Matches your frontend: POST /feedback/like
+app.post("/feedback/like", async (req, res) => {
+  const requestId = `like_${Date.now()}_${crypto.randomUUID()}`;
 
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
@@ -671,57 +606,142 @@ app.post("/feedback", async (req, res) => {
 
     const generationId = safeString(body.generationId || body.generation_id, null);
 
-    const payload =
-      body.payload && typeof body.payload === "object"
-        ? body.payload
-        : {
-            event_type: safeString(body.event_type, "feedback"),
-            payload: body.payload || {},
-            tags: Array.isArray(body.tags) ? body.tags : undefined,
-            hard_block: safeString(body.hard_block, "") || undefined,
-            note: safeString(body.note, "") || undefined,
-          };
+    const payload = {
+      event_type: "feedback.like",
+      liked: body.liked !== false,
+      resultType: safeString(body.resultType, "image"),
+      platform: safeString(body.platform, "web"),
+      prompt: safeString(body.prompt, ""),
+      comment: safeString(body.comment, ""),
+      imageUrl: safeString(body.imageUrl, ""),
+      videoUrl: safeString(body.videoUrl, ""),
+      sessionId: safeString(body.sessionId, ""),
+      createdAt: nowIso(),
+    };
 
     const out = await megaWriteFeedback({ passId, generationId, payload });
-
     return res.json({ ok: true, requestId, passId, feedbackId: out.feedbackId });
   } catch (e) {
-    console.error("POST /feedback failed", e);
+    console.error("POST /feedback/like failed", e);
     return res.status(500).json({ ok: false, requestId, error: "FEEDBACK_FAILED", message: e?.message || String(e) });
   }
 });
+
+// Keep legacy /feedback alias (won’t hurt)
+app.post("/feedback", async (req, res) => {
+  return app._router.handle(req, res, () => {}, "post", "/feedback/like");
+});
+
 // ======================================================
-// Shopify sync (frontend calls this; must NOT 404)
-// Returns a passId that matches the rest of the API: pass:user:<supabaseUserId>
+// R2 signed upload endpoints
 // ======================================================
-app.post("/auth/shopify-sync", async (req, res) => {
+const R2_ACCOUNT_ID = ENV.R2_ACCOUNT_ID || "";
+const R2_ACCESS_KEY_ID = ENV.R2_ACCESS_KEY_ID || "";
+const R2_SECRET_ACCESS_KEY = ENV.R2_SECRET_ACCESS_KEY || "";
+const R2_BUCKET = ENV.R2_BUCKET || "";
+
+function r2Enabled() {
+  return Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+}
+
+function getR2S3Client() {
+  if (!r2Enabled()) return null;
+  const endpoint = `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  return new S3Client({
+    region: "auto",
+    endpoint,
+    forcePathStyle: true,
+    credentials: {
+      accessKeyId: R2_ACCESS_KEY_ID,
+      secretAccessKey: R2_SECRET_ACCESS_KEY,
+    },
+  });
+}
+
+// Create signed PUT URL for browser upload
+app.post("/api/r2/upload-signed", async (req, res) => {
   try {
-    const authUser = await getAuthUser(req);
+    if (!r2Enabled()) return res.status(503).json({ ok: false, error: "R2_NOT_CONFIGURED" });
 
-    // If user isn't logged in yet, don't error (just say ok)
-    if (!authUser?.userId) {
-      return res.status(200).json({ ok: true, loggedIn: false });
-    }
+    const body = req.body || {};
 
-    const passId = normalizeIncomingPassId(`pass:user:${authUser.userId}`);
+    // ✅ accept BOTH front/back key names
+    const kind = safeString(body.kind || body.folder || "uploads", "uploads");
+    const filename = safeString(body.fileName || body.filename || body.file_name || "upload", "upload");
+    const contentType = safeString(body.contentType || "application/octet-stream", "application/octet-stream");
 
-    // Important: tell the browser the pass id
-    res.set("X-Mina-Pass-Id", passId);
+    const rawPass =
+      body.passId || body.customerId || req.get("x-mina-pass-id") || req.query.passId || req.query.customerId;
+    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
+    setPassIdHeader(res, passId);
 
-    // Optional: link this user into MEGA (safe)
-    if (sbEnabled()) {
-      await megaEnsureCustomer({ passId, userId: authUser.userId, email: authUser.email || null });
-    }
+    const key = makeKey({ kind, customerId: passId, filename, contentType });
+
+    const client = getR2S3Client();
+    const cmd = new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      ContentType: contentType,
+    });
+
+    const uploadUrl = await getSignedUrl(client, cmd, { expiresIn: 600 });
+    const publicUrl = publicUrlForKey(key);
 
     return res.status(200).json({
       ok: true,
-      loggedIn: true,
-      passId,
-      email: authUser.email || null,
+      key,
+      uploadUrl,
+      publicUrl,
+      url: publicUrl,
+      expiresIn: 600,
     });
   } catch (e) {
-    // Never break the app if sync fails
-    return res.status(200).json({ ok: true, loggedIn: false, degraded: true });
+    console.error("POST /api/r2/upload-signed failed", e);
+    return res.status(500).json({ ok: false, error: "UPLOAD_SIGN_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// Store a remote URL into R2 server-side
+app.post("/api/r2/store-remote-signed", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const url = safeString(body.sourceUrl || body.url || "", "");
+    if (!url) return res.status(400).json({ ok: false, error: "MISSING_URL" });
+
+    const kind = safeString(body.kind || body.folder || "generations", "generations");
+    const rawPass = body.passId || body.customerId || req.get("x-mina-pass-id");
+    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
+    setPassIdHeader(res, passId);
+
+    const out = await storeRemoteImageToR2({ url, kind, customerId: passId });
+    return res.status(200).json({ ok: true, key: out.key, publicUrl: out.publicUrl, url: out.publicUrl });
+  } catch (e) {
+    console.error("POST /api/r2/store-remote-signed failed", e);
+    return res.status(500).json({ ok: false, error: "STORE_REMOTE_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// Optional: accept base64 dataUrl and upload server-side
+app.post("/api/r2/upload-dataurl", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const dataUrl = safeString(body.dataUrl, "");
+    if (!dataUrl) return res.status(400).json({ ok: false, error: "MISSING_DATAURL" });
+
+    const kind = safeString(body.kind || body.folder || "uploads", "uploads");
+    const filename = safeString(body.filename || body.fileName || "upload", "upload");
+    const rawPass = body.passId || body.customerId || req.get("x-mina-pass-id");
+    const passId = normalizeIncomingPassId(rawPass) || "anonymous";
+    setPassIdHeader(res, passId);
+
+    const parsed = parseDataUrl(dataUrl);
+    const key = makeKey({ kind, customerId: passId, filename, contentType: parsed.contentType });
+
+    const out = await putBufferToR2({ key, buffer: parsed.buffer, contentType: parsed.contentType });
+    return res.status(200).json({ ok: true, key: out.key, publicUrl: out.publicUrl, url: out.publicUrl });
+  } catch (e) {
+    console.error("POST /api/r2/upload-dataurl failed", e);
+    return res.status(500).json({ ok: false, error: "UPLOAD_DATAURL_FAILED", message: e?.message || String(e) });
   }
 });
 
@@ -807,5 +827,5 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
 app.use(errorMiddleware);
 
 app.listen(PORT, () => {
-  console.log(`Mina MMA API (MEGA-only) listening on port ${PORT}`);
+  console.log(`Mina MMA API (MMA+MEGA) listening on port ${PORT}`);
 });

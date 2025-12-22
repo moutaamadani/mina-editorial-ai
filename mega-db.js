@@ -1,13 +1,21 @@
 // mega-db.js — MEGA-only persistence helpers (customers + credits + sessions + feedback)
-// Compatible with server.js imports:
-//   resolvePassId, megaEnsureCustomer, megaGetCredits, megaAdjustCredits,
-//   megaHasCreditRef, megaWriteSession, megaWriteFeedback
+// Matches your schema columns exactly:
+// mega_customers: mg_pass_id, mg_shopify_customer_id, mg_user_id, mg_email, mg_mma_preferences,
+//                 mg_mma_preferences_updated_at, mg_created_at, mg_updated_at, mg_credits,
+//                 mg_admin_allowlist, mg_last_active, mg_disabled, mg_expires_at
+// mega_generations: mg_id, mg_record_type, mg_pass_id, mg_generation_id, mg_parent_id, mg_step_no,
+//                   mg_step_type, mg_mma_mode, mg_mma_status, mg_status, mg_error, mg_mma_vars,
+//                   mg_prompt, mg_output_url, mg_meta, mg_payload, mg_event_at, mg_created_at,
+//                   mg_updated_at, mg_session_id, mg_platform, mg_title, mg_type, mg_provider,
+//                   mg_model, mg_latency_ms, mg_content_type, mg_delta, mg_reason, mg_source,
+//                   mg_ref_type, mg_ref_id
+
 import crypto from "node:crypto";
 import { getSupabaseAdmin } from "./supabase.js";
 
-// ---------------------------------------------
-// Basics
-// ---------------------------------------------
+// ---------------------------
+// Small helpers
+// ---------------------------
 function nowIso() {
   return new Date().toISOString();
 }
@@ -36,9 +44,9 @@ function requireSupabase() {
 }
 
 function addDaysIso(baseIso, days) {
-  const base = baseIso ? new Date(baseIso) : new Date();
-  if (Number.isFinite(days)) base.setUTCDate(base.getUTCDate() + Number(days));
-  return base.toISOString();
+  const d = baseIso ? new Date(baseIso) : new Date();
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString();
 }
 
 function maxIso(a, b) {
@@ -50,10 +58,19 @@ function maxIso(a, b) {
   return ta >= tb ? a : b;
 }
 
-// ---------------------------------------------
+async function touchCustomer(supabase, passId) {
+  const ts = nowIso();
+  const { error } = await supabase
+    .from("mega_customers")
+    .update({ mg_last_active: ts, mg_updated_at: ts })
+    .eq("mg_pass_id", passId);
+  if (error) throw error;
+}
+
+// ---------------------------
 // PassId resolver (used by server.js)
 // priority: body.customerId/passId -> header X-Mina-Pass-Id -> anon
-// ---------------------------------------------
+// ---------------------------
 export function resolvePassId(req, body = {}) {
   const fromBody = safeString(body?.customerId || body?.passId || body?.pass_id, "");
   if (fromBody) return fromBody;
@@ -64,9 +81,9 @@ export function resolvePassId(req, body = {}) {
   return `pass:anon:${crypto.randomUUID()}`;
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Ensure customer row exists
-// ---------------------------------------------
+// ---------------------------
 export async function megaEnsureCustomer({
   passId,
   userId = null,
@@ -93,35 +110,35 @@ export async function megaEnsureCustomer({
 
   const isNew = !existing?.mg_pass_id;
 
-  // Defaults (optional)
+  // Optional defaults (safe even if you set them to 0)
   const defaultFreeCredits = intOr(process.env.DEFAULT_FREE_CREDITS, 0);
   const expireDays = intOr(process.env.DEFAULT_CREDITS_EXPIRE_DAYS, 30);
 
   if (isNew) {
     const insertCredits = defaultFreeCredits > 0 ? defaultFreeCredits : 0;
-    const insertExpiresAt =
-      defaultFreeCredits > 0 ? addDaysIso(ts, expireDays) : null;
+    const insertExpiresAt = defaultFreeCredits > 0 ? addDaysIso(ts, expireDays) : null;
 
     const { error: insErr } = await supabase.from("mega_customers").insert({
       mg_pass_id: pid,
+      mg_shopify_customer_id: shopifyCustomerId || null,
       mg_user_id: userId || null,
       mg_email: normalizedEmail,
-      mg_shopify_customer_id: shopifyCustomerId || null,
+      mg_mma_preferences: {}, // ✅ matches your column name
+      mg_mma_preferences_updated_at: null,
       mg_credits: insertCredits,
-      mg_expires_at: insertExpiresAt,
+      mg_admin_allowlist: false,
       mg_last_active: ts,
       mg_disabled: false,
-      mg_mma_preferences: {}, // safe default; MMA can update later
-      mg_mma_preferences_updated_at: null,
+      mg_expires_at: insertExpiresAt,
       mg_created_at: ts,
       mg_updated_at: ts,
     });
 
     if (insErr) throw insErr;
 
-    // Optional: ledger row for free credits
+    // Optional: keep ledger consistent for signup credits
     if (defaultFreeCredits > 0) {
-      await supabase.from("mega_generations").insert({
+      const { error: ledErr } = await supabase.from("mega_generations").insert({
         mg_id: `credit_transaction:${crypto.randomUUID()}`,
         mg_record_type: "credit_transaction",
         mg_pass_id: pid,
@@ -131,11 +148,13 @@ export async function megaEnsureCustomer({
         mg_ref_type: "free_signup",
         mg_ref_id: pid,
         mg_status: "succeeded",
-        mg_meta: { credits_before: 0, credits_after: insertCredits },
+        mg_meta: { credits_before: 0, credits_after: insertCredits, expires_at: insertExpiresAt },
+        mg_payload: null,
         mg_event_at: ts,
         mg_created_at: ts,
         mg_updated_at: ts,
       });
+      if (ledErr) throw ledErr;
     }
 
     return {
@@ -148,7 +167,7 @@ export async function megaEnsureCustomer({
     };
   }
 
-  // Update non-destructively + last_active
+  // Update non-destructively (don’t overwrite existing values)
   const updates = {
     mg_last_active: ts,
     mg_updated_at: ts,
@@ -175,9 +194,9 @@ export async function megaEnsureCustomer({
   };
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Credits read
-// ---------------------------------------------
+// ---------------------------
 export async function megaGetCredits(passId) {
   const supabase = requireSupabase();
   const pid = safeString(passId, "");
@@ -197,9 +216,9 @@ export async function megaGetCredits(passId) {
   };
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Idempotency helper for Shopify webhook
-// ---------------------------------------------
+// ---------------------------
 export async function megaHasCreditRef({ refType, refId } = {}) {
   const supabase = requireSupabase();
   const rt = safeString(refType, "");
@@ -218,10 +237,10 @@ export async function megaHasCreditRef({ refType, refId } = {}) {
   return (data?.length ?? 0) > 0;
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Credits adjust + rolling expiry + ledger row
-// NOTE: not fully atomic under concurrency.
-// ---------------------------------------------
+// NOTE: not fully atomic under concurrency (OK for low traffic).
+// ---------------------------
 export async function megaAdjustCredits({
   passId,
   delta,
@@ -235,9 +254,11 @@ export async function megaAdjustCredits({
   const pid = safeString(passId, "");
   if (!pid) throw new Error("PASS_ID_REQUIRED");
 
-  const ts = nowIso();
   const d = Number(delta ?? 0);
   if (!Number.isFinite(d) || d === 0) throw new Error("DELTA_INVALID");
+
+  const ts = nowIso();
+  const eventAt = grantedAt ? new Date(grantedAt).toISOString() : ts;
 
   // Ensure customer exists
   await megaEnsureCustomer({ passId: pid });
@@ -256,17 +277,15 @@ export async function megaAdjustCredits({
 
   // Rolling expiry on positive grants
   const expireDays = intOr(process.env.DEFAULT_CREDITS_EXPIRE_DAYS, 30);
-  const eventAt = grantedAt ? new Date(grantedAt).toISOString() : ts;
-
   const currentExpiry = row?.mg_expires_at ? new Date(row.mg_expires_at).toISOString() : null;
-  let nextExpiry = currentExpiry;
 
+  let nextExpiry = currentExpiry;
   if (d > 0) {
     const candidate = addDaysIso(eventAt, expireDays);
     nextExpiry = maxIso(currentExpiry, candidate);
   }
 
-  // Update customer
+  // Update customer balance
   const { error: upErr } = await supabase
     .from("mega_customers")
     .update({
@@ -284,7 +303,7 @@ export async function megaAdjustCredits({
     mg_id: `credit_transaction:${crypto.randomUUID()}`,
     mg_record_type: "credit_transaction",
     mg_pass_id: pid,
-    mg_delta: d,
+    mg_delta: Math.trunc(d),
     mg_reason: safeString(reason, null),
     mg_source: safeString(source, null),
     mg_ref_type: refType ? safeString(refType, null) : null,
@@ -295,6 +314,7 @@ export async function megaAdjustCredits({
       credits_after: after,
       expires_at: nextExpiry,
     },
+    mg_payload: null,
     mg_event_at: eventAt,
     mg_created_at: ts,
     mg_updated_at: ts,
@@ -305,9 +325,9 @@ export async function megaAdjustCredits({
   return { creditsBefore: before, creditsAfter: after, expiresAt: nextExpiry };
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Session writer (mega_generations)
-// ---------------------------------------------
+// ---------------------------
 export async function megaWriteSession({
   passId,
   sessionId,
@@ -324,13 +344,7 @@ export async function megaWriteSession({
   const ts = nowIso();
 
   await megaEnsureCustomer({ passId: pid });
-
-  // keep customer active
-  const { error: upErr } = await supabase
-    .from("mega_customers")
-    .update({ mg_last_active: ts, mg_updated_at: ts })
-    .eq("mg_pass_id", pid);
-  if (upErr) throw upErr;
+  await touchCustomer(supabase, pid);
 
   const { error: insErr } = await supabase.from("mega_generations").insert({
     mg_id: `session:${sid}`,
@@ -341,6 +355,7 @@ export async function megaWriteSession({
     mg_title: title ? safeString(title, null) : null,
     mg_status: "succeeded",
     mg_meta: meta && typeof meta === "object" ? meta : {},
+    mg_payload: null,
     mg_event_at: ts,
     mg_created_at: ts,
     mg_updated_at: ts,
@@ -351,9 +366,9 @@ export async function megaWriteSession({
   return { sessionId: sid };
 }
 
-// ---------------------------------------------
+// ---------------------------
 // Feedback writer (mega_generations)
-// ---------------------------------------------
+// ---------------------------
 export async function megaWriteFeedback({
   passId,
   generationId = null,
@@ -367,13 +382,7 @@ export async function megaWriteFeedback({
   const feedbackId = crypto.randomUUID();
 
   await megaEnsureCustomer({ passId: pid });
-
-  // keep customer active
-  const { error: upErr } = await supabase
-    .from("mega_customers")
-    .update({ mg_last_active: ts, mg_updated_at: ts })
-    .eq("mg_pass_id", pid);
-  if (upErr) throw upErr;
+  await touchCustomer(supabase, pid);
 
   const { error: insErr } = await supabase.from("mega_generations").insert({
     mg_id: `feedback:${feedbackId}`,
@@ -382,6 +391,7 @@ export async function megaWriteFeedback({
     mg_generation_id: generationId ? safeString(generationId, null) : null,
     mg_status: "succeeded",
     mg_meta: payload && typeof payload === "object" ? payload : { value: payload },
+    mg_payload: null,
     mg_event_at: ts,
     mg_created_at: ts,
     mg_updated_at: ts,

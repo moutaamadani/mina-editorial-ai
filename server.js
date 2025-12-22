@@ -1,4 +1,4 @@
-// server.js — MMA + MEGA only (Supabase service-role). No legacy editorial/motion shims.
+// server.js — Pure MMA + MEGA (Supabase service role). No legacy editorial/motion shims.
 "use strict";
 
 import "dotenv/config";
@@ -8,7 +8,6 @@ import crypto from "node:crypto";
 
 import Replicate from "replicate";
 import OpenAI from "openai";
-
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { normalizeError } from "./server/logging/normalizeError.js";
@@ -36,11 +35,9 @@ import {
 import { parseDataUrl } from "./r2.js";
 import { requireAdmin } from "./auth.js";
 
-// MMA (robust import; supports router being a Router OR a factory)
-import mmaRouterMod from "./server/mma/mma-router.js";
+import mmaRouter from "./server/mma/mma-router.js";
 import * as mmaControllerMod from "./server/mma/mma-controller.js";
 
-// Admin MMA logs router (your existing)
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 
 // ======================================================
@@ -129,28 +126,13 @@ async function getAuthUser(req) {
   return { userId, email, token };
 }
 
-// PassId resolution: header/body/query → else stable user → else anon
 function resolvePassIdForRequest(req, bodyLike = {}) {
-  // 1) your mega-db resolver (body.customerId or x-mina-pass-id or anon)
-  const passFromMega = megaResolvePassId(req, bodyLike);
-  const normalized = safeString(passFromMega, "");
-  if (normalized) return normalized;
-
-  // Should never happen (megaResolvePassId always returns something), but fallback:
-  return `pass:anon:${crypto.randomUUID()}`;
+  // Uses YOUR mega-db.js resolver: body.customerId -> header x-mina-pass-id -> anon
+  return megaResolvePassId(req, bodyLike);
 }
 
 function setPassIdHeader(res, passId) {
-  if (!passId) return;
-  res.set("X-Mina-Pass-Id", passId);
-}
-
-function looksLikeExpressRouter(x) {
-  return (
-    typeof x === "function" &&
-    typeof x.use === "function" &&
-    Array.isArray(x.stack)
-  );
+  if (passId) res.set("X-Mina-Pass-Id", passId);
 }
 
 // ======================================================
@@ -183,15 +165,10 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-
-// Ensure X-Mina-Pass-Id is exposed even if upstream set something else
-app.use((req, res, next) => {
+app.use((_req, res, next) => {
   const existing = res.get("Access-Control-Expose-Headers");
   const headers = existing
-    ? existing
-        .split(",")
-        .map((h) => h.trim())
-        .filter(Boolean)
+    ? existing.split(",").map((h) => h.trim()).filter(Boolean)
     : [];
   if (!headers.some((h) => h.toLowerCase() === "x-mina-pass-id")) headers.push("X-Mina-Pass-Id");
   res.set("Access-Control-Expose-Headers", headers.join(", "));
@@ -199,7 +176,7 @@ app.use((req, res, next) => {
 });
 
 // ======================================================
-// Shopify webhook (RAW body + HMAC verify) — credits -> MEGA
+// Shopify webhook (RAW body + HMAC verify) -> MEGA credits
 // ======================================================
 const SHOPIFY_STORE_DOMAIN = ENV.SHOPIFY_STORE_DOMAIN || "";
 const SHOPIFY_ADMIN_TOKEN = ENV.SHOPIFY_ADMIN_TOKEN || "";
@@ -301,7 +278,7 @@ function creditsFromOrder(order) {
   return credits;
 }
 
-// Raw webhook MUST be before express.json()
+// Raw webhook route MUST be before express.json()
 app.post("/api/credits/shopify-order", express.raw({ type: "application/json" }), async (req, res) => {
   const requestId = `shopify_${Date.now()}_${crypto.randomUUID()}`;
 
@@ -340,7 +317,6 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
-    // Choose a stable passId for MEGA
     const passId =
       shopifyCustomerId
         ? `pass:shopify:${shopifyCustomerId}`
@@ -350,7 +326,6 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
 
     const grantedAt = order?.processed_at || order?.created_at || nowIso();
 
-    // Ensure row exists + link shopify/email
     await megaEnsureCustomer({
       passId,
       email,
@@ -368,7 +343,6 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
       grantedAt,
     });
 
-    // Optional: tag Shopify customer
     if (shopifyCustomerId) {
       try {
         await addCustomerTag(shopifyCustomerId, SHOPIFY_MINA_TAG);
@@ -432,30 +406,47 @@ app.post("/api/log-error", async (req, res) => {
 });
 
 // ======================================================
+// MMA init (IMPORTANT): if mma-controller exports a factory, call it once
+// ======================================================
+const supabaseAdmin = getSupabaseAdmin(); // may be null if env missing
+const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY || "" });
+const replicate = new Replicate({ auth: ENV.REPLICATE_API_TOKEN || "" });
+
+// If your mma-controller uses module-level state, this boot call wires clients once.
+// Safe: if factory doesn't exist, we do nothing.
+const createMmaController = mmaControllerMod.createMmaController || mmaControllerMod.default;
+if (typeof createMmaController === "function") {
+  try {
+    createMmaController({ supabaseAdmin, openai, replicate });
+    console.log("[mma] controller initialized");
+  } catch (e) {
+    console.warn("[mma] controller init failed (continuing):", e?.message || e);
+  }
+}
+
+// ======================================================
 // Core routes (MEGA)
 // ======================================================
 
-// Health
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    service: "Mina MMA API (MEGA)",
+    service: "Mina MMA API (MEGA-only)",
     time: nowIso(),
     supabase: sbEnabled(),
     env: IS_PROD ? "production" : "development",
   });
 });
 
-// /me — optional Supabase auth, but always returns a passId
 app.get("/me", async (req, res) => {
   const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
   try {
     const authUser = await getAuthUser(req);
 
-    // Start from incoming header/body passId (no body in GET)
+    // base passId from header/body (GET => header or anon)
     let passId = resolvePassIdForRequest(req, {});
 
-    // If logged-in and no explicit passId header, prefer stable user passId
+    // If logged in and no explicit header, prefer stable user passId
     const incomingHeader = safeString(req.get("x-mina-pass-id"), "");
     if (authUser?.userId && !incomingHeader) {
       passId = `pass:user:${authUser.userId}`;
@@ -475,7 +466,6 @@ app.get("/me", async (req, res) => {
     }
 
     if (authUser) {
-      // Light audit helpers (safe no-throw)
       void upsertProfileRow({ userId: authUser.userId, email: authUser.email });
       void upsertSessionRow({
         userId: authUser.userId,
@@ -485,14 +475,12 @@ app.get("/me", async (req, res) => {
         userAgent: req.get("user-agent"),
       });
 
-      // Ensure MEGA customer exists & link to user/email
       await megaEnsureCustomer({
         passId,
         userId: authUser.userId,
         email: authUser.email,
       });
     } else {
-      // Ensure MEGA customer exists for anon passId too (optional but useful)
       await megaEnsureCustomer({ passId });
     }
 
@@ -517,20 +505,16 @@ app.get("/me", async (req, res) => {
   }
 });
 
-// Credits: balance
 app.get("/credits/balance", async (req, res) => {
   const requestId = `credits_${Date.now()}_${crypto.randomUUID()}`;
   try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-    }
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
     const passId = resolvePassIdForRequest(req, {
       customerId: req.query.customerId || req.query.passId,
     });
     setPassIdHeader(res, passId);
 
-    // Ensure row exists and link if authed
     const authUser = await getAuthUser(req);
     await megaEnsureCustomer({
       passId,
@@ -539,7 +523,6 @@ app.get("/credits/balance", async (req, res) => {
     });
 
     const { credits, expiresAt } = await megaGetCredits(passId);
-
     return res.json({
       ok: true,
       requestId,
@@ -554,13 +537,10 @@ app.get("/credits/balance", async (req, res) => {
   }
 });
 
-// Credits: add (manual topup)
 app.post("/credits/add", async (req, res) => {
   const requestId = `add_${Date.now()}_${crypto.randomUUID()}`;
   try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-    }
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
     const body = req.body || {};
     const amount = typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
@@ -602,13 +582,10 @@ app.post("/credits/add", async (req, res) => {
   }
 });
 
-// Sessions: start
 app.post("/sessions/start", async (req, res) => {
   const requestId = `sess_${Date.now()}_${crypto.randomUUID()}`;
   try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-    }
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
     const body = req.body || {};
     const passId = resolvePassIdForRequest(req, body);
@@ -637,17 +614,6 @@ app.post("/sessions/start", async (req, res) => {
       },
     });
 
-    // (Optional) audit helper
-    if (authUser?.token) {
-      void upsertSessionRow({
-        userId: authUser.userId,
-        email: authUser.email,
-        token: authUser.token,
-        ip: req.ip,
-        userAgent: req.get("user-agent"),
-      });
-    }
-
     return res.json({
       ok: true,
       requestId,
@@ -660,13 +626,10 @@ app.post("/sessions/start", async (req, res) => {
   }
 });
 
-// Feedback: generic event writer (MMA router may have its own; this is a safe MEGA endpoint)
 app.post("/feedback", async (req, res) => {
   const requestId = `fb_${Date.now()}_${crypto.randomUUID()}`;
   try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-    }
+    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
     const body = req.body || {};
     const passId = resolvePassIdForRequest(req, body);
@@ -680,18 +643,17 @@ app.post("/feedback", async (req, res) => {
     });
 
     const generationId = safeString(body.generationId || body.generation_id, null);
-
-    const payload = body.payload && typeof body.payload === "object"
-      ? body.payload
-      : {
-          type: safeString(body.type, "feedback"),
-          tags: Array.isArray(body.tags) ? body.tags : undefined,
-          hard_block: safeString(body.hard_block, "") || undefined,
-          note: safeString(body.note, "") || undefined,
-        };
+    const payload =
+      body.payload && typeof body.payload === "object"
+        ? body.payload
+        : {
+            type: safeString(body.type, "feedback"),
+            tags: Array.isArray(body.tags) ? body.tags : undefined,
+            hard_block: safeString(body.hard_block, "") || undefined,
+            note: safeString(body.note, "") || undefined,
+          };
 
     const out = await megaWriteFeedback({ passId, generationId, payload });
-
     return res.json({ ok: true, requestId, passId, feedbackId: out.feedbackId });
   } catch (e) {
     console.error("POST /feedback failed", e);
@@ -699,241 +661,12 @@ app.post("/feedback", async (req, res) => {
   }
 });
 
-// History (MEGA): pulls from mega_customers + mega_generations
-app.get("/history", async (req, res) => {
-  const requestId = `hist_${Date.now()}_${crypto.randomUUID()}`;
-  try {
-    if (!sbEnabled()) {
-      return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-    }
-
-    const supabase = getSupabaseAdmin();
-    const passId = resolvePassIdForRequest(req, {
-      customerId: req.query.customerId || req.query.passId,
-    });
-    setPassIdHeader(res, passId);
-
-    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 200)));
-
-    // Ensure customer exists
-    await megaEnsureCustomer({ passId });
-
-    const [custRes, gensRes] = await Promise.all([
-      supabase
-        .from("mega_customers")
-        .select("mg_pass_id, mg_credits, mg_expires_at, mg_user_id, mg_email, mg_shopify_customer_id, mg_last_active, mg_created_at, mg_updated_at")
-        .eq("mg_pass_id", passId)
-        .maybeSingle(),
-      supabase
-        .from("mega_generations")
-        .select("*")
-        .eq("mg_pass_id", passId)
-        .order("mg_created_at", { ascending: false })
-        .limit(limit),
-    ]);
-
-    if (custRes.error) throw custRes.error;
-    if (gensRes.error) throw gensRes.error;
-
-    return res.json({
-      ok: true,
-      requestId,
-      passId,
-      customer: custRes.data || null,
-      events: gensRes.data || [],
-    });
-  } catch (e) {
-    console.error("GET /history failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "HISTORY_FAILED", message: e?.message || String(e) });
-  }
-});
-
 // ======================================================
-// R2 (public) helper endpoints (optional but useful)
+// MMA routes (your router as-is)
 // ======================================================
-const R2_ACCOUNT_ID = ENV.R2_ACCOUNT_ID || "";
-const R2_ACCESS_KEY_ID = ENV.R2_ACCESS_KEY_ID || "";
-const R2_SECRET_ACCESS_KEY = ENV.R2_SECRET_ACCESS_KEY || "";
-const R2_BUCKET = ENV.R2_BUCKET || "";
-const R2_ENDPOINT =
-  ENV.R2_ENDPOINT ||
-  (R2_ACCOUNT_ID ? `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : "");
+app.use("/mma", mmaRouter);
 
-const R2_PUBLIC_BASE_URL = ENV.R2_PUBLIC_BASE_URL || "";
-if (IS_PROD && (R2_ENDPOINT || R2_BUCKET) && !R2_PUBLIC_BASE_URL) {
-  throw new Error("R2_PUBLIC_BASE_URL is REQUIRED in production so asset URLs are permanent (non-expiring).");
-}
-
-function r2Enabled() {
-  return Boolean(R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
-}
-
-const r2 = r2Enabled()
-  ? new S3Client({
-      region: "auto",
-      endpoint: R2_ENDPOINT,
-      credentials: {
-        accessKeyId: R2_ACCESS_KEY_ID,
-        secretAccessKey: R2_SECRET_ACCESS_KEY,
-      },
-    })
-  : null;
-
-function safeName(name = "file") {
-  return String(name).replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-function safeFolderName(name = "uploads") {
-  return String(name).replace(/[^a-zA-Z0-9/_-]/g, "_");
-}
-function guessExtFromContentType(contentType = "") {
-  const ct = String(contentType).toLowerCase();
-  if (ct.includes("png")) return "png";
-  if (ct.includes("jpeg") || ct.includes("jpg")) return "jpg";
-  if (ct.includes("webp")) return "webp";
-  if (ct.includes("gif")) return "gif";
-  if (ct.includes("mp4")) return "mp4";
-  return "";
-}
-function encodeKeyForUrl(key) {
-  return String(key || "")
-    .split("/")
-    .map((p) => encodeURIComponent(p))
-    .join("/");
-}
-function r2PublicUrlForKey(key) {
-  if (!key) return "";
-  if (R2_PUBLIC_BASE_URL) return `${R2_PUBLIC_BASE_URL}/${encodeKeyForUrl(key)}`;
-  if (R2_ACCOUNT_ID && R2_BUCKET) {
-    return `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET}/${encodeKeyForUrl(key)}`;
-  }
-  return "";
-}
-
-async function r2PutPublic({ key, body, contentType }) {
-  if (!r2Enabled() || !r2) throw new Error("R2_NOT_CONFIGURED");
-
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: R2_BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType || "application/octet-stream",
-      CacheControl: "public, max-age=31536000, immutable",
-    })
-  );
-
-  const publicUrl = r2PublicUrlForKey(key);
-  if (!publicUrl) throw new Error("Missing R2_PUBLIC_BASE_URL (or public fallback config).");
-  return { key, publicUrl };
-}
-
-async function storeRemoteToR2Public({ remoteUrl, kind = "generations", customerId = "anon" }) {
-  const resp = await fetch(remoteUrl);
-  if (!resp.ok) throw new Error(`REMOTE_FETCH_FAILED (${resp.status})`);
-
-  const contentType = resp.headers.get("content-type") || "application/octet-stream";
-  const arrayBuf = await resp.arrayBuffer();
-  const buf = Buffer.from(arrayBuf);
-
-  const folder = safeFolderName(kind);
-  const cid = String(customerId || "anon");
-  const uuid = crypto.randomUUID();
-  const extGuess = guessExtFromContentType(contentType);
-  const key = `${folder}/${cid}/${Date.now()}-${uuid}${extGuess ? `.${extGuess}` : ""}`;
-
-  return r2PutPublic({ key, body: buf, contentType });
-}
-
-// Upload dataURL -> public R2
-app.post("/api/r2/upload-public", async (req, res) => {
-  const requestId = `r2_${Date.now()}_${crypto.randomUUID()}`;
-  try {
-    if (!r2Enabled()) return res.status(503).json({ ok: false, requestId, error: "R2_NOT_CONFIGURED" });
-
-    const { dataUrl, kind = "uploads", customerId = "anon", filename = "" } = req.body || {};
-    if (!dataUrl) return res.status(400).json({ ok: false, requestId, error: "MISSING_DATAURL" });
-
-    const { buffer, contentType, ext } = parseDataUrl(dataUrl);
-
-    const folder = safeFolderName(kind);
-    const cid = String(customerId || "anon");
-    const base = safeName(filename || "upload");
-    const uuid = crypto.randomUUID();
-
-    const extGuess = ext || guessExtFromContentType(contentType);
-    const key = `${folder}/${cid}/${Date.now()}-${uuid}-${base}${
-      extGuess && !base.toLowerCase().endsWith(`.${extGuess}`) ? `.${extGuess}` : ""
-    }`;
-
-    const stored = await r2PutPublic({ key, body: buffer, contentType });
-
-    return res.json({
-      ok: true,
-      requestId,
-      key: stored.key,
-      url: stored.publicUrl,
-      publicUrl: stored.publicUrl,
-      contentType,
-      bytes: buffer.length,
-    });
-  } catch (e) {
-    console.error("POST /api/r2/upload-public failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "UPLOAD_FAILED", message: e?.message || String(e) });
-  }
-});
-
-// Store remote URL -> public R2
-app.post("/api/r2/store-remote", async (req, res) => {
-  const requestId = `r2s_${Date.now()}_${crypto.randomUUID()}`;
-  try {
-    if (!r2Enabled()) return res.status(503).json({ ok: false, requestId, error: "R2_NOT_CONFIGURED" });
-
-    const { url, kind = "generations", customerId = "anon" } = req.body || {};
-    if (!url) return res.status(400).json({ ok: false, requestId, error: "MISSING_URL" });
-
-    const stored = await storeRemoteToR2Public({ remoteUrl: url, kind, customerId });
-
-    return res.json({ ok: true, requestId, key: stored.key, url: stored.publicUrl, publicUrl: stored.publicUrl });
-  } catch (e) {
-    console.error("POST /api/r2/store-remote failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "STORE_REMOTE_FAILED", message: e?.message || String(e) });
-  }
-});
-
-// ======================================================
-// MMA wiring
-// ======================================================
-const replicate = new Replicate({ auth: ENV.REPLICATE_API_TOKEN || "" });
-const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY || "" });
-
-const createMmaController = mmaControllerMod.createMmaController || mmaControllerMod.default;
-if (typeof createMmaController !== "function") {
-  throw new Error(
-    "MMA controller factory not found. Expected createMmaController export in ./server/mma/mma-controller.js"
-  );
-}
-
-const supabaseAdmin = getSupabaseAdmin(); // may be null in dev if env missing
-const mmaController = createMmaController({ supabaseAdmin, openai, replicate });
-const mmaHub = typeof mmaController?.getHub === "function" ? mmaController.getHub() : null;
-
-// Resolve router (Router instance OR factory)
-let mmaRouter = mmaRouterMod?.default ?? mmaRouterMod;
-if (looksLikeExpressRouter(mmaRouter)) {
-  app.locals.mma = { controller: mmaController, hub: mmaHub, supabaseAdmin };
-  app.use("/mma", mmaRouter);
-} else if (typeof mmaRouter === "function") {
-  const built = mmaRouter({ controller: mmaController, hub: mmaHub, supabaseAdmin, openai, replicate });
-  if (!looksLikeExpressRouter(built)) {
-    throw new Error("mma-router factory did not return an express.Router");
-  }
-  app.locals.mma = { controller: mmaController, hub: mmaHub, supabaseAdmin };
-  app.use("/mma", built);
-} else {
-  console.warn("[mma] router not loaded (check ./server/mma/mma-router.js exports)");
-}
-
-// MMA admin logs router
+// MMA admin logs
 app.use("/admin/mma", mmaLogAdminRouter);
 
 // ======================================================
@@ -942,15 +675,14 @@ app.use("/admin/mma", mmaLogAdminRouter);
 app.get("/admin/summary", requireAdmin, async (req, res) => {
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const supabase = getSupabaseAdmin();
 
+    const supabase = getSupabaseAdmin();
     const { count, error } = await supabase
       .from("mega_customers")
       .select("mg_pass_id", { count: "exact", head: true });
 
     if (error) throw error;
 
-    // Audit
     void logAdminAction({
       userId: req.user?.userId,
       email: req.user?.email,
@@ -967,28 +699,6 @@ app.get("/admin/summary", requireAdmin, async (req, res) => {
   } catch (e) {
     console.error("GET /admin/summary failed", e);
     res.status(500).json({ ok: false, error: "ADMIN_SUMMARY_FAILED", message: e?.message || String(e) });
-  }
-});
-
-app.get("/admin/customers", requireAdmin, async (req, res) => {
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
-    const supabase = getSupabaseAdmin();
-
-    const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 500)));
-
-    const { data, error } = await supabase
-      .from("mega_customers")
-      .select("mg_pass_id,mg_email,mg_credits,mg_expires_at,mg_last_active,mg_created_at,mg_updated_at,mg_disabled,mg_shopify_customer_id,mg_user_id")
-      .order("mg_created_at", { ascending: false })
-      .limit(limit);
-
-    if (error) throw error;
-
-    res.json({ ok: true, customers: data || [], source: "mega_customers" });
-  } catch (e) {
-    console.error("GET /admin/customers failed", e);
-    res.status(500).json({ ok: false, error: "ADMIN_CUSTOMERS_FAILED", message: e?.message || String(e) });
   }
 });
 
@@ -1014,18 +724,6 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
       grantedAt: nowIso(),
     });
 
-    void logAdminAction({
-      userId: req.user?.userId,
-      email: req.user?.email,
-      action: "admin.credits.adjust",
-      status: 200,
-      route: "/admin/credits/adjust",
-      method: "POST",
-      detail: { passId: String(passId), delta, out },
-      ip: req.ip,
-      userAgent: req.get("user-agent"),
-    });
-
     res.json({
       ok: true,
       requestId,
@@ -1046,5 +744,5 @@ app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
 app.use(errorMiddleware);
 
 app.listen(PORT, () => {
-  console.log(`Mina MMA API (MEGA) listening on port ${PORT}`);
+  console.log(`Mina MMA API (MEGA-only) listening on port ${PORT}`);
 });

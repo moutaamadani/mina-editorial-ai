@@ -167,6 +167,7 @@ app.get("/public/stats/total-users", async (_req, res) => {
   }
 });
 
+
 // ======================================================
 // Shopify webhook (RAW body + HMAC verify) — MEGA credits
 // ======================================================
@@ -689,7 +690,43 @@ app.post("/feedback", async (req, res) => {
     return res.status(500).json({ ok: false, requestId, error: "FEEDBACK_FAILED", message: e?.message || String(e) });
   }
 });
+// ============================
+// [ADD WHOLE BLOCK] /auth/shopify-sync
+// Put this in server.js after your JSON middleware is set up
+// ============================
+app.post("/auth/shopify-sync", express.json(), async (req, res) => {
+  try {
+    // Grab Bearer token if present
+    const auth = String(req.headers.authorization || "");
+    const jwt = auth.startsWith("Bearer ") ? auth.slice(7) : "";
 
+    // If no JWT or no Supabase admin client, just respond OK (no-op)
+    // (This stops the frontend 404 spam.)
+    if (!jwt || !process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.json({ ok: true, skipped: true });
+    }
+
+    // Create a Supabase server client (service role can verify JWT via getUser)
+    const { createClient } = await import("@supabase/supabase-js");
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+    });
+
+    const { data, error } = await sb.auth.getUser(jwt);
+    if (error || !data?.user) {
+      return res.status(401).json({ ok: false, message: "Unauthorized" });
+    }
+
+    // Use Supabase user.id as your stable passId everywhere
+    const passId = data.user.id;
+    const email = data.user.email || null;
+
+    return res.json({ ok: true, passId, email });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e?.message || "shopify-sync failed" });
+  }
+});
+z
 // ======================================================
 // MMA API (primary)
 // ======================================================

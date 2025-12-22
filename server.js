@@ -398,6 +398,8 @@ app.post("/api/r2/upload-signed", async (req, res) => {
     const cmd = new PutObjectCommand({
       Bucket: R2_BUCKET,
       Key: key,
+      ContentType: contentType,   // ok if client sends same Content-Type (you do)
+
       // IMPORTANT: do NOT set ContentDisposition/CacheControl here,
       // otherwise the browser must send matching headers and CORS/preflight becomes painful.
     });

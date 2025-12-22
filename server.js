@@ -35,6 +35,9 @@ import mmaRouter from "./server/mma/mma-router.js";
 
 // Admin MMA logs router (optional, your existing file)
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
+import { registerShopifySync } from "./shopifySyncRoute.js";
+
+registerShopifySync(app);
 
 // ======================================================
 // Env / app boot

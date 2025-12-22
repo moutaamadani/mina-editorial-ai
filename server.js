@@ -46,8 +46,7 @@ const PORT = Number(ENV.PORT || 8080);
 const app = express();
 app.set("trust proxy", 1);
 
-import { registerShopifySync } from "./shopifySyncRoute.js";
-registerShopifySync(app);
+
 
 function nowIso() {
   return new Date().toISOString();
@@ -362,6 +361,7 @@ const passId =
     });
   }
 });
+import { registerShopifySync } from "./shopifySyncRoute.js";
 
 // ======================================================
 // Standard body parsers

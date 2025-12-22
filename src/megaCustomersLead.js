@@ -1,57 +1,67 @@
-// src/megaCustomersLead.js (ESM)
-// Minimal “lead capture” helper that is SAFE and cannot break deploy.
-// It simply links email/userId/shopifyCustomerId to the MEGA customer row.
-
+// megaCustomersLead.js — minimal upsert into mega_customers for lead capture
 "use strict";
 
-import { sbEnabled } from "../supabase.js";
-import { megaEnsureCustomer } from "../mega-db.js";
+import { getSupabaseAdmin, sbEnabled } from "./supabase.js";
 
 function cleanStr(v) {
-  const s = String(v || "").trim();
+  const s = String(v ?? "").trim();
   return s || null;
 }
 
 function normalizeEmail(v) {
-  const e = cleanStr(v);
-  return e ? e.toLowerCase() : null;
+  const e = String(v ?? "").trim().toLowerCase();
+  return e || null;
 }
 
-function supabaseOk() {
-  return typeof sbEnabled === "function" ? sbEnabled() : !!sbEnabled;
+async function tryUpsertRow(supabase, row) {
+  const { error } = await supabase.from("mega_customers").upsert(row, { onConflict: "mg_pass_id" });
+  if (!error) return { ok: true };
+  return { ok: false, error };
 }
 
 /**
- * Upsert/Link a "lead" into MEGA.
- * This does NOT create any new tables.
- * It just uses megaEnsureCustomer() which you already rely on everywhere.
+ * Safe upsert: if your table doesn’t have mg_shopify_customer_id,
+ * we retry without it instead of crashing the whole route.
  */
 export async function upsertMegaCustomerLead({
   passId,
-  email,
+  email = null,
   userId = null,
   shopifyCustomerId = null,
 } = {}) {
+  if (!sbEnabled()) return { ok: false, degraded: true, reason: "NO_SUPABASE" };
+
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return { ok: false, degraded: true, reason: "NO_SUPABASE" };
+
   const pid = cleanStr(passId);
+  if (!pid) return { ok: false, error: "MISSING_PASS_ID" };
+
+  const rowBase = { mg_pass_id: pid };
+
   const em = normalizeEmail(email);
+  const uid = cleanStr(userId);
+  const sid = cleanStr(shopifyCustomerId);
 
-  if (!pid && !em) {
-    return { ok: false, error: "missing_passId_or_email" };
+  if (em) rowBase.mg_email = em;
+  if (uid) rowBase.mg_user_id = uid;
+  if (sid) rowBase.mg_shopify_customer_id = sid;
+
+  // First try with everything
+  const first = await tryUpsertRow(supabase, rowBase);
+  if (first.ok) return { ok: true };
+
+  // Retry without shopify column if it doesn't exist
+  const msg = String(first.error?.message || "");
+  if (msg.toLowerCase().includes("mg_shopify_customer_id") && msg.toLowerCase().includes("does not exist")) {
+    const retryRow = { mg_pass_id: pid };
+    if (em) retryRow.mg_email = em;
+    if (uid) retryRow.mg_user_id = uid;
+
+    const second = await tryUpsertRow(supabase, retryRow);
+    if (second.ok) return { ok: true, degraded: true, reason: "NO_SHOPIFY_COLUMN" };
   }
 
-  // If Supabase is not configured, be non-blocking.
-  if (!supabaseOk()) {
-    return { ok: true, degraded: true, reason: "NO_SUPABASE" };
-  }
-
-  const finalPassId = pid || `pass:email:${em}`;
-
-  await megaEnsureCustomer({
-    passId: finalPassId,
-    email: em,
-    userId: cleanStr(userId),
-    shopifyCustomerId: cleanStr(shopifyCustomerId),
-  });
-
-  return { ok: true, passId: finalPassId };
+  // Otherwise bubble the error (real issue)
+  throw first.error;
 }

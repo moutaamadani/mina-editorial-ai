@@ -32,7 +32,7 @@ export function getMmaConfig() {
     ["MMA_KLING_VERSION", "MMA_KLING_MODEL_VERSION", "KLING_MODEL_VERSION"],
     "kwaivgi/kling-v2.1"
   );
-  const klingMode = pickEnv(["MMA_KLING_MODE"], "standard"); // standard | pro
+  const klingMode = pickEnv(["MMA_KLING_MODE"], "pro"); // standard | pro
 
   // You asked for these env keys specifically:
   const negativeSeedream =

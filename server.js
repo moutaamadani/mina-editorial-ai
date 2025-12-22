@@ -194,6 +194,37 @@ async function shopifyAdminFetch(path, { method = "GET", body = null } = {}) {
 
   return json;
 }
+async function resolveExistingPassIdForOrder({ shopifyCustomerId, email }) {
+  try {
+    const supabase = getSupabaseAdmin();
+    if (!supabase) return null;
+
+    const sid = shopifyCustomerId ? String(shopifyCustomerId).trim() : "";
+    const em = email ? String(email).trim().toLowerCase() : "";
+
+    if (sid) {
+      const { data } = await supabase
+        .from("mega_customers")
+        .select("mg_pass_id")
+        .eq("mg_shopify_customer_id", sid)
+        .maybeSingle();
+      if (data?.mg_pass_id) return String(data.mg_pass_id);
+    }
+
+    if (em) {
+      const { data } = await supabase
+        .from("mega_customers")
+        .select("mg_pass_id")
+        .eq("mg_email", em)
+        .maybeSingle();
+      if (data?.mg_pass_id) return String(data.mg_pass_id);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 async function addCustomerTag(customerId, tag) {
   const id = String(customerId);
@@ -274,13 +305,16 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
-    // MEGA passId scheme consistent with MMA computePassId()
-    const passId =
-      shopifyCustomerId
-        ? `pass:shopify:${shopifyCustomerId}`
-        : email
-          ? `pass:email:${email}`
-          : `pass:anon:${crypto.randomUUID()}`;
+    const existingPassId = await resolveExistingPassIdForOrder({ shopifyCustomerId, email });
+
+const passId =
+  existingPassId ||
+  (shopifyCustomerId
+    ? `pass:shopify:${shopifyCustomerId}`
+    : email
+      ? `pass:email:${email}`
+      : `pass:anon:${crypto.randomUUID()}`);
+
 
     await megaEnsureCustomer({
       passId,

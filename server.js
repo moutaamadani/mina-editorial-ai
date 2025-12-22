@@ -1,14 +1,10 @@
-// server.js — Pure MMA + MEGA (Supabase service role). No legacy editorial/motion shims.
+// server.js — Pure MMA + MEGA wired (Supabase service role). No legacy editorial/motion shims.
 "use strict";
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "node:crypto";
-
-import Replicate from "replicate";
-import OpenAI from "openai";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { normalizeError } from "./server/logging/normalizeError.js";
 import { logError } from "./server/logging/logError.js";
@@ -32,16 +28,16 @@ import {
   megaWriteFeedback,
 } from "./mega-db.js";
 
-import { parseDataUrl } from "./r2.js";
 import { requireAdmin } from "./auth.js";
 
+// MMA router (your Part 3 router)
 import mmaRouter from "./server/mma/mma-router.js";
-import * as mmaControllerMod from "./server/mma/mma-controller.js";
 
+// Admin MMA logs router (optional, your existing file)
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 
 // ======================================================
-// Env / boot
+// Env / app boot
 // ======================================================
 const ENV = process.env;
 const IS_PROD = ENV.NODE_ENV === "production";
@@ -49,6 +45,17 @@ const PORT = Number(ENV.PORT || 8080);
 
 const app = express();
 app.set("trust proxy", 1);
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeString(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  const s = typeof v === "string" ? v : String(v);
+  const t = s.trim();
+  return t ? t : fallback;
+}
 
 // ======================================================
 // Process-level crash logging
@@ -86,68 +93,13 @@ process.on("uncaughtException", async (err) => {
 });
 
 // ======================================================
-// Small helpers
+// CORS
 // ======================================================
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function safeString(v, fallback = "") {
-  if (v === null || v === undefined) return fallback;
-  const s = typeof v === "string" ? v : String(v);
-  const t = s.trim();
-  return t ? t : fallback;
-}
-
-function getBearerToken(req) {
-  const raw = String(req.headers.authorization || "");
-  const m = raw.match(/^Bearer\s+(.+)$/i);
-  if (!m) return null;
-  const token = m[1].trim();
-  const lower = token.toLowerCase();
-  if (!token || lower === "null" || lower === "undefined" || lower === "[object object]") return null;
-  return token;
-}
-
-async function getAuthUser(req) {
-  const token = getBearerToken(req);
-  if (!token) return null;
-
-  const supabase = getSupabaseAdmin();
-  if (!supabase) return null;
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-
-  const userId = safeString(data.user.id, "");
-  const email = safeString(data.user.email, "").toLowerCase() || null;
-
-  if (!userId) return null;
-  return { userId, email, token };
-}
-
-function resolvePassIdForRequest(req, bodyLike = {}) {
-  // Uses YOUR mega-db.js resolver: body.customerId -> header x-mina-pass-id -> anon
-  return megaResolvePassId(req, bodyLike);
-}
-
-function setPassIdHeader(res, passId) {
-  if (passId) res.set("X-Mina-Pass-Id", passId);
-}
-
-// ======================================================
-// CORS (allowlist)
-// ======================================================
-const defaultAllowlist = [
-  "http://mina.faltastudio.com",
-  "https://mina-app-bvpn.onrender.com",
-];
-
+const defaultAllowlist = ["http://mina.faltastudio.com", "https://mina-app-bvpn.onrender.com"];
 const envAllowlist = (ENV.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
 const allowlist = Array.from(new Set([...defaultAllowlist, ...envAllowlist]));
 
 const corsOptions = {
@@ -168,7 +120,10 @@ app.options("*", cors(corsOptions));
 app.use((_req, res, next) => {
   const existing = res.get("Access-Control-Expose-Headers");
   const headers = existing
-    ? existing.split(",").map((h) => h.trim()).filter(Boolean)
+    ? existing
+        .split(",")
+        .map((h) => h.trim())
+        .filter(Boolean)
     : [];
   if (!headers.some((h) => h.toLowerCase() === "x-mina-pass-id")) headers.push("X-Mina-Pass-Id");
   res.set("Access-Control-Expose-Headers", headers.join(", "));
@@ -176,7 +131,7 @@ app.use((_req, res, next) => {
 });
 
 // ======================================================
-// Shopify webhook (RAW body + HMAC verify) -> MEGA credits
+// Shopify webhook (RAW body + HMAC verify) — MEGA credits
 // ======================================================
 const SHOPIFY_STORE_DOMAIN = ENV.SHOPIFY_STORE_DOMAIN || "";
 const SHOPIFY_ADMIN_TOKEN = ENV.SHOPIFY_ADMIN_TOKEN || "";
@@ -274,11 +229,10 @@ function creditsFromOrder(order) {
       credits += Number(CREDIT_PRODUCT_MAP[sku] || 0);
     }
   }
-
   return credits;
 }
 
-// Raw webhook route MUST be before express.json()
+// RAW webhook MUST be before express.json()
 app.post("/api/credits/shopify-order", express.raw({ type: "application/json" }), async (req, res) => {
   const requestId = `shopify_${Date.now()}_${crypto.randomUUID()}`;
 
@@ -299,7 +253,7 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const orderId = order?.id != null ? String(order.id) : null;
     if (!orderId) return res.status(400).json({ ok: false, error: "MISSING_ORDER_ID", requestId });
 
-    // Idempotency (MEGA ledger)
+    // idempotency
     const already = await megaHasCreditRef({ refType: "shopify_order", refId: orderId });
     if (already) return res.status(200).json({ ok: true, requestId, alreadyProcessed: true, orderId });
 
@@ -317,6 +271,7 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
+    // MEGA passId scheme consistent with MMA computePassId()
     const passId =
       shopifyCustomerId
         ? `pass:shopify:${shopifyCustomerId}`
@@ -324,14 +279,14 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
           ? `pass:email:${email}`
           : `pass:anon:${crypto.randomUUID()}`;
 
-    const grantedAt = order?.processed_at || order?.created_at || nowIso();
-
     await megaEnsureCustomer({
       passId,
       email,
       shopifyCustomerId: shopifyCustomerId || null,
       userId: null,
     });
+
+    const grantedAt = order?.processed_at || order?.created_at || nowIso();
 
     const out = await megaAdjustCredits({
       passId,
@@ -378,54 +333,47 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // ======================================================
-// Frontend error logger
+// Auth helper (service role validates a user token)
 // ======================================================
-app.post("/api/log-error", async (req, res) => {
-  try {
-    const body = req.body || {};
-    await logError({
-      action: "frontend.error",
-      status: 500,
-      route: body.url || "/(frontend)",
-      method: "FRONTEND",
-      message: body.message || "Frontend crash",
-      stack: body.stack,
-      userAgent: body.userAgent || req.get("user-agent"),
-      ip: req.headers["x-forwarded-for"] || req.ip,
-      userId: body.userId,
-      email: body.email,
-      emoji: "🖥️",
-      code: "FRONTEND_CRASH",
-      detail: { ...(body.extra || {}) },
-      sourceSystem: "mina-frontend",
-    });
-  } catch (err) {
-    console.error("[POST /api/log-error] failed to record", err);
-  }
-  res.json({ ok: true });
-});
+function getBearerToken(req) {
+  const raw = String(req.headers.authorization || "");
+  const match = raw.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
 
-// ======================================================
-// MMA init (IMPORTANT): if mma-controller exports a factory, call it once
-// ======================================================
-const supabaseAdmin = getSupabaseAdmin(); // may be null if env missing
-const openai = new OpenAI({ apiKey: ENV.OPENAI_API_KEY || "" });
-const replicate = new Replicate({ auth: ENV.REPLICATE_API_TOKEN || "" });
+  const token = match[1].trim();
+  const lower = token.toLowerCase();
+  if (!token || lower === "null" || lower === "undefined" || lower === "[object object]") return null;
+  return token;
+}
 
-// If your mma-controller uses module-level state, this boot call wires clients once.
-// Safe: if factory doesn't exist, we do nothing.
-const createMmaController = mmaControllerMod.createMmaController || mmaControllerMod.default;
-if (typeof createMmaController === "function") {
-  try {
-    createMmaController({ supabaseAdmin, openai, replicate });
-    console.log("[mma] controller initialized");
-  } catch (e) {
-    console.warn("[mma] controller init failed (continuing):", e?.message || e);
-  }
+async function getAuthUser(req) {
+  const token = getBearerToken(req);
+  if (!token) return null;
+
+  const supabase = getSupabaseAdmin();
+  if (!supabase) return null;
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+
+  const userId = safeString(data.user.id, "");
+  const email = safeString(data.user.email, "").toLowerCase() || null;
+  if (!userId) return null;
+
+  return { userId, email, token };
+}
+
+function resolvePassIdForRequest(req, bodyLike = {}) {
+  // Uses YOUR mega-db.js resolver: body.customerId -> header x-mina-pass-id -> anon
+  return megaResolvePassId(req, bodyLike);
+}
+
+function setPassIdHeader(res, passId) {
+  if (passId) res.set("X-Mina-Pass-Id", passId);
 }
 
 // ======================================================
-// Core routes (MEGA)
+// Core routes (MEGA-only)
 // ======================================================
 
 app.get("/health", (_req, res) => {
@@ -440,17 +388,14 @@ app.get("/health", (_req, res) => {
 
 app.get("/me", async (req, res) => {
   const requestId = `me_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     const authUser = await getAuthUser(req);
 
-    // base passId from header/body (GET => header or anon)
-    let passId = resolvePassIdForRequest(req, {});
-
-    // If logged in and no explicit header, prefer stable user passId
+    // passId: header/body -> anon, but if authed and no header, stabilize to pass:user:<id>
     const incomingHeader = safeString(req.get("x-mina-pass-id"), "");
-    if (authUser?.userId && !incomingHeader) {
-      passId = `pass:user:${authUser.userId}`;
-    }
+    let passId = resolvePassIdForRequest(req, {});
+    if (authUser?.userId && !incomingHeader) passId = `pass:user:${authUser.userId}`;
 
     setPassIdHeader(res, passId);
 
@@ -507,6 +452,7 @@ app.get("/me", async (req, res) => {
 
 app.get("/credits/balance", async (req, res) => {
   const requestId = `credits_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
@@ -523,6 +469,7 @@ app.get("/credits/balance", async (req, res) => {
     });
 
     const { credits, expiresAt } = await megaGetCredits(passId);
+
     return res.json({
       ok: true,
       requestId,
@@ -533,17 +480,24 @@ app.get("/credits/balance", async (req, res) => {
     });
   } catch (e) {
     console.error("GET /credits/balance failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "CREDITS_FAILED", message: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "CREDITS_FAILED",
+      message: e?.message || String(e),
+    });
   }
 });
 
 app.post("/credits/add", async (req, res) => {
   const requestId = `add_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
     const body = req.body || {};
     const amount = typeof body.amount === "number" ? body.amount : Number(body.amount || 0);
+
     if (!Number.isFinite(amount) || amount === 0) {
       return res.status(400).json({ ok: false, requestId, error: "INVALID_AMOUNT" });
     }
@@ -578,12 +532,18 @@ app.post("/credits/add", async (req, res) => {
     });
   } catch (e) {
     console.error("POST /credits/add failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "CREDITS_ADD_FAILED", message: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "CREDITS_ADD_FAILED",
+      message: e?.message || String(e),
+    });
   }
 });
 
 app.post("/sessions/start", async (req, res) => {
   const requestId = `sess_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
@@ -622,12 +582,18 @@ app.post("/sessions/start", async (req, res) => {
     });
   } catch (e) {
     console.error("POST /sessions/start failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "SESSION_FAILED", message: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "SESSION_FAILED",
+      message: e?.message || String(e),
+    });
   }
 });
 
 app.post("/feedback", async (req, res) => {
   const requestId = `fb_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
@@ -643,30 +609,43 @@ app.post("/feedback", async (req, res) => {
     });
 
     const generationId = safeString(body.generationId || body.generation_id, null);
+
     const payload =
       body.payload && typeof body.payload === "object"
         ? body.payload
         : {
-            type: safeString(body.type, "feedback"),
+            event_type: safeString(body.event_type, "feedback"),
+            payload: body.payload || {},
             tags: Array.isArray(body.tags) ? body.tags : undefined,
             hard_block: safeString(body.hard_block, "") || undefined,
             note: safeString(body.note, "") || undefined,
           };
 
     const out = await megaWriteFeedback({ passId, generationId, payload });
-    return res.json({ ok: true, requestId, passId, feedbackId: out.feedbackId });
+
+    return res.json({
+      ok: true,
+      requestId,
+      passId,
+      feedbackId: out.feedbackId,
+    });
   } catch (e) {
     console.error("POST /feedback failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "FEEDBACK_FAILED", message: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: "FEEDBACK_FAILED",
+      message: e?.message || String(e),
+    });
   }
 });
 
 // ======================================================
-// MMA routes (your router as-is)
+// MMA API (primary)
 // ======================================================
 app.use("/mma", mmaRouter);
 
-// MMA admin logs
+// Optional: separate admin log router (your file)
 app.use("/admin/mma", mmaLogAdminRouter);
 
 // ======================================================
@@ -704,6 +683,7 @@ app.get("/admin/summary", requireAdmin, async (req, res) => {
 
 app.post("/admin/credits/adjust", requireAdmin, async (req, res) => {
   const requestId = `admcred_${Date.now()}_${crypto.randomUUID()}`;
+
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 

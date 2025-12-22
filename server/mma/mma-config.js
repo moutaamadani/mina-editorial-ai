@@ -1,4 +1,4 @@
-// src/routes/mma/mma-config.js
+//./server/mma/mma-config.js
 const pickEnv = (keys, fallback = "") => {
   for (const k of keys) {
     const v = process.env[k];

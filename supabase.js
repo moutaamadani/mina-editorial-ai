@@ -1,4 +1,4 @@
-// Hero Part 1: Admin-only Supabase helpers
+// supabase.js Part 1: Admin-only Supabase helpers
 // Part 1.1: Initializes a cached admin client and writes basic audit/profile rows.
 // Part 1.1.1: Use these helpers from auth + server code instead of duplicating queries.
 // Part 1.2: Normalization + safety helpers keep audit rows consistent and short.

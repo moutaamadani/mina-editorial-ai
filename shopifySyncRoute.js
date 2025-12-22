@@ -1,6 +1,6 @@
 // shopifySyncRoute.js (ESM)
 import { findAndTagCustomerByEmail } from "./shopifyAdmin.js";
-import { upsertMegaCustomerLead } from "./megaCustomersLead.js";
+import { upsertMegaCustomerLead } from "./src/megaCustomersLead.js";
 
 function cleanStr(v) {
   const s = String(v || "").trim();

@@ -3,6 +3,7 @@ import express from "express";
 import OpenAI from "openai";
 import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { megaEnsureCustomer } from "../../mega-db.js";
 
 import { getSupabaseAdmin } from "../../supabase.js";
 import {
@@ -110,30 +111,16 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 // ---------------------------
 // DB helpers
 // ---------------------------
-async function ensureCustomerRow(supabase, passId, { shopifyCustomerId, userId, email }) {
-  const { data } = await supabase
-    .from("mega_customers")
-    .select("mg_pass_id, mg_mma_preferences")
-    .eq("mg_pass_id", passId)
-    .maybeSingle();
-
-  const prefs = data?.mg_mma_preferences || {};
-
-  if (!data) {
-    await supabase.from("mega_customers").insert({
-      mg_pass_id: passId,
-      mg_shopify_customer_id: shopifyCustomerId || null,
-      mg_user_id: userId || null,
-      mg_email: email || null,
-      mg_credits: 0,
-      mg_mma_preferences: prefs,
-      mg_created_at: nowIso(),
-      mg_updated_at: nowIso(),
-    });
-  }
-
-  return { preferences: prefs };
+async function ensureCustomerRow(_supabase, passId, { shopifyCustomerId, userId, email }) {
+  const out = await megaEnsureCustomer({
+    passId,
+    shopifyCustomerId: shopifyCustomerId || null,
+    userId: userId || null,
+    email: email || null,
+  });
+  return { preferences: out?.preferences || {} };
 }
+
 
 async function writeGeneration({ supabase, generationId, parentId, passId, vars, mode }) {
   const identifiers = generationIdentifiers(generationId);

@@ -213,6 +213,32 @@ router.get("/history/pass/:passId", async (req, res) => {
           createdAt: String(r.mg_created_at || nowIso()),
         };
       });
+    // If truly empty, create a first "welcome" session so UI is never empty
+if (!sessions.length && !generations.length && !feedbacks.length) {
+  const sid = crypto.randomUUID();
+
+  // real DB row (so next call returns it too)
+  try {
+    const { megaWriteSession } = await import("../mega-db.js");
+    await megaWriteSession({
+      passId: primaryPassId,
+      sessionId: sid,
+      platform: "web",
+      title: "Welcome ✨",
+      meta: { placeholder: true },
+    });
+  } catch {}
+
+  sessions.push({
+    id: `session:${sid}`,
+    sessionId: sid,
+    passId: primaryPassId,
+    platform: "web",
+    title: "Welcome ✨",
+    createdAt: new Date().toISOString(),
+    placeholder: true,
+  });
+}
 
     return res.json({
       ok: true,

@@ -266,6 +266,103 @@ function creditsFromOrder(order) {
   }
   return credits;
 }
+// ======================================================
+// Shopify ↔ MEGA passId reconciliation helpers
+// ======================================================
+
+// NOTE: adjust these column names ONLY if your mega_customers schema differs
+const MEGA_CUSTOMERS_TABLE = "mega_customers";
+const COL_PASS_ID = "mg_pass_id";
+const COL_EMAIL = "mg_email";
+const COL_SHOPIFY_ID = "mg_shopify_customer_id";
+const COL_UPDATED_AT = "mg_updated_at";
+
+// Find the "best" existing passId for this Shopify identity
+async function findExistingPassIdForShopify({ supabase, shopifyCustomerId, email }) {
+  if (!supabase) return null;
+
+  const filters = [];
+  if (shopifyCustomerId) filters.push(`${COL_SHOPIFY_ID}.eq.${shopifyCustomerId}`);
+  if (email) filters.push(`${COL_EMAIL}.eq.${email}`);
+  if (!filters.length) return null;
+
+  const { data, error } = await supabase
+    .from(MEGA_CUSTOMERS_TABLE)
+    .select(`${COL_PASS_ID}, ${COL_EMAIL}, ${COL_SHOPIFY_ID}, ${COL_UPDATED_AT}`)
+    .or(filters.join(","))
+    .order(COL_UPDATED_AT, { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data?.[COL_PASS_ID] || null;
+}
+
+// Merge credits from any other passIds with the same email into primaryPassId.
+// This fixes "I bought on Shopify but my app balance didn't change".
+async function mergeCreditsByEmail({ supabase, primaryPassId, email }) {
+  if (!supabase || !primaryPassId || !email) return;
+
+  const { data, error } = await supabase
+    .from(MEGA_CUSTOMERS_TABLE)
+    .select(`${COL_PASS_ID}, ${COL_EMAIL}, ${COL_SHOPIFY_ID}, ${COL_UPDATED_AT}`)
+    .eq(COL_EMAIL, email)
+    .order(COL_UPDATED_AT, { ascending: false })
+    .limit(10);
+
+  if (error) throw error;
+
+  const rows = Array.isArray(data) ? data : [];
+  for (const r of rows) {
+    const otherPassId = r?.[COL_PASS_ID];
+    const otherShopifyId = r?.[COL_SHOPIFY_ID] || null;
+    if (!otherPassId || otherPassId === primaryPassId) continue;
+
+    // If this other record has a Shopify id, attach it to primary so future webhook lookups find it.
+    if (otherShopifyId) {
+      try {
+        await megaEnsureCustomer({
+          passId: primaryPassId,
+          email,
+          shopifyCustomerId: String(otherShopifyId),
+          userId: null,
+        });
+      } catch {}
+    }
+
+    // Move any existing balance over (idempotent via credit ref)
+    const { credits: otherCredits } = await megaGetCredits(otherPassId);
+    const amount = Number(otherCredits || 0);
+    if (amount <= 0) continue;
+
+    const refId = `merge:${otherPassId}=>${primaryPassId}`;
+
+    const already = await megaHasCreditRef({ refType: "merge", refId });
+    if (already) continue;
+
+    // Add to primary
+    await megaAdjustCredits({
+      passId: primaryPassId,
+      delta: amount,
+      reason: "credits-merge-in",
+      source: "shopify-sync",
+      refType: "merge",
+      refId,
+      grantedAt: nowIso(),
+    });
+
+    // Remove from secondary
+    await megaAdjustCredits({
+      passId: otherPassId,
+      delta: -amount,
+      reason: "credits-merge-out",
+      source: "shopify-sync",
+      refType: "merge_out",
+      refId,
+      grantedAt: nowIso(),
+    });
+  }
+}
 
 // RAW webhook MUST be before express.json()
 app.post("/api/credits/shopify-order", express.raw({ type: "application/json" }), async (req, res) => {
@@ -295,14 +392,32 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
+    const supabase = getSupabaseAdmin();
+    
+    // ✅ Try to credit the SAME passId the app already uses (pass:user:*), if it exists.
+    const existingPassId = await findExistingPassIdForShopify({
+      supabase,
+      shopifyCustomerId,
+      email,
+    });
+    
     const passId =
-      shopifyCustomerId
+      existingPassId ||
+      (shopifyCustomerId
         ? `pass:shopify:${shopifyCustomerId}`
         : email
           ? `pass:email:${email}`
-          : `pass:anon:${crypto.randomUUID()}`;
+          : `pass:anon:${crypto.randomUUID()}`);
+
 
     await megaEnsureCustomer({ passId, email, shopifyCustomerId: shopifyCustomerId || null, userId: null });
+    // ✅ If we credited an existing passId, ensure Shopify id/email are attached to that row too.
+    await megaEnsureCustomer({
+      passId,
+      email,
+      shopifyCustomerId: shopifyCustomerId || null,
+      userId: null,
+    });
 
     const grantedAt = order?.processed_at || order?.created_at || nowIso();
 
@@ -410,6 +525,18 @@ app.post("/auth/shopify-sync", async (req, res) => {
 
     if (sbEnabled()) {
       await megaEnsureCustomer({ passId, userId: authUser.userId, email: authUser.email || null });
+            // ✅ Pull any credits from Shopify/email passIds into the logged-in user passId
+      try {
+        const supabase = getSupabaseAdmin();
+        await mergeCreditsByEmail({
+          supabase,
+          primaryPassId: passId,
+          email: authUser.email || null,
+        });
+      } catch (e) {
+        console.warn("[shopify-sync] merge credits failed:", e?.message || e);
+      }
+
     }
 
     return res.status(200).json({ ok: true, loggedIn: true, passId, email: authUser.email || null });

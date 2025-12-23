@@ -4,10 +4,9 @@ import OpenAI from "openai";
 import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { megaEnsureCustomer } from "../../mega-db.js";
-
 import { getSupabaseAdmin } from "../../supabase.js";
+
 import {
-  appendScanLine,
   computePassId,
   eventIdentifiers,
   generationIdentifiers,
@@ -16,8 +15,28 @@ import {
   nowIso,
   stepIdentifiers,
 } from "./mma-utils.js";
+
 import { addSseClient, sendDone, sendScanLine, sendStatus } from "./mma-sse.js";
 import { getMmaConfig } from "./mma-config.js";
+
+// ============================================================================
+// MMA (STILL) REAL PIPELINE
+// - GPTscanner (vision): scan each user image -> crt + userMessage line
+// - Like-history (vision optional): keywords -> style_history_csv
+// - GPT reader (vision): clean_prompt + userMessage line
+// - Seedream (Replicate): generate still
+// - Output scan (vision): still_crt + userMessage line
+//
+// TWEAK STILL PIPELINE
+// - Scan parent output (still_crt) (or reuse saved)
+// - GPT feedback fixer (vision): new clean_prompt
+// - Seedream with image_input=[parent_output] (image-to-image)
+// - Output scan (vision): new still_crt
+//
+// Storage:
+// - mega_generations (mg_record_type="generation") => mg_mma_vars (full state over time)
+// - mega_generations (mg_record_type="mma_step")   => mg_payload per step (ctx+request+raw+parsed+timing)
+// ============================================================================
 
 // ---------------------------
 // Clients (cached singletons)
@@ -457,7 +476,445 @@ async function fetchRecentLikedItems({ supabase, passId, limit }) {
 }
 
 // ---------------------------
-// R2 Public store (self-contained)
+// Small helpers
+// ---------------------------
+function safeStr(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  const s = typeof v === "string" ? v : String(v);
+  const t = s.trim();
+  return t ? t : fallback;
+}
+
+function asHttpUrl(u) {
+  const s = safeStr(u, "");
+  return s.startsWith("http") ? s : "";
+}
+
+function safeArray(x) {
+  return Array.isArray(x) ? x : [];
+}
+
+function parseJsonMaybe(v) {
+  if (!v) return null;
+  if (typeof v === "object") return v;
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function pushUserMessageLine(vars, text) {
+  const t = safeStr(text, "");
+  if (!t) return vars;
+
+  const next = { ...(vars || {}) };
+  next.userMessages = { ...(next.userMessages || {}) };
+
+  const prev = Array.isArray(next.userMessages.scan_lines) ? next.userMessages.scan_lines : [];
+  const index = prev.length;
+
+  next.userMessages.scan_lines = [...prev, { text: t, index }];
+  return next;
+}
+
+function lastScanLine(vars, fallbackText) {
+  const lines = vars?.userMessages?.scan_lines;
+  const last = Array.isArray(lines) ? lines[lines.length - 1] : null;
+  return last || { text: fallbackText, index: Array.isArray(lines) ? lines.length : 0 };
+}
+
+// ---------------------------
+// ctx config (editable in mega_admin)
+// ---------------------------
+/**
+ * table: mega_admin
+ * row: mg_record_type = 'app_config', mg_key = 'mma_ctx'
+ * col: mg_value (jsonb)
+ *
+ * keys:
+ * - scanner
+ * - like_history
+ * - reader
+ * - output_scan
+ * - feedback
+ */
+async function getMmaCtxConfig(supabase) {
+  const defaults = {
+    scanner: [
+      "You are Mina GPTscanner.",
+      "You will be given ONE image.",
+      'Output STRICT JSON only (no markdown): {"crt":string,"userMessage":string}',
+      "crt: short factual 1-sentence description (max 220 chars). Also hint if product/logo/inspiration.",
+      "userMessage: short friendly line while user waits (joke/fact/quote/advice/compliment). Max 140 chars.",
+      "Do NOT mention technical errors like CORS.",
+    ].join("\n"),
+
+    like_history: [
+      "You are Mina Style Memory.",
+      "You receive recently liked generations (prompt + maybe image).",
+      'Output STRICT JSON only: {"style_history_csv":string}',
+      "style_history_csv: comma-separated keywords (5 to 12). No hashtags. No sentences.",
+      'Example: "editorial still life, luxury, minimal, soft shadows, no lens flare"',
+    ].join("\n"),
+
+    reader: [
+      "You are Mina Mind — prompt builder for Seedream (still images ONLY).",
+      "You will receive product_crt/logo_crt/inspiration_crt + userBrief + style + style_history_csv.",
+      'Output STRICT JSON only: {"clean_prompt":string,"userMessage":string}',
+      "clean_prompt must be Seedream-ready: photoreal editorial, concise but detailed.",
+      "Respect logo integration if logo_crt exists. Use inspirations if provided.",
+      "userMessage: one friendly line to show while generating (max 140 chars).",
+    ].join("\n"),
+
+    output_scan: [
+      "You are Mina GPTscanner (output scan).",
+      "You will be given the GENERATED image.",
+      'Output STRICT JSON only: {"still_crt":string,"userMessage":string}',
+      "still_crt: short 1-sentence description of the generated image (max 220 chars).",
+      "userMessage: short friendly line (max 140 chars).",
+    ].join("\n"),
+
+    feedback: [
+      "You are Mina Feedback Fixer for Seedream still images.",
+      "You will receive: generated image + still_crt + user feedback text + previous prompt.",
+      'Output STRICT JSON only: {"clean_prompt":string}',
+      "clean_prompt must keep what's good, fix what's bad, and apply feedback precisely.",
+    ].join("\n"),
+  };
+
+  try {
+    const { data, error } = await supabase
+      .from("mega_admin")
+      .select("mg_value")
+      .eq("mg_record_type", "app_config")
+      .eq("mg_key", "mma_ctx")
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const overrides = data?.mg_value && typeof data.mg_value === "object" ? data.mg_value : {};
+    return { ...defaults, ...overrides };
+  } catch {
+    return defaults;
+  }
+}
+
+// ---------------------------
+// OpenAI vision JSON helper (Responses API preferred)
+// ---------------------------
+function buildResponsesUserContent({ text, imageUrls }) {
+  const parts = [];
+  const t = safeStr(text, "");
+  if (t) parts.push({ type: "input_text", text: t });
+
+  for (const u of Array.isArray(imageUrls) ? imageUrls : []) {
+    const url = asHttpUrl(u);
+    if (!url) continue;
+    parts.push({ type: "input_image", image_url: url });
+  }
+  return parts;
+}
+
+function extractResponsesText(resp) {
+  // SDK usually provides output_text
+  if (resp && typeof resp.output_text === "string") return resp.output_text;
+
+  // Fallback: walk output items
+  const out = resp?.output;
+  if (!Array.isArray(out)) return "";
+
+  let text = "";
+  for (const item of out) {
+    if (item?.type === "message" && Array.isArray(item?.content)) {
+      for (const c of item.content) {
+        // output_text chunks
+        if (c?.type === "output_text" && typeof c?.text === "string") {
+          text += c.text;
+        }
+      }
+    }
+  }
+  return text || "";
+}
+
+async function openaiJsonVision({ model, system, userText, imageUrls }) {
+  const openai = getOpenAI();
+
+  const input = [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content: buildResponsesUserContent({ text: userText, imageUrls }),
+    },
+  ];
+
+  // Prefer Responses API (vision + structured JSON)
+  try {
+    if (openai.responses?.create) {
+      const resp = await openai.responses.create({
+        model,
+        input,
+        text: { format: { type: "json_object" } },
+      });
+
+      const raw = extractResponsesText(resp);
+      const parsed = parseJsonMaybe(raw);
+
+      return {
+        request: { model, input, text: { format: { type: "json_object" } } },
+        raw,
+        parsed,
+      };
+    }
+  } catch (e) {
+    // fall through to chat.completions fallback
+  }
+
+  // Fallback: Chat Completions (older SDK setups)
+  const messages = [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: safeStr(userText, "") },
+        ...safeArray(imageUrls)
+          .map(asHttpUrl)
+          .filter(Boolean)
+          .map((url) => ({ type: "image_url", image_url: { url } })),
+      ],
+    },
+  ];
+
+  const resp = await openai.chat.completions.create({
+    model,
+    messages,
+    // try to force JSON if supported
+    response_format: { type: "json_object" },
+  });
+
+  const raw = resp?.choices?.[0]?.message?.content || "";
+  const parsed = parseJsonMaybe(raw);
+
+  return {
+    request: { model, messages, response_format: { type: "json_object" } },
+    raw,
+    parsed,
+  };
+}
+
+// ---------------------------
+// GPT steps (scanner/reader/feedback)
+// ---------------------------
+async function gptScanImage({ cfg, ctx, kind, imageUrl }) {
+  const userText = [`KIND: ${kind}`, "Return JSON only."].join("\n");
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.scanner,
+    userText,
+    imageUrls: [imageUrl],
+  });
+
+  const crt = safeStr(out?.parsed?.crt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return { crt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptMakeStyleHistory({ cfg, ctx, likeItems }) {
+  const userText = [
+    "RECENT_LIKES (prompt + imageUrl):",
+    JSON.stringify(likeItems, null, 2).slice(0, 12000),
+    "Return JSON only.",
+  ].join("\n");
+
+  const imageUrls = likeItems
+    .map((x) => asHttpUrl(x?.imageUrl))
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.like_history,
+    userText,
+    imageUrls,
+  });
+
+  const style_history_csv = safeStr(out?.parsed?.style_history_csv, "");
+  return { style_history_csv, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptReader({ cfg, ctx, input, imageUrls }) {
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.reader,
+    userText: JSON.stringify(input, null, 2).slice(0, 14000),
+    imageUrls: (Array.isArray(imageUrls) ? imageUrls : []).slice(0, 10),
+  });
+
+  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return { clean_prompt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptScanOutputStill({ cfg, ctx, imageUrl }) {
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.output_scan,
+    userText: "Scan this generated image. Return JSON only.",
+    imageUrls: [imageUrl],
+  });
+
+  const still_crt = safeStr(out?.parsed?.still_crt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return { still_crt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptFeedbackFixer({ cfg, ctx, parentImageUrl, stillCrt, feedbackText, previousPrompt }) {
+  const input = {
+    parent_image_url: parentImageUrl,
+    still_crt: safeStr(stillCrt, ""),
+    feedback: safeStr(feedbackText, ""),
+    previous_prompt: safeStr(previousPrompt, ""),
+  };
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.feedback,
+    userText: JSON.stringify(input, null, 2).slice(0, 14000),
+    imageUrls: [parentImageUrl],
+  });
+
+  const clean_prompt =
+    safeStr(out?.parsed?.clean_prompt, "") ||
+    safeStr(out?.parsed?.prompt, "") ||
+    "";
+
+  return { clean_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+// ---------------------------
+// Replicate helpers
+// ---------------------------
+function pickFirstUrl(output) {
+  if (!output) return "";
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return pickFirstUrl(output[0]);
+  if (typeof output === "object") {
+    if (typeof output.url === "string") return output.url;
+    if (typeof output.output === "string") return output.output;
+  }
+  return "";
+}
+
+function buildSeedreamImageInputs(vars) {
+  const assets = vars?.assets || {};
+
+  const product = asHttpUrl(assets.product_image_url || assets.productImageUrl);
+  const logo = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+
+  const styleHero = asHttpUrl(
+    assets.style_hero_image_url ||
+      assets.styleHeroImageUrl ||
+      assets.style_hero_url ||
+      assets.styleHeroUrl
+  );
+
+  const inspiration = safeArray(
+    assets.inspiration_image_urls ||
+      assets.inspirationImageUrls ||
+      assets.style_image_urls ||
+      assets.styleImageUrls
+  )
+    .map(asHttpUrl)
+    .filter(Boolean)
+    .slice(0, 4);
+
+  // Spec order:
+  // product, logo, inspirations, style hero
+  return []
+    .concat(product ? [product] : [])
+    .concat(logo ? [logo] : [])
+    .concat(inspiration)
+    .concat(styleHero ? [styleHero] : [])
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhancePrompt, input: forcedInput }) {
+  const replicate = getReplicate();
+
+  const cfg = getMmaConfig();
+  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K";
+  const defaultAspect = process.env.MMA_SEADREAM_ASPECT_RATIO || cfg?.seadream?.aspectRatio || "match_input_image";
+
+  const version =
+    process.env.MMA_SEADREAM_VERSION ||
+    process.env.MMA_SEADREAM_MODEL_VERSION ||
+    cfg?.seadream?.model ||
+    "bytedance/seedream-4";
+
+  const neg =
+    process.env.NEGATIVE_PROMPT_SEADREAM ||
+    process.env.MMA_NEGATIVE_PROMPT_SEADREAM ||
+    cfg?.seadream?.negativePrompt ||
+    "";
+
+  const finalPrompt = neg ? `${prompt}\n\nAvoid: ${neg}` : prompt;
+
+  const cleanedInputs = Array.isArray(imageInputs)
+    ? imageInputs.map(asHttpUrl).filter(Boolean).slice(0, 10)
+    : [];
+
+  const enhance_prompt =
+    enhancePrompt !== undefined
+      ? enhancePrompt
+      : cfg?.seadream?.enhancePrompt !== undefined
+        ? !!cfg.seadream.enhancePrompt
+        : true;
+
+  const input = forcedInput
+    ? { ...forcedInput, prompt: forcedInput.prompt || finalPrompt }
+    : {
+        prompt: finalPrompt,
+        size: sizeValue,
+        aspect_ratio: aspectRatio || defaultAspect,
+        enhance_prompt,
+        sequential_image_generation: "disabled",
+        max_images: 1,
+        ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
+      };
+
+  // enforce required fields
+  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
+  if (!input.size) input.size = sizeValue;
+  if (input.enhance_prompt === undefined) input.enhance_prompt = enhance_prompt;
+  if (!input.sequential_image_generation) input.sequential_image_generation = "disabled";
+  if (!input.max_images) input.max_images = 1;
+  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+
+  const t0 = Date.now();
+  const out = await replicate.run(version, { input });
+
+  return {
+    input,
+    out,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+  };
+}
+
+// ---------------------------
+// R2 Public store
 // ---------------------------
 function getR2() {
   const accountId = process.env.R2_ACCOUNT_ID || "";
@@ -489,9 +946,6 @@ function guessExt(url, fallback = ".bin") {
     if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return ".jpg";
     if (p.endsWith(".webp")) return ".webp";
     if (p.endsWith(".gif")) return ".gif";
-    if (p.endsWith(".mp4")) return ".mp4";
-    if (p.endsWith(".webm")) return ".webm";
-    if (p.endsWith(".mov")) return ".mov";
     return fallback;
   } catch {
     return fallback;
@@ -503,7 +957,6 @@ async function storeRemoteToR2Public(url, keyPrefix) {
   if (!enabled || !client) return url;
   if (!url || typeof url !== "string") return url;
 
-  // already public/stable
   if (publicBase && url.startsWith(publicBase)) return url;
 
   const res = await fetch(url);
@@ -511,7 +964,7 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 
   const buf = Buffer.from(await res.arrayBuffer());
   const contentType = res.headers.get("content-type") || "application/octet-stream";
-  const ext = guessExt(url, contentType.includes("video") ? ".mp4" : ".png");
+  const ext = guessExt(url, ".png");
   const objKey = `${keyPrefix}${ext}`;
 
   await client.send(
@@ -539,7 +992,6 @@ async function ensureCustomerRow(_supabase, passId, { shopifyCustomerId, userId,
   return { preferences: out?.preferences || {} };
 }
 
-
 async function writeGeneration({ supabase, generationId, parentId, passId, vars, mode }) {
   const identifiers = generationIdentifiers(generationId);
   await supabase.from("mega_generations").insert({
@@ -557,11 +1009,12 @@ async function writeGeneration({ supabase, generationId, parentId, passId, vars,
   });
 }
 
-async function writeStep({ supabase, generationId, stepNo, stepType, payload }) {
+async function writeStep({ supabase, generationId, passId, stepNo, stepType, payload }) {
   const identifiers = stepIdentifiers(generationId, stepNo);
   await supabase.from("mega_generations").insert({
     ...identifiers,
     mg_parent_id: `generation:${generationId}`,
+    mg_pass_id: passId || null,
     mg_step_type: stepType,
     mg_payload: payload,
     mg_created_at: nowIso(),
@@ -599,22 +1052,31 @@ async function updateStatus({ supabase, generationId, status }) {
     .eq("mg_record_type", "generation");
 }
 
-// ---------------------------
-// Production pipeline
-// ---------------------------
-function pickFirstUrl(output) {
-  if (!output) return "";
-  if (typeof output === "string") return output;
-  if (Array.isArray(output)) return pickFirstUrl(output[0]);
-  if (typeof output === "object") {
-    if (typeof output.url === "string") return output.url;
-    if (typeof output.output === "string") return output.output;
-  }
-  return "";
+async function fetchParentGenerationRow(supabase, parentGenerationId) {
+  const { data, error } = await supabase
+    .from("mega_generations")
+    .select("mg_pass_id, mg_output_url, mg_prompt, mg_mma_vars, mg_mma_mode, mg_status, mg_error")
+    .eq("mg_generation_id", parentGenerationId)
+    .eq("mg_record_type", "generation")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
 }
 
-function safeArray(x) {
-  return Array.isArray(x) ? x : [];
+// Likes in YOUR DB are sometimes stored as JSON string in mg_meta, not mg_payload.
+function extractFeedbackLikePayload(row) {
+  const payload = parseJsonMaybe(row?.mg_payload);
+  if (payload) return payload;
+
+  const meta = parseJsonMaybe(row?.mg_meta);
+  if (!meta) return null;
+
+  // if event wrapper exists
+  if (meta.payload && typeof meta.payload === "object") return meta.payload;
+
+  // sometimes mg_meta IS the payload
+  return meta;
 }
 
 function buildSeedreamImageInputs(vars) {
@@ -650,72 +1112,96 @@ function buildSeedreamImageInputs(vars) {
   return ordered;
 }
 
-async function runSeedream({
-  prompt,
-  aspectRatio,
-  imageInputs = [],
-  size,
-  enhancePrompt,
-  input: forcedInput,
-}) {
-  const replicate = getReplicate();
+    // 1b) Like-history -> style_history_csv
+    const visionOn = !!working?.history?.vision_intelligence;
+    const likeLimit = visionOn ? 5 : 20;
 
-  const sizeValue = size || process.env.MMA_SEADREAM_SIZE || "2K";
-  const enhancePromptRaw = process.env.MMA_SEADREAM_ENHANCE_PROMPT;
-  const enhance_prompt =
-    enhancePrompt !== undefined
-      ? enhancePrompt
-      : enhancePromptRaw === undefined
-        ? true
-        : String(enhancePromptRaw).toLowerCase() === "true";
+    try {
+      const likes = await fetchRecentLikedItems({ supabase, passId, limit: likeLimit });
+      if (likes.length) {
+        const t0 = Date.now();
+        const style = await gptMakeStyleHistory({ cfg, ctx, likeItems: likes });
 
-  const defaultAspect = process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
-  const version =
-    process.env.MMA_SEADREAM_VERSION || process.env.MMA_SEADREAM_MODEL_VERSION || "bytedance/seedream-4";
+        await writeStep({
+          supabase,
+          generationId,
+          passId,
+          stepNo: stepNo++,
+          stepType: "gpt_like_history",
+          payload: {
+            ctx: ctx.like_history,
+            input: { vision_intelligence: visionOn, limit: likeLimit, likes },
+            request: style.request,
+            raw: style.raw,
+            output: { style_history_csv: style.style_history_csv, parsed_ok: style.parsed_ok },
+            timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+            error: null,
+          },
+        });
 
-  const neg =
-    process.env.NEGATIVE_PROMPT_SEADREAM ||
-    process.env.MMA_NEGATIVE_PROMPT_SEADREAM ||
-    "";
+        working.history = { ...(working.history || {}), style_history_csv: style.style_history_csv || null };
 
-  const finalPrompt = neg ? `${prompt}\n\nAvoid: ${neg}` : prompt;
+        working = pushUserMessageLine(working, "Remembered your style preferences 🧠✨");
+        await updateVars({ supabase, generationId, vars: working });
+        sendScanLine(generationId, lastScanLine(working, "Remembered your style preferences 🧠✨"));
+      }
+    } catch {
+      // optional
+    }
 
-  const cleanedInputs = Array.isArray(imageInputs)
-    ? imageInputs.filter((u) => typeof u === "string" && u.startsWith("http")).slice(0, 10)
-    : [];
+    // 2) GPT reader
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    sendStatus(generationId, "prompting");
 
-  const input = forcedInput
-    ? { ...forcedInput, prompt: forcedInput.prompt || finalPrompt }
-    : {
-        prompt: finalPrompt,
-        size: sizeValue,
-        aspect_ratio: aspectRatio || defaultAspect,
-        enhance_prompt,
-        sequential_image_generation: "disabled",
-        max_images: 1,
-        ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
-      };
+    const readerInput = {
+      product_crt: safeStr(working?.scans?.product_crt || ""),
+      logo_crt: safeStr(working?.scans?.logo_crt || ""),
+      inspiration_crt: Array.isArray(working?.scans?.inspiration_crt) ? working.scans.inspiration_crt : [],
+      style_hero_crt: safeStr(working?.scans?.style_hero_crt || ""),
+      userBrief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief || ""),
+      style: safeStr(working?.inputs?.style || ""),
+      aspect_ratio: safeStr(working?.inputs?.aspect_ratio || ""),
+      platform: safeStr(working?.inputs?.platform || "default"),
+      style_history_csv: safeStr(working?.history?.style_history_csv || ""),
+    };
 
-  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
-  if (!input.size) input.size = sizeValue;
-  if (input.enhance_prompt === undefined) input.enhance_prompt = enhance_prompt;
-  if (!input.sequential_image_generation) input.sequential_image_generation = "disabled";
-  if (!input.max_images) input.max_images = 1;
-  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+    // IMPORTANT: give reader the images too, so it truly "reads"
+    const readerImages = []
+      .concat(productUrl ? [productUrl] : [])
+      .concat(logoUrl ? [logoUrl] : [])
+      .concat(insp)
+      .concat(styleHeroUrl ? [styleHeroUrl] : [])
+      .filter(Boolean);
 
-  const t0 = Date.now();
-  const out = await replicate.run(version, { input });
+    const tReader = Date.now();
+    const prompts = await gptReader({ cfg, ctx, input: readerInput, imageUrls: readerImages });
 
-  return {
-    input,
-    out,
-    timing: {
-      started_at: new Date(t0).toISOString(),
-      ended_at: nowIso(),
-      duration_ms: Date.now() - t0,
-    },
-  };
-}
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "gpt_reader",
+      payload: {
+        ctx: ctx.reader,
+        input: readerInput,
+        request: prompts.request,
+        raw: prompts.raw,
+        output: { clean_prompt: prompts.clean_prompt, userMessage: prompts.userMessage, parsed_ok: prompts.parsed_ok },
+        timing: { started_at: new Date(tReader).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - tReader },
+        error: null,
+      },
+    });
+
+    working.prompts = { ...(working.prompts || {}), clean_prompt: prompts.clean_prompt || "" };
+
+    working = pushUserMessageLine(working, prompts.userMessage || "Prompt locked in. Cooking… 🔥");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, lastScanLine(working, "Prompt locked in. Cooking… 🔥"));
+
+    // 3) Seedream
+    await updateStatus({ supabase, generationId, status: "generating" });
+    sendStatus(generationId, "generating");
 
 // ---------------------------
 // Kling (video) helpers
@@ -781,8 +1267,9 @@ async function runKling({ prompt, startImage, duration, mode, negativePrompt, in
   input.duration = Number(input.duration ?? defaultDuration) || defaultDuration;
   if (!input.start_image) input.start_image = startImage;
 
-  const t0 = Date.now();
-  const out = await replicate.run(version, { input });
+    // 4) postscan (scan generated output)
+    await updateStatus({ supabase, generationId, status: "postscan" });
+    sendStatus(generationId, "postscan");
 
   return {
     input,
@@ -795,90 +1282,63 @@ async function runKling({ prompt, startImage, duration, mode, negativePrompt, in
   };
 }
 
-async function gptMakePrompts({ mode, vars, preferences }) {
-  const cfg = getMmaConfig();
-  const openai = getOpenAI();
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "gpt_scan_output",
+      payload: {
+        ctx: ctx.output_scan,
+        input: { imageUrl: remoteUrl },
+        request: outScan.request,
+        raw: outScan.raw,
+        output: { still_crt: outScan.still_crt, userMessage: outScan.userMessage, parsed_ok: outScan.parsed_ok },
+        timing: { started_at: new Date(tScan).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - tScan },
+        error: null,
+      },
+    });
 
-  const brief =
-    vars?.inputs?.brief ||
-    vars?.inputs?.prompt ||
-    vars?.inputs?.motionDescription ||
-    vars?.inputs?.motion_description ||
-    "";
+    working.scans = { ...(working.scans || {}), still_crt: outScan.still_crt || null };
 
-  const platform = vars?.inputs?.platform || vars?.settings?.platform || "default";
-  const aspectRatio = vars?.inputs?.aspect_ratio || vars?.settings?.aspectRatio || vars?.settings?.aspect_ratio || "";
+    working = pushUserMessageLine(working, outScan.userMessage || "Done ✅");
+    working.userMessages = { ...(working.userMessages || {}), final_line: "Finished generation." };
 
-  const negSeedream = cfg.seadream.negativePrompt ? `Avoid (global): ${cfg.seadream.negativePrompt}` : "";
-  const negKling = cfg.kling.negativePrompt ? `Negative prompt (global): ${cfg.kling.negativePrompt}` : "";
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, lastScanLine(working, "Done ✅"));
 
-  const sys = [
-    "You are Mina Mind — a production prompt engine.",
-    "Output STRICT JSON only, no markdown.",
-    "Schema: { clean_prompt: string, motion_prompt: string }",
-    "clean_prompt is for Seedream (still image).",
-    "motion_prompt is for Kling (image-to-video).",
-    "Be concise, specific, photoreal, high-end editorial.",
-    negSeedream,
-    negKling,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
 
-  const user = [
-    `MODE: ${mode}`,
-    `PLATFORM: ${platform}`,
-    aspectRatio ? `ASPECT_RATIO: ${aspectRatio}` : "",
-    preferences ? `USER_PREFERENCES_JSON: ${JSON.stringify(preferences).slice(0, 4000)}` : "",
-    `BRIEF: ${String(brief).slice(0, 6000)}`,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    await updateStatus({ supabase, generationId, status: "done" });
+    sendStatus(generationId, "done");
+    sendDone(generationId, "done");
+  } catch (err) {
+    console.error("[mma] still create pipeline error", err);
 
-  const model = cfg.gptModel;
-  const temperature = 1;
+    await updateStatus({ supabase, generationId, status: "error" });
+    await supabase
+      .from("mega_generations")
+      .update({
+        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_updated_at: nowIso(),
+      })
+      .eq("mg_generation_id", generationId)
+      .eq("mg_record_type", "generation");
 
-  const resp = await openai.chat.completions.create({
-    model,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: user },
-    ],
-    temperature,
-  });
-
-  const text = resp?.choices?.[0]?.message?.content || "";
-
-  let clean_prompt = "";
-  let motion_prompt = "";
-
-  try {
-    const parsed = JSON.parse(text);
-    clean_prompt = typeof parsed.clean_prompt === "string" ? parsed.clean_prompt : "";
-    motion_prompt = typeof parsed.motion_prompt === "string" ? parsed.motion_prompt : "";
-  } catch {
-    clean_prompt = mode === "still" ? text : "";
-    motion_prompt = mode === "video" ? text : "";
+    sendStatus(generationId, "error");
+    sendDone(generationId, "error");
   }
-
-  return {
-    clean_prompt,
-    motion_prompt,
-    raw: text,
-    debug: {
-      model,
-      temperature,
-      system: sys,
-      user,
-    },
-  };
 }
 
-async function runProductionPipeline({ supabase, generationId, vars, mode, preferences }) {
+// ============================================================================
+// STILL TWEAK PIPELINE (REAL)
+// ============================================================================
+async function runStillTweakPipeline({ supabase, generationId, passId, parent, vars, preferences }) {
   const cfg = getMmaConfig();
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
+  const ctx = await getMmaCtxConfig(supabase);
 
   try {
     // 1) REAL scanning (GPTscanner on each image)
@@ -1068,71 +1528,46 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
     await updateVars({ supabase, generationId, vars: working });
     sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Prompt locked in. Cooking something beautiful…");
 
-    // 3) generating (Replicate)
+    // 3) generating (Seedream tweak: image_input ONLY parent output)
     await updateStatus({ supabase, generationId, status: "generating" });
     sendStatus(generationId, "generating");
 
-    let remoteUrl = "";
-    let usedPrompt = "";
+    const aspect_ratio =
+      working?.inputs?.aspect_ratio ||
+      cfg?.seadream?.aspectRatio ||
+      process.env.MMA_SEADREAM_ASPECT_RATIO ||
+      "match_input_image";
 
-    if (mode === "still") {
-      usedPrompt = working.prompts.clean_prompt || "";
-      if (!usedPrompt) throw new Error("EMPTY_PROMPT");
+    const forcedInput = {
+      prompt: usedPrompt,
+      size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
+      aspect_ratio,
+      enhance_prompt: !!cfg?.seadream?.enhancePrompt,
+      sequential_image_generation: "disabled",
+      max_images: 1,
+      image_input: [parentUrl], // ✅ your tweak spec
+    };
 
-      const imageInputs = buildSeedreamImageInputs(working);
-      const aspect_ratio =
-        working?.inputs?.aspect_ratio ||
-        cfg.seadream.aspectRatio ||
-        process.env.MMA_SEADREAM_ASPECT_RATIO ||
-        "match_input_image";
+    const { input, out: seedOut, timing } = await runSeedream({
+      prompt: usedPrompt,
+      aspectRatio: aspect_ratio,
+      imageInputs: [parentUrl],
+      size: cfg?.seadream?.size,
+      enhancePrompt: cfg?.seadream?.enhancePrompt,
+      input: forcedInput,
+    });
 
-      const { input, out, timing } = await runSeedream({
-        prompt: usedPrompt,
-        aspectRatio: aspect_ratio,
-        imageInputs,
-        size: cfg.seadream.size,
-        enhancePrompt: cfg.seadream.enhancePrompt,
-      });
-      const url = pickFirstUrl(out);
-      if (!url) throw new Error("SEADREAM_NO_URL");
+    const seedUrl = pickFirstUrl(seedOut);
+    if (!seedUrl) throw new Error("SEADREAM_NO_URL_TWEAK");
 
-      await writeStep({
-        supabase,
-        generationId,
-        stepNo: 2,
-        stepType: "seedream_generate",
-        payload: {
-          input,
-          output: out,
-          timing,
-          error: null,
-        },
-      });
-
-      // store to R2 public
-      remoteUrl = await storeRemoteToR2Public(url, `mma/still/${generationId}`);
-      working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
-    } else {
-      usedPrompt = working.prompts.motion_prompt || "";
-      if (!usedPrompt) throw new Error("EMPTY_PROMPT");
-
-      const { start, end } = pickKlingImages(working);
-      if (!start) throw new Error("Kling requires a start image (start_image_url).");
-
-      // end_image => force pro mode (required by schema)
-      const klingMode = end ? "pro" : cfg.kling.mode;
-
-      // include duration (schema default is 5, but settable)
-      const duration = Number(cfg.kling.duration || process.env.MMA_KLING_DURATION || 5);
-
-      const input = {
-        mode: klingMode, // "standard" | "pro"
-        prompt: usedPrompt, // required
-        duration, // ✅ required in practice
-        start_image: start, // ✅ required for kling-v2.1
-        ...(end ? { end_image: end } : {}),
-        ...(cfg.kling.negativePrompt ? { negative_prompt: cfg.kling.negativePrompt } : {}),
-      };
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "seedream_generate_tweak",
+      payload: { input, output: seedOut, timing, error: null },
+    });
 
       const { input: klingInput, out, timing } = await runKling({
         input,
@@ -1146,36 +1581,42 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
       const url = pickFirstUrl(out);
       if (!url) throw new Error("KLING_NO_URL");
 
-      await writeStep({
-        supabase,
-        generationId,
-        stepNo: 2,
-        stepType: "kling_generate",
-        payload: {
-          input: { ...klingInput, used_end: usedEnd },
-          output: out,
-          timing,
-          error: null,
-        },
-      });
+    working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
+    working.mg_output_url = remoteUrl;
 
-      remoteUrl = await storeRemoteToR2Public(url, `mma/video/${generationId}`);
-      working.outputs = { ...(working.outputs || {}), kling_video_url: remoteUrl };
-    }
+    working = pushUserMessageLine(working, "Saved your improved image ✅");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, lastScanLine(working, "Saved your improved image ✅"));
 
-    // 4) postscan + finalize
+    // 4) postscan (scan new output)
     await updateStatus({ supabase, generationId, status: "postscan" });
     sendStatus(generationId, "postscan");
 
-    working.mg_output_url = remoteUrl;
-    working.userMessages = {
-      ...(working.userMessages || {}),
-      final_line: "Finished generation.",
-    };
+    const t3 = Date.now();
+    const scanNew = await gptScanOutputStill({ cfg, ctx, imageUrl: remoteUrl });
 
-    working = appendScanLine(working, "Stored output to permanent URL.");
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "gpt_scan_output",
+      payload: {
+        ctx: ctx.output_scan,
+        input: { imageUrl: remoteUrl },
+        request: scanNew.request,
+        raw: scanNew.raw,
+        output: { still_crt: scanNew.still_crt, userMessage: scanNew.userMessage, parsed_ok: scanNew.parsed_ok },
+        timing: { started_at: new Date(t3).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t3 },
+        error: null,
+      },
+    });
+
+    working.scans = { ...(working.scans || {}), still_crt: scanNew.still_crt || stillCrt || "" };
+    working = pushUserMessageLine(working, scanNew.userMessage || "Tweak done ✅");
+    working.userMessages = { ...(working.userMessages || {}), final_line: "Tweak finished." };
+
     await updateVars({ supabase, generationId, vars: working });
-    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Stored output.");
 
     await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
 
@@ -1183,7 +1624,7 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
     sendStatus(generationId, "done");
     sendDone(generationId, "done");
   } catch (err) {
-    console.error("[mma] pipeline error", err);
+    console.error("[mma] still tweak pipeline error", err);
 
     await updateStatus({ supabase, generationId, status: "error" });
     await supabase
@@ -2123,6 +2564,23 @@ export async function handleMmaCreate({ mode, body }) {
       .eq("mg_record_type", "generation");
   }
 
+  vars.mg_pass_id = passId;
+  vars.meta = { ...(vars.meta || {}), flow: "still_tweak", parent_generation_id: parentGenerationId };
+  vars.inputs = { ...(vars.inputs || {}), parent_output_url: parent?.mg_output_url || null };
+
+  await writeGeneration({
+    supabase,
+    generationId,
+    parentId: parentGenerationId,
+    passId,
+    vars,
+    mode: "still",
+  });
+
+  runStillTweakPipeline({ supabase, generationId, passId, parent, vars, preferences }).catch((e) =>
+    console.error("[mma] still tweak pipeline error", e)
+  );
+
   return { generation_id: generationId, status: "queued", sse_url: `/mma/stream/${generationId}` };
 }
 
@@ -2158,7 +2616,7 @@ export async function handleMmaEvent(body) {
     mg_updated_at: nowIso(),
   });
 
-  // Keep your existing preference-write logic (unchanged)
+  // keep existing preference-write logic
   if (body?.event_type === "like" || body?.event_type === "dislike" || body?.event_type === "preference_set") {
     const { data } = await supabase
       .from("mega_customers")
@@ -2249,8 +2707,6 @@ export function registerSseClient(generationId, res, initial) {
   addSseClient(generationId, res, initial);
 }
 
-
-
 // -----------------------------------------------------------------------------
 // Factory expected by server boot
 // -----------------------------------------------------------------------------
@@ -2259,7 +2715,7 @@ export function createMmaController() {
 
   router.post("/still/create", async (req, res) => {
     try {
-      const result = await handleMmaCreate({ mode: "still", body: req.body, req });
+      const result = await handleMmaCreate({ mode: "still", body: req.body });
       res.json(result);
     } catch (err) {
       console.error("[mma] still/create error", err);
@@ -2280,12 +2736,13 @@ export function createMmaController() {
     }
   });
 
+  // motion later (kept route but will return "motion not ready" via handleMmaCreate)
   router.post("/video/animate", async (req, res) => {
     try {
-      const result = await handleMmaCreate({ mode: "video", body: req.body, req });
+      const result = await handleMmaCreate({ mode: "video", body: req.body });
       res.json(result);
     } catch (err) {
-      console.error("[mma] video animate error", err);
+      console.error("[mma] video/animate error", err);
       res.status(err?.statusCode || 500).json({ error: "MMA_ANIMATE_FAILED", message: err?.message });
     }
   });
@@ -2305,7 +2762,7 @@ export function createMmaController() {
 
   router.post("/events", async (req, res) => {
     try {
-      const result = await handleMmaEvent(req.body || {}, req);
+      const result = await handleMmaEvent(req.body || {});
       res.json(result);
     } catch (err) {
       console.error("[mma] events error", err);
@@ -2377,4 +2834,3 @@ export function createMmaController() {
 }
 
 export default createMmaController;
-

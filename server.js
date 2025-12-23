@@ -608,72 +608,84 @@ app.post("/sessions/start", async (req, res) => {
 });
 
 // ✅ Matches your frontend: GET /history/pass/:passId
+// ✅ Matches your frontend: GET /history/pass/:passId
 app.get("/history/pass/:passId", async (req, res) => {
   const requestId = `hist_${Date.now()}_${crypto.randomUUID()}`;
 
   try {
     if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
 
-    const raw = safeString(req.params.passId, "");
-    const passId = normalizeIncomingPassId(raw);
-    setPassIdHeader(res, passId);
+    const rawParam = safeString(req.params.passId, "");
+    const primaryPassId = normalizeIncomingPassId(rawParam);
+    setPassIdHeader(res, primaryPassId);
 
     const authUser = await getAuthUser(req);
-    await megaEnsureCustomer({ passId, userId: authUser?.userId || null, email: authUser?.email || null });
+    await megaEnsureCustomer({ passId: primaryPassId, userId: authUser?.userId || null, email: authUser?.email || null });
 
-    const { credits, expiresAt } = await megaGetCredits(passId);
+    const { credits, expiresAt } = await megaGetCredits(primaryPassId);
 
-    // These table names are the standard MEGA setup.
-    // If your DB uses slightly different names, change ONLY these 2 strings.
     const supabase = getSupabaseAdmin();
 
-    const { data: gensRaw, error: gensErr } = await supabase
-      .from("mega_generations")
-      .select("*")
-      .eq("pass_id", passId)
-      .order("created_at", { ascending: false });
-
-    if (gensErr) throw gensErr;
-
-    const { data: fbsRaw, error: fbsErr } = await supabase
-      .from("mega_feedback")
-      .select("*")
-      .eq("pass_id", passId)
-      .order("created_at", { ascending: false });
-
-    if (fbsErr) {
-      // tolerate if feedback table is named differently
-      // (frontend still works with empty feedback list)
-      console.warn("[history] mega_feedback query failed:", fbsErr?.message || fbsErr);
+    // ✅ also try legacy anon-short id if needed, so history doesn’t “look empty”
+    const candidates = new Set([primaryPassId]);
+    if (primaryPassId.startsWith("pass:anon:")) {
+      candidates.add(primaryPassId.slice("pass:anon:".length));
+    } else if (!primaryPassId.startsWith("pass:")) {
+      candidates.add(`pass:anon:${primaryPassId}`);
     }
 
-    const generations = (gensRaw || []).map((r) => ({
-      id: String(r.id ?? r.generation_id ?? r.mg_id ?? ""),
-      type: String(r.type ?? r.result_type ?? "image"),
-      sessionId: String(r.session_id ?? r.sessionId ?? ""),
-      passId: String(r.pass_id ?? passId),
-      platform: String(r.platform ?? "web"),
-      prompt: String(r.prompt ?? ""),
-      outputUrl: String(r.output_url ?? r.outputUrl ?? r.public_url ?? r.url ?? ""),
-      createdAt: String(r.created_at ?? r.createdAt ?? nowIso()),
-      meta: r.meta ?? null,
-    }));
+    const passList = Array.from(candidates);
 
-    const feedbacks = (fbsRaw || []).map((r) => ({
-      id: String(r.id ?? r.fb_id ?? ""),
-      passId: String(r.pass_id ?? passId),
-      resultType: String(r.result_type ?? r.resultType ?? "image"),
-      platform: String(r.platform ?? "web"),
-      prompt: String(r.prompt ?? ""),
-      comment: String(r.comment ?? ""),
-      imageUrl: r.image_url ? String(r.image_url) : undefined,
-      videoUrl: r.video_url ? String(r.video_url) : undefined,
-      createdAt: String(r.created_at ?? r.createdAt ?? nowIso()),
-    }));
+    const { data: rows, error } = await supabase
+      .from("mega_generations")
+      .select(
+        "mg_id, mg_record_type, mg_pass_id, mg_generation_id, mg_session_id, mg_platform, mg_title, mg_type, mg_prompt, mg_output_url, mg_created_at, mg_meta, mg_content_type, mg_mma_mode"
+      )
+      .in("mg_pass_id", passList)
+      .in("mg_record_type", ["generation", "feedback", "session"])
+      .order("mg_created_at", { ascending: false })
+      .limit(500);
+
+    if (error) throw error;
+
+    const all = Array.isArray(rows) ? rows : [];
+
+    const generations = all
+      .filter((r) => r.mg_record_type === "generation")
+      .map((r) => ({
+        id: String(r.mg_id || r.mg_generation_id || ""),
+        generationId: String(r.mg_generation_id || ""),
+        type: String(r.mg_type || r.mg_content_type || "image"),
+        sessionId: String(r.mg_session_id || ""),
+        passId: String(r.mg_pass_id || primaryPassId),
+        platform: String(r.mg_platform || "web"),
+        prompt: String(r.mg_prompt || ""),
+        outputUrl: String(r.mg_output_url || ""),
+        createdAt: String(r.mg_created_at || nowIso()),
+        meta: r.mg_meta ?? null,
+        mode: String(r.mg_mma_mode || ""),
+      }));
+
+    const feedbacks = all
+      .filter((r) => r.mg_record_type === "feedback")
+      .map((r) => {
+        const meta = r.mg_meta && typeof r.mg_meta === "object" ? r.mg_meta : {};
+        return {
+          id: String(r.mg_id || ""),
+          passId: String(r.mg_pass_id || primaryPassId),
+          resultType: String(meta.resultType || meta.result_type || "image"),
+          platform: String(meta.platform || "web"),
+          prompt: String(meta.prompt || ""),
+          comment: String(meta.comment || ""),
+          imageUrl: meta.imageUrl ? String(meta.imageUrl) : undefined,
+          videoUrl: meta.videoUrl ? String(meta.videoUrl) : undefined,
+          createdAt: String(r.mg_created_at || nowIso()),
+        };
+      });
 
     return res.json({
       ok: true,
-      passId,
+      passId: primaryPassId,
       credits: { balance: credits, expiresAt },
       generations,
       feedbacks,
@@ -683,6 +695,7 @@ app.get("/history/pass/:passId", async (req, res) => {
     return res.status(500).json({ ok: false, error: "HISTORY_FAILED", requestId, message: e?.message || String(e) });
   }
 });
+
 
 // ✅ Matches your frontend: DELETE /history/:id
 app.delete("/history/:id", async (req, res) => {
@@ -696,26 +709,23 @@ app.delete("/history/:id", async (req, res) => {
 
     const supabase = getSupabaseAdmin();
 
-    // Try delete from generations first
-    const genDel = await supabase.from("mega_generations").delete().eq("id", id).select("id");
-    const genCount = Array.isArray(genDel.data) ? genDel.data.length : 0;
+    // Try delete by mg_id first
+    let del = await supabase.from("mega_generations").delete().eq("mg_id", id).select("mg_id");
+    let count = Array.isArray(del.data) ? del.data.length : 0;
 
-    if (genDel.error && genCount === 0) {
-      // if the column isn't `id` in your DB, adjust here
-      console.warn("[history delete] mega_generations delete warning:", genDel.error?.message || genDel.error);
+    // Fallback: if frontend sent a generation_id
+    if ((del.error || count === 0) && !id.startsWith("credit_transaction:")) {
+      const del2 = await supabase.from("mega_generations").delete().eq("mg_generation_id", id).select("mg_id");
+      count = Array.isArray(del2.data) ? del2.data.length : count;
     }
 
-    // Also try delete from feedback table (safe if not found)
-    try {
-      await supabase.from("mega_feedback").delete().eq("id", id);
-    } catch {}
-
-    return res.json({ ok: true, requestId, deleted: true });
+    return res.json({ ok: true, requestId, deleted: count > 0 });
   } catch (e) {
     console.error("DELETE /history/:id failed", e);
     return res.status(500).json({ ok: false, requestId, error: "DELETE_FAILED", message: e?.message || String(e) });
   }
 });
+
 
 // ✅ Matches your frontend: POST /feedback/like
 app.post("/feedback/like", async (req, res) => {

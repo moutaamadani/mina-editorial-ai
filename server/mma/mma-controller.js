@@ -83,7 +83,7 @@ const MMA_UI = {
   ].join("\n"),
 };
 
-function toUserStatus(internalStatus) {
+export function toUserStatus(internalStatus) {
   const s = String(internalStatus || "queued");
   return MMA_UI.statusMap[s] || "working";
 }
@@ -145,6 +145,19 @@ function parseJsonMaybe(v) {
   return null;
 }
 
+function normalizeUrlForKey(u) {
+  const url = asHttpUrl(u);
+  if (!url) return "";
+  try {
+    const x = new URL(url);
+    x.search = "";
+    x.hash = "";
+    return x.toString();
+  } catch {
+    return url;
+  }
+}
+
 function pushUserMessageLine(vars, text) {
   const t = safeStr(text, "");
   if (!t) return vars;
@@ -203,6 +216,7 @@ async function getMmaCtxConfig(supabase) {
       'Output STRICT JSON only: {"style_history_csv":string}',
       "style_history_csv: comma-separated keywords (5 to 12 items). No hashtags. No sentences.",
       'Example: "editorial still life, luxury, minimal, soft shadows, no lens flare"',
+      // no userMessage here
     ].join("\n"),
 
     reader: [
@@ -231,6 +245,7 @@ async function getMmaCtxConfig(supabase) {
 
     // ---------------------------
     // MOTION (video) ctx blocks
+    // NOTE: these can receive BOTH start and end frames (if end provided)
     // ---------------------------
     motion_suggestion: [
       "You are Mina Motion Suggestion.",
@@ -641,7 +656,11 @@ function pickKlingEndImage(vars, parent) {
   const inputs = vars?.inputs || {};
 
   // allow explicit end image (optional)
-  return asHttpUrl(inputs.end_image_url || inputs.endImageUrl) || asHttpUrl(assets.end_image_url || assets.endImageUrl) || "";
+  return (
+    asHttpUrl(inputs.end_image_url || inputs.endImageUrl) ||
+    asHttpUrl(assets.end_image_url || assets.endImageUrl) ||
+    ""
+  );
 }
 
 async function runKling({ prompt, startImage, endImage, duration, mode, negativePrompt, input: forcedInput }) {
@@ -769,7 +788,7 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 // ============================================================================
 // DB helpers
 // ============================================================================
-async function ensureCustomerRow(passId, { shopifyCustomerId, userId, email }) {
+async function ensureCustomerRow(_supabase, passId, { shopifyCustomerId, userId, email }) {
   const out = await megaEnsureCustomer({
     passId,
     shopifyCustomerId: shopifyCustomerId || null,
@@ -779,6 +798,7 @@ async function ensureCustomerRow(passId, { shopifyCustomerId, userId, email }) {
   return { preferences: out?.preferences || {} };
 }
 
+// ✅ HISTORY COMPAT: ensure session row exists for /history grouping
 async function ensureSessionForHistory({ passId, sessionId, platform, title, meta }) {
   const sid = safeStr(sessionId, "");
   if (!sid) return;
@@ -897,15 +917,29 @@ function extractFeedbackPayload(row) {
   return m;
 }
 
-// ✅ Dedup liked items so they NEVER repeat in the style memory input
+function feedbackKey(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const gid = safeStr(payload.generation_id || payload.generationId || payload.mg_generation_id || payload.id, "");
+  if (gid) return `gid:${gid}`;
+  const url = normalizeUrlForKey(payload.imageUrl || payload.output_url || payload.url || payload.assetUrl);
+  if (url) return `url:${url}`;
+  const prompt = safeStr(payload.prompt, "");
+  if (prompt) return `prompt:${prompt.slice(0, 240)}`;
+  return "";
+}
+
+// ✅ Dedup likes: only keep the LATEST feedback event per generation/image.
+//    If the latest event is "unliked", we must NOT include older likes.
 async function fetchRecentLikedItems({ supabase, passId, limit }) {
+  const target = Math.max(1, Number(limit || 0) || 1);
+
   const { data, error } = await supabase
     .from("mega_generations")
-    .select("mg_generation_id, mg_payload, mg_meta, mg_event_at, mg_created_at")
+    .select("mg_payload, mg_meta, mg_event_at, mg_created_at")
     .eq("mg_record_type", "feedback")
     .eq("mg_pass_id", passId)
     .order("mg_event_at", { ascending: false })
-    .limit(Math.max(60, limit * 8));
+    .limit(Math.max(80, target * 20));
 
   if (error) throw error;
 
@@ -917,133 +951,30 @@ async function fetchRecentLikedItems({ supabase, passId, limit }) {
     const payload = extractFeedbackPayload(r);
     if (!payload) continue;
 
-    const isLiked = payload.liked === true;
-    if (!isLiked) continue;
-
-    const genId = safeStr(payload.generation_id || payload.generationId || r.mg_generation_id, "");
-    const prompt = safeStr(payload.prompt, "");
-    const imageUrl = safeStr(payload.imageUrl || payload.image_url || payload.url, "");
-
-    const key =
-      genId ? `g:${genId}` : imageUrl ? `u:${imageUrl}` : prompt ? `p:${prompt}` : "";
-
+    const key = feedbackKey(payload) || `row:${r.mg_event_at || r.mg_created_at || ""}`;
     if (!key) continue;
+
+    // Only first (newest) event per key counts
     if (seen.has(key)) continue;
     seen.add(key);
 
+    const isLiked = payload.liked === true;
+    if (!isLiked) {
+      // If latest event is NOT liked (unliked/false), it blocks older like events.
+      continue;
+    }
+
     liked.push({
-      generationId: genId || null,
-      prompt,
-      imageUrl,
+      generationId: safeStr(payload.generation_id || payload.generationId || "", ""),
+      prompt: safeStr(payload.prompt, ""),
+      imageUrl: safeStr(payload.imageUrl, ""),
       createdAt: r.mg_event_at || r.mg_created_at || null,
     });
 
-    if (liked.length >= limit) break;
+    if (liked.length >= target) break;
   }
 
   return liked;
-}
-
-// ✅ Upsert-like behavior for feedback rows (prevents duplicates in /history joins)
-async function upsertFeedbackRow({ supabase, passId, generationId, liked, payload }) {
-  const gid = safeStr(generationId, "");
-  if (!gid) return;
-
-  const imageUrl = safeStr(payload?.imageUrl || payload?.image_url || payload?.url || payload?.output_url, "");
-  const prompt = safeStr(payload?.prompt, "");
-
-  // Find newest existing feedback row for (passId, generationId)
-  let existing = null;
-  try {
-    const { data, error } = await supabase
-      .from("mega_generations")
-      .select("mg_event_id, mg_created_at, mg_event_at")
-      .eq("mg_record_type", "feedback")
-      .eq("mg_pass_id", passId)
-      .eq("mg_generation_id", gid)
-      .order("mg_event_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (!error) existing = data || null;
-  } catch {
-    existing = null;
-  }
-
-  const feedbackPayload = {
-    ...(typeof payload === "object" && payload ? payload : {}),
-    liked: !!liked,
-    generation_id: gid,
-    prompt,
-    imageUrl,
-  };
-
-  // Update if exists
-  if (existing?.mg_event_id) {
-    await supabase
-      .from("mega_generations")
-      .update({
-        mg_payload: feedbackPayload,
-        mg_meta: { source: "mma", event_type: liked ? "like" : "dislike" },
-        mg_event_at: nowIso(),
-        mg_updated_at: nowIso(),
-      })
-      .eq("mg_record_type", "feedback")
-      .eq("mg_pass_id", passId)
-      .eq("mg_generation_id", gid)
-      .eq("mg_event_id", existing.mg_event_id);
-
-    // Best-effort cleanup: delete older duplicates if they exist
-    try {
-      const { data: dups } = await supabase
-        .from("mega_generations")
-        .select("mg_event_id")
-        .eq("mg_record_type", "feedback")
-        .eq("mg_pass_id", passId)
-        .eq("mg_generation_id", gid)
-        .order("mg_event_at", { ascending: false })
-        .limit(25);
-
-      const ids = (Array.isArray(dups) ? dups : [])
-        .map((x) => safeStr(x?.mg_event_id, ""))
-        .filter(Boolean);
-
-      const keep = existing.mg_event_id;
-      const toDelete = ids.filter((id) => id && id !== keep);
-
-      if (toDelete.length) {
-        // Supabase "in" filter
-        await supabase
-          .from("mega_generations")
-          .delete()
-          .eq("mg_record_type", "feedback")
-          .eq("mg_pass_id", passId)
-          .eq("mg_generation_id", gid)
-          .in("mg_event_id", toDelete);
-      }
-    } catch {
-      // ignore cleanup errors
-    }
-
-    return;
-  }
-
-  // Insert new feedback row
-  const eventId = newUuid();
-  const identifiers = eventIdentifiers(eventId);
-
-  await supabase.from("mega_generations").insert({
-    ...identifiers,
-    mg_record_type: "feedback", // override (we want feedback rows, not generic events)
-    mg_generation_id: gid,
-    mg_pass_id: passId,
-    mg_parent_id: `generation:${gid}`,
-    mg_payload: feedbackPayload,
-    mg_meta: { source: "mma", event_type: liked ? "like" : "dislike" },
-    mg_event_at: nowIso(),
-    mg_created_at: nowIso(),
-    mg_updated_at: nowIso(),
-  });
 }
 
 // ============================================================================
@@ -1075,7 +1006,10 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
 
     const inspUrls = safeArray(
-      assets.inspiration_image_urls || assets.inspirationImageUrls || assets.style_image_urls || assets.styleImageUrls
+      assets.inspiration_image_urls ||
+        assets.inspirationImageUrls ||
+        assets.style_image_urls ||
+        assets.styleImageUrls
     )
       .map(asHttpUrl)
       .filter(Boolean)
@@ -1195,6 +1129,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
         });
 
         working.history = { ...(working.history || {}), style_history_csv: style.style_history_csv || null };
+        // no need to spam a line here; keep it subtle
         await updateVars({ supabase, generationId, vars: working });
       }
     } catch {
@@ -1555,6 +1490,9 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
 // ============================================================================
 // VIDEO ANIMATE PIPELINE (Kling)
+// - optional “type for me” => gpt_motion_suggestion (may be repeated by client)
+// - then gpt_motion_reader2 unless sugg_prompt provided
+// - supports optional end frame (end_image_url)
 // ============================================================================
 async function runVideoAnimatePipeline({ supabase, generationId, passId, parent, vars }) {
   const cfg = getMmaConfig();
@@ -1644,6 +1582,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       working?.inputs?.typeForMe === true ||
       working?.inputs?.use_suggestion === true;
 
+    // if true: frontend is asking only for suggestion and will stop pipeline
     const suggestOnly = working?.inputs?.suggest_only === true || working?.inputs?.suggestOnly === true;
 
     if (typeForMe) {
@@ -1687,6 +1626,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       emitLine(generationId, working);
 
       if (suggestOnly) {
+        // mark as “suggested” and stop (frontend uses returned prompt)
         await supabase
           .from("mega_generations")
           .update({
@@ -1704,6 +1644,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       }
     }
 
+    // If sugg_prompt already provided (either from inputs or just created), we may skip reader2.
     const providedSugg = safeStr(working?.inputs?.sugg_prompt || working?.inputs?.suggPrompt, "");
     const suggPrompt = providedSugg || safeStr(working?.prompts?.sugg_prompt, "");
     let finalMotionPrompt = suggPrompt;
@@ -1750,6 +1691,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       await updateVars({ supabase, generationId, vars: working });
       emitLine(generationId, working);
     } else {
+      // keep consistent key
       working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
       await updateVars({ supabase, generationId, vars: working });
     }
@@ -2082,7 +2024,7 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
 
   const generationId = newUuid();
 
-  const { preferences } = await ensureCustomerRow(passId, {
+  const { preferences } = await ensureCustomerRow(supabase, passId, {
     shopifyCustomerId: body?.customer_id,
     userId: body?.user_id,
     email: body?.email,
@@ -2100,7 +2042,7 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
 
   vars.mg_pass_id = passId;
 
-  // ✅ HISTORY COMPAT: reuse parent session if possible
+  // ✅ HISTORY COMPAT: keep same session by default (fallback to parent)
   const sessionId =
     safeStr(body?.sessionId || body?.session_id || body?.inputs?.sessionId || body?.inputs?.session_id, "") ||
     safeStr(parent?.mg_session_id, "") ||
@@ -2108,7 +2050,10 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
 
   const platform = safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
 
-  const title = safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Image session";
+  const title =
+    safeStr(body?.title || body?.inputs?.title, "") ||
+    safeStr(parent?.mg_title, "") ||
+    "Image session";
 
   vars.inputs = { ...(vars.inputs || {}), session_id: sessionId, platform, title };
   vars.meta = { ...(vars.meta || {}), session_id: sessionId, platform, title };
@@ -2159,7 +2104,7 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
 
   const generationId = newUuid();
 
-  await ensureCustomerRow(passId, {
+  await ensureCustomerRow(supabase, passId, {
     shopifyCustomerId: body?.customer_id,
     userId: body?.user_id,
     email: body?.email,
@@ -2182,9 +2127,15 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
     safeStr(parent?.mg_session_id, "") ||
     newUuid();
 
-  const platform = safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
+  const platform =
+    safeStr(body?.platform || body?.inputs?.platform, "") ||
+    safeStr(parent?.mg_platform, "") ||
+    "web";
 
-  const title = safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Image session";
+  const title =
+    safeStr(body?.title || body?.inputs?.title, "") ||
+    safeStr(parent?.mg_title, "") ||
+    "Video session";
 
   vars.inputs = { ...(vars.inputs || {}), session_id: sessionId, platform, title };
   vars.meta = { ...(vars.meta || {}), session_id: sessionId, platform, title };
@@ -2243,12 +2194,9 @@ export async function handleMmaCreate({ mode, body }) {
     body?.generation_id ||
     null;
 
-  // If video and we have a parent, fetch parent early so we can reuse session/platform/title
-  const parent = mode === "video" && parentId ? await fetchParentGenerationRow(supabase, parentId) : null;
-
   const generationId = newUuid();
 
-  const { preferences } = await ensureCustomerRow(passId, {
+  const { preferences } = await ensureCustomerRow(supabase, passId, {
     shopifyCustomerId: body?.customer_id,
     userId: body?.user_id,
     email: body?.email,
@@ -2266,18 +2214,22 @@ export async function handleMmaCreate({ mode, body }) {
 
   vars.mg_pass_id = passId;
 
-  // ✅ HISTORY COMPAT: ALWAYS set session/platform/title
+  // ✅ HISTORY COMPAT: always have a session + fields your /history route reads
+  const parent = parentId ? await fetchParentGenerationRow(supabase, parentId).catch(() => null) : null;
+
   const sessionId =
     safeStr(body?.sessionId || body?.session_id || body?.inputs?.sessionId || body?.inputs?.session_id, "") ||
-    (parent ? safeStr(parent?.mg_session_id, "") : "") ||
+    safeStr(parent?.mg_session_id, "") ||
     newUuid();
 
   const platform =
-    safeStr(body?.platform || body?.inputs?.platform, "") || (parent ? safeStr(parent?.mg_platform, "") : "") || "web";
+    safeStr(body?.platform || body?.inputs?.platform, "") ||
+    safeStr(parent?.mg_platform, "") ||
+    "web";
 
   const title =
     safeStr(body?.title || body?.inputs?.title, "") ||
-    (parent ? safeStr(parent?.mg_title, "") : "") ||
+    safeStr(parent?.mg_title, "") ||
     (mode === "video" ? "Video session" : "Image session");
 
   vars.inputs = { ...(vars.inputs || {}), session_id: sessionId, platform, title };
@@ -2291,25 +2243,23 @@ export async function handleMmaCreate({ mode, body }) {
     meta: { source: "mma", flow: mode === "video" ? "video_animate" : "still_create" },
   });
 
-  // Set meta flow BEFORE writeGeneration (so it’s persisted immediately)
-  if (mode === "still") {
-    vars.meta = { ...(vars.meta || {}), flow: "still_create" };
-  } else if (mode === "video") {
-    vars.meta = { ...(vars.meta || {}), flow: "video_animate", parent_generation_id: parentId || null };
-    if (parent?.mg_output_url) {
-      vars.inputs = { ...(vars.inputs || {}), parent_output_url: parent.mg_output_url };
-    }
-  }
-
   await writeGeneration({ supabase, generationId, parentId, passId, vars, mode });
 
   if (mode === "still") {
+    vars.meta = { ...(vars.meta || {}), flow: "still_create" };
     await updateVars({ supabase, generationId, vars });
 
     runStillCreatePipeline({ supabase, generationId, passId, vars, preferences }).catch((err) =>
       console.error("[mma] still create pipeline error", err)
     );
   } else if (mode === "video") {
+    vars.meta = { ...(vars.meta || {}), flow: "video_animate", parent_generation_id: parentId || null };
+
+    // if animating from a still, store parent output url for audit + start_image
+    if (parent?.mg_output_url) {
+      vars.inputs = { ...(vars.inputs || {}), parent_output_url: parent.mg_output_url };
+    }
+
     await updateVars({ supabase, generationId, vars });
 
     runVideoAnimatePipeline({ supabase, generationId, passId, parent, vars }).catch((err) =>
@@ -2343,73 +2293,27 @@ export async function handleMmaEvent(body) {
       email: body?.email,
     });
 
-  await ensureCustomerRow(passId, {
+  await ensureCustomerRow(supabase, passId, {
     shopifyCustomerId: body?.customer_id,
     userId: body?.user_id,
     email: body?.email,
   });
 
-  const eventType = safeStr(body?.event_type || body?.eventType, "unknown");
-  const payload = body?.payload && typeof body.payload === "object" ? body.payload : {};
-
-  const generationId = safeStr(body?.generation_id || body?.generationId || payload?.generation_id || payload?.generationId, "");
-
-  // ✅ IMPORTANT: like/dislike MUST be stored as a single feedback row (prevents history duplicates)
-  if (eventType === "like" || eventType === "dislike") {
-    const liked = eventType === "like" ? true : false;
-
-    await upsertFeedbackRow({
-      supabase,
-      passId,
-      generationId,
-      liked,
-      payload,
-    });
-
-    // preference updates (kept minimal like you had)
-    if (payload?.hard_block) {
-      const { data } = await supabase
-        .from("mega_customers")
-        .select("mg_mma_preferences")
-        .eq("mg_pass_id", passId)
-        .maybeSingle();
-
-      const prefs = data?.mg_mma_preferences || {};
-      const hardBlocks = new Set(Array.isArray(prefs.hard_blocks) ? prefs.hard_blocks : []);
-      const tagWeights = { ...(prefs.tag_weights || {}) };
-
-      hardBlocks.add(payload.hard_block);
-      tagWeights[payload.hard_block] = -999;
-
-      await supabase
-        .from("mega_customers")
-        .update({
-          mg_mma_preferences: { ...prefs, hard_blocks: Array.from(hardBlocks), tag_weights: tagWeights },
-          mg_mma_preferences_updated_at: nowIso(),
-          mg_updated_at: nowIso(),
-        })
-        .eq("mg_pass_id", passId);
-    }
-
-    return { event_id: null, status: "ok" };
-  }
-
-  // Other events: store as normal event rows
   const eventId = newUuid();
   const identifiers = eventIdentifiers(eventId);
 
   await supabase.from("mega_generations").insert({
     ...identifiers,
-    mg_generation_id: generationId || null,
+    mg_generation_id: body?.generation_id || null,
     mg_pass_id: passId,
-    mg_parent_id: generationId ? `generation:${generationId}` : null,
-    mg_meta: { event_type: eventType || "unknown", payload: payload || {} },
+    mg_parent_id: body?.generation_id ? `generation:${body.generation_id}` : null,
+    mg_meta: { event_type: body?.event_type || "unknown", payload: body?.payload || {} },
     mg_created_at: nowIso(),
     mg_updated_at: nowIso(),
   });
 
   // preference updates kept minimal here (same logic you had)
-  if (eventType === "preference_set") {
+  if (body?.event_type === "like" || body?.event_type === "dislike" || body?.event_type === "preference_set") {
     const { data } = await supabase
       .from("mega_customers")
       .select("mg_mma_preferences")
@@ -2420,9 +2324,9 @@ export async function handleMmaEvent(body) {
     const hardBlocks = new Set(Array.isArray(prefs.hard_blocks) ? prefs.hard_blocks : []);
     const tagWeights = { ...(prefs.tag_weights || {}) };
 
-    if (payload?.hard_block) {
-      hardBlocks.add(payload.hard_block);
-      tagWeights[payload.hard_block] = -999;
+    if (body?.payload?.hard_block) {
+      hardBlocks.add(body.payload.hard_block);
+      tagWeights[body.payload.hard_block] = -999;
     }
 
     await supabase
@@ -2503,7 +2407,7 @@ export function registerSseClient(generationId, res, initial) {
 }
 
 // ============================================================================
-// Router factory
+// Router factory (optional; you may also use ./mma-router.js)
 // ============================================================================
 export function createMmaController() {
   const router = express.Router();

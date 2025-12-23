@@ -18,6 +18,7 @@ import { requireAdmin } from "./auth.js";
 
 import mmaRouter from "./server/mma/mma-router.js";
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
+import historyRouter from "./server/history-router.js";
 
 import {
   resolvePassId as megaResolvePassId,

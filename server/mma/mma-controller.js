@@ -285,6 +285,46 @@ async function gptScanOutputStill({ cfg, ctx, imageUrl }) {
   };
 }
 
+async function gptFeedbackFixer({ cfg, ctx, parentImageUrl, stillCrt, feedbackText, previousPrompt }) {
+  const input = {
+    parent_image_url: parentImageUrl,
+    still_crt: safeStr(stillCrt, ""),
+    feedback: safeStr(feedbackText, ""),
+    previous_prompt: safeStr(previousPrompt, ""),
+  };
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.feedback,
+    userText: JSON.stringify(input, null, 2).slice(0, 14000),
+    imageUrls: [parentImageUrl],
+  });
+
+  const clean_prompt =
+    safeStr(out?.parsed?.clean_prompt, "") ||
+    safeStr(out?.parsed?.prompt, "") ||
+    ""; // tolerate naming drift
+
+  return {
+    clean_prompt,
+    raw: out.raw,
+    request: out.request,
+    parsed_ok: !!out.parsed,
+  };
+}
+
+async function fetchParentGenerationRow(supabase, parentGenerationId) {
+  const { data, error } = await supabase
+    .from("mega_generations")
+    .select("mg_pass_id, mg_output_url, mg_prompt, mg_mma_vars, mg_mma_mode, mg_status, mg_error")
+    .eq("mg_generation_id", parentGenerationId)
+    .eq("mg_record_type", "generation")
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
 async function fetchRecentLikedItems({ supabase, passId, limit }) {
   // Likes are stored in mega_generations as mg_record_type='feedback' in your current setup.
   const { data, error } = await supabase
@@ -1046,9 +1086,283 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
   }
 }
 
+async function runStillTweakPipeline({ supabase, generationId, parent, vars, preferences }) {
+  const cfg = getMmaConfig();
+  if (!cfg.enabled) throw new Error("MMA_DISABLED");
+
+  let working = vars;
+  const ctx = await getMmaCtxConfig(supabase);
+
+  try {
+    // 1) scanning (parent output + still_crt)
+    await updateStatus({ supabase, generationId, status: "scanning" });
+    sendStatus(generationId, "scanning");
+
+    working = pushUserMessageLine(working, "Reviewing your last image…");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Reviewing your last image…");
+
+    const parentUrl = asHttpUrl(parent?.mg_output_url);
+    if (!parentUrl) throw new Error("PARENT_OUTPUT_URL_MISSING");
+
+    // try to reuse saved still_crt if it exists
+    const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
+    const existingStillCrt =
+      safeStr(parentVars?.scans?.still_crt, "") ||
+      safeStr(parentVars?.scans?.output_still_crt, "") ||
+      safeStr(parentVars?.still_crt, "");
+
+    let stillCrt = existingStillCrt;
+
+    // If missing, scan parent output now
+    if (!stillCrt) {
+      const t0 = Date.now();
+      const scan = await gptScanOutputStill({ cfg, ctx, imageUrl: parentUrl });
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: 1,
+        stepType: "gpt_scan_output_parent",
+        payload: {
+          ctx: ctx.output_scan,
+          input: { imageUrl: parentUrl },
+          output: scan,
+          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+          error: null,
+        },
+      });
+
+      stillCrt = scan.still_crt || "";
+      working.scans = { ...(working.scans || {}), still_crt: stillCrt };
+      working = pushUserMessageLine(working, scan.userMessage || "Got it — I see what we generated ✅");
+      await updateVars({ supabase, generationId, vars: working });
+      sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Got it — I see what we generated ✅");
+    } else {
+      // store it for audit anyway
+      working.scans = { ...(working.scans || {}), still_crt: stillCrt };
+      await updateVars({ supabase, generationId, vars: working });
+    }
+
+    // 2) prompting (GPT feedback fixer)
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    sendStatus(generationId, "prompting");
+
+    const feedbackText =
+      safeStr(working?.feedback?.still_feedback, "") ||
+      safeStr(working?.feedback?.feedback_still, "") ||
+      safeStr(working?.feedback?.text, "") ||
+      safeStr(working?.inputs?.feedback_still, "") ||
+      safeStr(working?.inputs?.feedback, "") ||
+      safeStr(working?.inputs?.comment, "");
+
+    if (!feedbackText) throw new Error("MISSING_STILL_FEEDBACK");
+
+    const t1 = Date.now();
+    const out = await gptFeedbackFixer({
+      cfg,
+      ctx,
+      parentImageUrl: parentUrl,
+      stillCrt,
+      feedbackText,
+      previousPrompt: safeStr(parent?.mg_prompt, ""),
+    });
+
+    await writeStep({
+      supabase,
+      generationId,
+      stepNo: 2,
+      stepType: "gpt_feedback_still",
+      payload: {
+        ctx: ctx.feedback,
+        input: {
+          parent_image_url: parentUrl,
+          still_crt: stillCrt,
+          feedback: feedbackText,
+          previous_prompt: safeStr(parent?.mg_prompt, ""),
+          preferences,
+        },
+        output: out,
+        timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+        error: null,
+      },
+    });
+
+    const usedPrompt = out.clean_prompt;
+    if (!usedPrompt) throw new Error("EMPTY_FEEDBACK_PROMPT");
+
+    working.prompts = { ...(working.prompts || {}), clean_prompt: usedPrompt };
+    working = pushUserMessageLine(working, "Applying your feedback… ✨");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Applying your feedback… ✨");
+
+    // 3) generating (Seedream tweak = parent output image as ONLY image_input)
+    await updateStatus({ supabase, generationId, status: "generating" });
+    sendStatus(generationId, "generating");
+
+    const aspect_ratio =
+      working?.inputs?.aspect_ratio ||
+      cfg.seadream.aspectRatio ||
+      process.env.MMA_SEADREAM_ASPECT_RATIO ||
+      "match_input_image";
+
+    const forcedInput = {
+      prompt: usedPrompt,
+      size: cfg.seadream.size || process.env.MMA_SEADREAM_SIZE || "2K",
+      aspect_ratio,
+      enhance_prompt: !!cfg.seadream.enhancePrompt,
+      sequential_image_generation: "disabled",
+      max_images: 1,
+      image_input: [parentUrl], // ✅ THIS is your spec for tweak
+    };
+
+    const t2 = Date.now();
+    const { input, out: seedOut, timing } = await runSeedream({
+      prompt: usedPrompt,
+      aspectRatio: aspect_ratio,
+      imageInputs: [parentUrl],
+      size: cfg.seadream.size,
+      enhancePrompt: cfg.seadream.enhancePrompt,
+      input: forcedInput,
+    });
+
+    const seedUrl = pickFirstUrl(seedOut);
+    if (!seedUrl) throw new Error("SEADREAM_NO_URL_TWEAK");
+
+    await writeStep({
+      supabase,
+      generationId,
+      stepNo: 3,
+      stepType: "seedream_generate_tweak",
+      payload: { input, output: seedOut, timing, error: null },
+    });
+
+    // store to R2 public
+    const remoteUrl = await storeRemoteToR2Public(seedUrl, `mma/still/${generationId}`);
+    working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
+    working.mg_output_url = remoteUrl;
+
+    working = pushUserMessageLine(working, "Saved your improved image ✅");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Saved your improved image ✅");
+
+    // 4) postscan (scan the NEW output)
+    await updateStatus({ supabase, generationId, status: "postscan" });
+    sendStatus(generationId, "postscan");
+
+    const t3 = Date.now();
+    const scanNew = await gptScanOutputStill({ cfg, ctx, imageUrl: remoteUrl });
+
+    await writeStep({
+      supabase,
+      generationId,
+      stepNo: 4,
+      stepType: "gpt_scan_output",
+      payload: {
+        ctx: ctx.output_scan,
+        input: { imageUrl: remoteUrl },
+        output: scanNew,
+        timing: { started_at: new Date(t3).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t3 },
+        error: null,
+      },
+    });
+
+    working.scans = { ...(working.scans || {}), still_crt: scanNew.still_crt || stillCrt || "" };
+    working.userMessages = { ...(working.userMessages || {}), final_line: "Tweak finished." };
+
+    await updateVars({ supabase, generationId, vars: working });
+
+    // finalize generation row
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
+
+    await updateStatus({ supabase, generationId, status: "done" });
+    sendStatus(generationId, "done");
+    sendDone(generationId, "done");
+  } catch (err) {
+    console.error("[mma] still tweak pipeline error", err);
+
+    await updateStatus({ supabase, generationId, status: "error" });
+    await supabase
+      .from("mega_generations")
+      .update({
+        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_updated_at: nowIso(),
+      })
+      .eq("mg_generation_id", generationId)
+      .eq("mg_record_type", "generation");
+
+    sendStatus(generationId, "error");
+    sendDone(generationId, "error");
+  }
+}
+
 // ---------------------------
 // Public controller API
 // ---------------------------
+export async function handleMmaStillTweak({ parentGenerationId, body }) {
+  const supabase = getSupabaseAdmin();
+  if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
+
+  const parent = await fetchParentGenerationRow(supabase, parentGenerationId);
+  if (!parent) throw new Error("PARENT_GENERATION_NOT_FOUND");
+
+  const passId =
+    body?.passId ||
+    body?.pass_id ||
+    parent?.mg_pass_id || // ✅ safest: inherit from parent
+    computePassId({
+      shopifyCustomerId: body?.customer_id,
+      userId: body?.user_id,
+      email: body?.email,
+    });
+
+  const generationId = newUuid();
+
+  const { preferences } = await ensureCustomerRow(supabase, passId, {
+    shopifyCustomerId: body?.customer_id,
+    userId: body?.user_id,
+    email: body?.email,
+  });
+
+  const vars = makeInitialVars({
+    mode: "still",
+    assets: body?.assets || {},
+    history: body?.history || {},
+    inputs: body?.inputs || {},
+    settings: body?.settings || {},
+    feedback: body?.feedback || {},
+    prompts: body?.prompts || {},
+  });
+
+  // ✅ keep passId inside vars for audit + helper functions
+  vars.mg_pass_id = passId;
+
+  // ✅ store tweak meta
+  vars.meta = { ...(vars.meta || {}), flow: "still_tweak", parent_generation_id: parentGenerationId };
+
+  // ✅ save parent output url for audit
+  vars.inputs = { ...(vars.inputs || {}), parent_output_url: parent?.mg_output_url || null };
+
+  await writeGeneration({
+    supabase,
+    generationId,
+    parentId: parentGenerationId,
+    passId,
+    vars,
+    mode: "still",
+  });
+
+  runStillTweakPipeline({
+    supabase,
+    generationId,
+    parent,
+    vars,
+    preferences,
+  }).catch((e) => console.error("[mma] still tweak pipeline error", e));
+
+  return { generation_id: generationId, status: "queued", sse_url: `/mma/stream/${generationId}` };
+}
+
 export async function handleMmaCreate({ mode, body }) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
@@ -1236,10 +1550,9 @@ export function createMmaController() {
 
   router.post("/still/:generation_id/tweak", async (req, res) => {
     try {
-      const result = await handleMmaCreate({
-        mode: "still",
-        body: { ...req.body, parent_generation_id: req.params.generation_id },
-        req,
+      const result = await handleMmaStillTweak({
+        parentGenerationId: req.params.generation_id,
+        body: req.body || {},
       });
       res.json(result);
     } catch (err) {

@@ -38,6 +38,285 @@ function getReplicate() {
   return _replicate;
 }
 
+// ============================================================================
+// [MMA REAL PIPELINE] ctx loader + OpenAI vision JSON helpers
+// Stores everything into mega_generations as mma_step rows + mg_mma_vars state.
+// ============================================================================
+
+function safeStr(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  const s = typeof v === "string" ? v : String(v);
+  const t = s.trim();
+  return t ? t : fallback;
+}
+
+function asHttpUrl(u) {
+  const s = safeStr(u, "");
+  return s.startsWith("http") ? s : "";
+}
+
+function pushUserMessageLine(vars, text) {
+  const t = safeStr(text, "");
+  if (!t) return vars;
+
+  const next = { ...(vars || {}) };
+  next.userMessages = { ...(next.userMessages || {}) };
+
+  const prev = Array.isArray(next.userMessages.scan_lines) ? next.userMessages.scan_lines : [];
+  const index = prev.length;
+
+  next.userMessages.scan_lines = [...prev, { text: t, index }];
+  return next;
+}
+
+/**
+ * ctx config is editable in Supabase:
+ * table: mega_admin
+ * row: mg_record_type = 'app_config', mg_key = 'mma_ctx'
+ * col: mg_value (jsonb)
+ *
+ * Example mg_value:
+ * {
+ *   "scanner": "...",
+ *   "like_history": "...",
+ *   "reader": "...",
+ *   "output_scan": "...",
+ *   "feedback": "..."
+ * }
+ */
+async function getMmaCtxConfig(supabase) {
+  const defaults = {
+    // GPTscanner: describe image (crt) + friendly waiting userMessage
+    scanner: [
+      "You are Mina GPTscanner.",
+      "You will be given ONE image. Understand it.",
+      'Output STRICT JSON only (no markdown): {"crt":string,"userMessage":string}',
+      "crt: short factual description of the image in ONE sentence (max 220 chars).",
+      "Also classify implicitly: if it's product/logo/inspiration, mention that in crt.",
+      "userMessage: short friendly human line while user waits (joke/fact/quote/advice/compliment). Max 140 chars.",
+      "Never mention 'CORS' or browser errors even if present elsewhere.",
+    ].join("\n"),
+
+    // Like-history -> style keywords
+    like_history: [
+      "You are Mina Style Memory.",
+      "You will receive a list of the user's recently liked generations (prompts and sometimes images).",
+      'Output STRICT JSON only: {"style_history_csv":string}',
+      "style_history_csv: comma-separated keywords (5 to 12 items). No hashtags. No sentences.",
+      'Example: "editorial still life, luxury, minimal, soft shadows, no lens flare"',
+    ].join("\n"),
+
+    // GPT reader -> Seedream clean prompt + userMessage5
+    reader: [
+      "You are Mina Mind — prompt builder for Seedream (still image only).",
+      "You will receive product_crt/logo_crt/inspiration_crt + user brief + style + style_history.",
+      'Output STRICT JSON only: {"clean_prompt":string,"userMessage":string}',
+      "clean_prompt must be Seedream-ready, photoreal editorial, concise but detailed.",
+      "Respect logo integration if logo_crt exists, and use inspirations if provided.",
+      "userMessage: one friendly line to show while generating (max 140 chars).",
+    ].join("\n"),
+
+    // Scan the final output image -> still_crt
+    output_scan: [
+      "You are Mina GPTscanner (output scan).",
+      "You will be given the GENERATED image.",
+      'Output STRICT JSON only: {"still_crt":string,"userMessage":string}',
+      "still_crt: short description of what the generated image contains (1 sentence, max 220 chars).",
+      "userMessage: short friendly line (max 140 chars).",
+    ].join("\n"),
+
+    // Feedback tweak (used later in tweak route)
+    feedback: [
+      "You are Mina Feedback Fixer for Seedream still images.",
+      "You will receive: generated image + still_crt + user feedback text.",
+      'Output STRICT JSON only: {"clean_prompt":string}',
+      "clean_prompt must keep what's good, fix what's bad, and apply feedback precisely.",
+    ].join("\n"),
+  };
+
+  try {
+    const { data, error } = await supabase
+      .from("mega_admin")
+      .select("mg_value")
+      .eq("mg_record_type", "app_config")
+      .eq("mg_key", "mma_ctx")
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const overrides = data?.mg_value && typeof data.mg_value === "object" ? data.mg_value : {};
+    return { ...defaults, ...overrides };
+  } catch {
+    return defaults;
+  }
+}
+
+function buildVisionUserContent({ text, imageUrls }) {
+  const parts = [{ type: "text", text: safeStr(text, "") }];
+  for (const u of Array.isArray(imageUrls) ? imageUrls : []) {
+    const url = asHttpUrl(u);
+    if (!url) continue;
+    parts.push({ type: "image_url", image_url: { url } });
+  }
+  return parts;
+}
+
+async function openaiJsonVision({ model, system, userText, imageUrls }) {
+  const openai = getOpenAI();
+
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: buildVisionUserContent({ text: userText, imageUrls }) },
+  ];
+
+  // IMPORTANT: for gpt-5-mini, do NOT force temperature.
+  const resp = await openai.chat.completions.create({
+    model,
+    messages,
+  });
+
+  const text = resp?.choices?.[0]?.message?.content || "";
+  let parsed = null;
+
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+
+  return {
+    request: { model, messages },
+    raw: text,
+    parsed,
+  };
+}
+
+async function gptScanImage({ cfg, ctx, kind, imageUrl }) {
+  const userText = [
+    `KIND: ${kind}`,
+    "Return JSON only.",
+  ].join("\n");
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.scanner,
+    userText,
+    imageUrls: [imageUrl],
+  });
+
+  const crt = safeStr(out?.parsed?.crt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return {
+    crt,
+    userMessage,
+    raw: out.raw,
+    request: out.request,
+    parsed_ok: !!out.parsed,
+  };
+}
+
+async function gptMakeStyleHistory({ cfg, ctx, likeItems }) {
+  const userText = [
+    "RECENT_LIKES:",
+    JSON.stringify(likeItems, null, 2).slice(0, 12000),
+    "Return JSON only.",
+  ].join("\n");
+
+  const imageUrls = likeItems
+    .map((x) => asHttpUrl(x?.imageUrl))
+    .filter(Boolean)
+    .slice(0, 8);
+
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.like_history,
+    userText,
+    imageUrls,
+  });
+
+  const style_history_csv = safeStr(out?.parsed?.style_history_csv, "");
+
+  return {
+    style_history_csv,
+    raw: out.raw,
+    request: out.request,
+    parsed_ok: !!out.parsed,
+  };
+}
+
+async function gptReader({ cfg, ctx, input, imageUrls }) {
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.reader,
+    userText: JSON.stringify(input, null, 2).slice(0, 14000),
+    imageUrls: (Array.isArray(imageUrls) ? imageUrls : []).slice(0, 10),
+  });
+
+  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return {
+    clean_prompt,
+    userMessage,
+    raw: out.raw,
+    request: out.request,
+    parsed_ok: !!out.parsed,
+  };
+}
+
+async function gptScanOutputStill({ cfg, ctx, imageUrl }) {
+  const out = await openaiJsonVision({
+    model: cfg.gptModel,
+    system: ctx.output_scan,
+    userText: "Scan this generated image. Return JSON only.",
+    imageUrls: [imageUrl],
+  });
+
+  const still_crt = safeStr(out?.parsed?.still_crt, "");
+  const userMessage = safeStr(out?.parsed?.userMessage, "");
+
+  return {
+    still_crt,
+    userMessage,
+    raw: out.raw,
+    request: out.request,
+    parsed_ok: !!out.parsed,
+  };
+}
+
+async function fetchRecentLikedItems({ supabase, passId, limit }) {
+  // Likes are stored in mega_generations as mg_record_type='feedback' in your current setup.
+  const { data, error } = await supabase
+    .from("mega_generations")
+    .select("mg_payload, mg_event_at, mg_created_at")
+    .eq("mg_record_type", "feedback")
+    .eq("mg_pass_id", passId)
+    .order("mg_event_at", { ascending: false })
+    .limit(Math.max(50, limit * 5));
+
+  if (error) throw error;
+
+  const rows = Array.isArray(data) ? data : [];
+  const liked = [];
+
+  for (const r of rows) {
+    const p = r?.mg_payload && typeof r.mg_payload === "object" ? r.mg_payload : null;
+    if (!p) continue;
+    if (p.liked !== true) continue;
+
+    liked.push({
+      prompt: safeStr(p.prompt, ""),
+      imageUrl: safeStr(p.imageUrl, ""),
+      createdAt: r.mg_event_at || r.mg_created_at || null,
+    });
+
+    if (liked.length >= limit) break;
+  }
+
+  return liked;
+}
+
 // ---------------------------
 // R2 Public store (self-contained)
 // ---------------------------
@@ -201,18 +480,35 @@ function safeArray(x) {
 
 function buildSeedreamImageInputs(vars) {
   const assets = vars?.assets || {};
-  const product = assets.product_image_url || assets.productImageUrl || "";
-  const logo = assets.logo_image_url || assets.logoImageUrl || "";
-  const inspiration = safeArray(
-    assets.inspiration_image_urls || assets.inspirationImageUrls || assets.style_image_urls || assets.styleImageUrls
+  const product = asHttpUrl(assets.product_image_url || assets.productImageUrl);
+  const logo = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+
+  // optional “style hero” image (if you use it)
+  const styleHero = asHttpUrl(
+    assets.style_hero_image_url || assets.styleHeroImageUrl || assets.style_hero_url || assets.styleHeroUrl
   );
 
-  return []
-    .concat(typeof product === "string" ? [product] : [])
+  const inspiration = safeArray(
+    assets.inspiration_image_urls ||
+      assets.inspirationImageUrls ||
+      assets.style_image_urls ||
+      assets.styleImageUrls
+  )
+    .map(asHttpUrl)
+    .filter(Boolean)
+    .slice(0, 4);
+
+  // IMPORTANT ORDER (your spec):
+  // product, logo, inspirations, style hero (or style hero before inspo if you prefer)
+  const ordered = []
+    .concat(product ? [product] : [])
+    .concat(logo ? [logo] : [])
     .concat(inspiration)
-    .concat(typeof logo === "string" ? [logo] : [])
-    .filter((u) => typeof u === "string" && u.startsWith("http"))
+    .concat(styleHero ? [styleHero] : [])
+    .filter(Boolean)
     .slice(0, 10);
+
+  return ordered;
 }
 
 function pickKlingImages(vars) {
@@ -431,53 +727,192 @@ async function runProductionPipeline({ supabase, generationId, vars, mode, prefe
   let working = vars;
 
   try {
-    // 1) scanning
+    // 1) REAL scanning (GPTscanner on each image)
     await updateStatus({ supabase, generationId, status: "scanning" });
     sendStatus(generationId, "scanning");
 
-    working = appendScanLine(working, "Scanning inputs…");
-    await updateVars({ supabase, generationId, vars: working });
-    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Scanning inputs…");
+    const ctx = await getMmaCtxConfig(supabase);
+    working.ctx = { ...(working.ctx || {}), mma_ctx: ctx }; // so you can audit which ctx was used
 
-    // 2) prompting (GPT)
+    let stepNo = 1;
+
+    // Always show a first line quickly
+    working = pushUserMessageLine(working, "Scanning your inputs…");
+    await updateVars({ supabase, generationId, vars: working });
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Scanning your inputs…");
+
+    // Ensure scans object exists
+    working.scans = { ...(working.scans || {}) };
+
+    // product scan
+    const productUrl = asHttpUrl(working?.assets?.product_image_url || working?.assets?.productImageUrl);
+    if (productUrl) {
+      const t0 = Date.now();
+      const scan = await gptScanImage({ cfg, ctx, kind: "product", imageUrl: productUrl });
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_scan_product",
+        payload: {
+          ctx: ctx.scanner,
+          input: { kind: "product", imageUrl: productUrl },
+          output: scan,
+          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+          error: null,
+        },
+      });
+
+      working.scans.product_crt = scan.crt || null;
+      working = pushUserMessageLine(working, scan.userMessage || "Got your product image ✅");
+      await updateVars({ supabase, generationId, vars: working });
+      sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Got your product image ✅");
+    }
+
+    // logo scan
+    const logoUrl = asHttpUrl(working?.assets?.logo_image_url || working?.assets?.logoImageUrl);
+    if (logoUrl) {
+      const t0 = Date.now();
+      const scan = await gptScanImage({ cfg, ctx, kind: "logo", imageUrl: logoUrl });
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_scan_logo",
+        payload: {
+          ctx: ctx.scanner,
+          input: { kind: "logo", imageUrl: logoUrl },
+          output: scan,
+          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+          error: null,
+        },
+      });
+
+      working.scans.logo_crt = scan.crt || null;
+      working = pushUserMessageLine(working, scan.userMessage || "Logo noted ✅");
+      await updateVars({ supabase, generationId, vars: working });
+      sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Logo noted ✅");
+    }
+
+    // inspiration scans (up to 4)
+    const insp = safeArray(
+      working?.assets?.inspiration_image_urls ||
+        working?.assets?.inspirationImageUrls ||
+        working?.assets?.style_image_urls ||
+        working?.assets?.styleImageUrls
+    )
+      .map(asHttpUrl)
+      .filter(Boolean)
+      .slice(0, 4);
+
+    working.scans.inspiration_crt = Array.isArray(working.scans.inspiration_crt) ? working.scans.inspiration_crt : [];
+
+    for (let i = 0; i < insp.length; i++) {
+      const imageUrl = insp[i];
+      const t0 = Date.now();
+
+      const scan = await gptScanImage({ cfg, ctx, kind: `inspiration_${i + 1}`, imageUrl });
+
+      await writeStep({
+        supabase,
+        generationId,
+        stepNo: stepNo++,
+        stepType: "gpt_scan_inspiration",
+        payload: {
+          ctx: ctx.scanner,
+          input: { kind: `inspiration_${i + 1}`, imageUrl },
+          output: scan,
+          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+          error: null,
+        },
+      });
+
+      working.scans.inspiration_crt = [...working.scans.inspiration_crt, scan.crt || ""];
+      working = pushUserMessageLine(working, scan.userMessage || `Inspiration ${i + 1} added ✨`);
+      await updateVars({ supabase, generationId, vars: working });
+      sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || `Inspiration ${i + 1} added ✨`);
+    }
+
+    // 1b) Like-history -> style keywords
+    const visionOn = !!working?.history?.vision_intelligence;
+    const likeLimit = visionOn ? 5 : 20;
+
+    try {
+      const likes = await fetchRecentLikedItems({ supabase, passId: working?.mg_pass_id || vars?.mg_pass_id || "", limit: likeLimit });
+      if (likes.length) {
+        const t0 = Date.now();
+        const style = await gptMakeStyleHistory({ cfg, ctx, likeItems: likes });
+
+        await writeStep({
+          supabase,
+          generationId,
+          stepNo: stepNo++,
+          stepType: "gpt_like_history",
+          payload: {
+            ctx: ctx.like_history,
+            input: { vision_intelligence: visionOn, limit: likeLimit, likes },
+            output: style,
+            timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+            error: null,
+          },
+        });
+
+        working.history = { ...(working.history || {}), style_history_csv: style.style_history_csv || null };
+        working = pushUserMessageLine(working, "I remembered your style preferences 🧠✨");
+        await updateVars({ supabase, generationId, vars: working });
+        sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "I remembered your style preferences 🧠✨");
+      }
+    } catch {
+      // style history is optional; don't fail pipeline
+    }
+
+    // 2) GPT reader (build Seedream clean prompt)
     await updateStatus({ supabase, generationId, status: "prompting" });
     sendStatus(generationId, "prompting");
 
-    const t0 = Date.now();
-    const prompts = await gptMakePrompts({ mode, vars: working, preferences });
+    const readerInput = {
+      product_crt: working?.scans?.product_crt || "",
+      logo_crt: working?.scans?.logo_crt || "",
+      inspiration_crt: Array.isArray(working?.scans?.inspiration_crt) ? working.scans.inspiration_crt : [],
+      userBrief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief || ""),
+      style: safeStr(working?.inputs?.style || ""),
+      platform: safeStr(working?.inputs?.platform || "default"),
+      aspect_ratio: safeStr(working?.inputs?.aspect_ratio || ""),
+      style_history_csv: safeStr(working?.history?.style_history_csv || ""),
+    };
+
+    const readerImages = []
+      .concat(productUrl ? [productUrl] : [])
+      .concat(logoUrl ? [logoUrl] : [])
+      .concat(insp);
+
+    const tReader = Date.now();
+    const prompts = await gptReader({ cfg, ctx, input: readerInput, imageUrls: readerImages });
 
     await writeStep({
       supabase,
       generationId,
-      stepNo: 1,
-      stepType: mode === "video" ? "gpt_reader_motion" : "gpt_reader",
+      stepNo: stepNo++,
+      stepType: "gpt_reader",
       payload: {
-        request: prompts.request, // ✅ system + user (context) + model
-        input: {
-          brief: working?.inputs?.brief || working?.inputs?.motionDescription || "",
-          preferences,
-          gpt: prompts?.debug || null, // ✅ system + user + model + temp
-        },
-        output: {
-          clean_prompt: prompts.clean_prompt,
-          motion_prompt: prompts.motion_prompt,
-          raw: prompts.raw, // ✅ raw model response
-        },
-        mma_config: getMmaConfig(), // ✅ config snapshot
-        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+        ctx: ctx.reader,
+        input: readerInput,
+        output: prompts,
+        timing: { started_at: new Date(tReader).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - tReader },
         error: null,
       },
     });
 
     working.prompts = {
       ...(working.prompts || {}),
-      clean_prompt: prompts.clean_prompt || working?.prompts?.clean_prompt || "",
-      motion_prompt: prompts.motion_prompt || working?.prompts?.motion_prompt || "",
+      clean_prompt: prompts.clean_prompt || "",
     };
 
-    working = appendScanLine(working, "Prompts ready.");
+    working = pushUserMessageLine(working, prompts.userMessage || "Prompt locked in. Cooking something beautiful…");
     await updateVars({ supabase, generationId, vars: working });
-    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Prompts ready.");
+    sendScanLine(generationId, working.userMessages.scan_lines?.slice(-1)?.[0] || "Prompt locked in. Cooking something beautiful…");
 
     // 3) generating (Replicate)
     await updateStatus({ supabase, generationId, status: "generating" });

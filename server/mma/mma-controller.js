@@ -386,7 +386,7 @@ async function gptMakePrompts({ mode, vars, preferences }) {
     .join("\n");
 
   const model = cfg.gptModel;
-  const temperature = 0.4;
+  const temperature = 1;
 
   const resp = await openai.chat.completions.create({
     model,

@@ -47,7 +47,7 @@ const PORT = Number(ENV.PORT || 8080);
 
 const app = express();
 app.set("trust proxy", 1);
-app.use(historyRouter);
+ 
 
 function nowIso() {
   return new Date().toISOString();
@@ -463,6 +463,106 @@ app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
 // ======================================================
+// History router (must be AFTER CORS + body parsers)
+// ======================================================
+app.use(historyRouter);
+
+// ======================================================
+// MMA: force consistent passId + enforce credits pricing
+// Pricing:
+// - still image create/tweak: 1 credit
+// - video animate/tweak: 5 credits
+// - "type for me" suggestion only: 0 credit (inputs.suggest_only = true)
+// ======================================================
+app.use("/mma", async (req, res, next) => {
+  try {
+    // Only charge on generation-start POST endpoints
+    if (req.method !== "POST") return next();
+
+    const path = String(req.path || "");
+
+    // Never charge on these
+    if (path.startsWith("/stream/")) return next();
+    if (path.startsWith("/generations/")) return next();
+    if (path === "/events") return next();
+
+    // Determine cost by endpoint
+    let cost = 0;
+
+    const isStillCreate = path === "/still/create";
+    const isStillTweak = /^\/still\/[^/]+\/tweak$/.test(path);
+
+    const isVideoAnimate = path === "/video/animate";
+    const isVideoTweak = /^\/video\/[^/]+\/tweak$/.test(path);
+
+    if (isStillCreate || isStillTweak) cost = 1;
+    if (isVideoAnimate || isVideoTweak) cost = 5;
+
+    // "type for me" suggestion-only must be FREE
+    const inputs = (req.body && req.body.inputs && typeof req.body.inputs === "object") ? req.body.inputs : {};
+    const suggestOnly = inputs.suggest_only === true || inputs.suggestOnly === true;
+    const typeForMe = inputs.type_for_me === true || inputs.typeForMe === true || inputs.use_suggestion === true;
+
+    if (suggestOnly && typeForMe) cost = 0;
+
+    // Resolve passId ONCE (and inject it so MMA controller uses the same one)
+    const resolved = resolvePassIdForRequest(req, req.body || {});
+    const passId = normalizeIncomingPassId(resolved);
+    setPassIdHeader(res, passId);
+
+    req.body = req.body || {};
+    if (!req.body.passId) req.body.passId = passId;
+    if (!req.body.pass_id) req.body.pass_id = passId;
+
+    // Ensure customer row exists
+    if (sbEnabled()) {
+      const authUser = await getAuthUser(req);
+      await megaEnsureCustomer({
+        passId,
+        userId: authUser?.userId || null,
+        email: authUser?.email || null,
+      });
+    }
+
+    // If cost is zero, continue
+    if (cost <= 0) return next();
+
+    // If no Supabase configured, MMA would fail anyway
+    if (!sbEnabled()) {
+      return res.status(503).json({ ok: false, error: "NO_SUPABASE" });
+    }
+
+    // Check balance
+    const { credits } = await megaGetCredits(passId);
+    if (Number(credits || 0) < cost) {
+      return res.status(402).json({
+        ok: false,
+        error: "INSUFFICIENT_CREDITS",
+        passId,
+        balance: Number(credits || 0),
+        needed: cost,
+      });
+    }
+
+    // Charge immediately (best effort)
+    await megaAdjustCredits({
+      passId,
+      delta: -cost,
+      reason: cost === 1 ? "mma_image" : "mma_video",
+      source: "mma",
+      refType: "mma_charge",
+      refId: `req:${Date.now()}_${crypto.randomUUID()}`,
+      grantedAt: nowIso(),
+    });
+
+    return next();
+  } catch (e) {
+    console.error("[mma credits middleware] failed", e);
+    return res.status(500).json({ ok: false, error: "MMA_CREDITS_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// ======================================================
 // Auth helper (service role validates a user token)
 // ======================================================
 function getBearerToken(req) {
@@ -609,125 +709,6 @@ app.post("/sessions/start", async (req, res) => {
   }
 });
 
-// ✅ Matches your frontend: GET /history/pass/:passId
-// ✅ Matches your frontend: GET /history/pass/:passId
-app.get("/history/pass/:passId", async (req, res) => {
-  const requestId = `hist_${Date.now()}_${crypto.randomUUID()}`;
-
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-
-    const rawParam = safeString(req.params.passId, "");
-    const primaryPassId = normalizeIncomingPassId(rawParam);
-    setPassIdHeader(res, primaryPassId);
-
-    const authUser = await getAuthUser(req);
-    await megaEnsureCustomer({ passId: primaryPassId, userId: authUser?.userId || null, email: authUser?.email || null });
-
-    const { credits, expiresAt } = await megaGetCredits(primaryPassId);
-
-    const supabase = getSupabaseAdmin();
-
-    // ✅ also try legacy anon-short id if needed, so history doesn’t “look empty”
-    const candidates = new Set([primaryPassId]);
-    if (primaryPassId.startsWith("pass:anon:")) {
-      candidates.add(primaryPassId.slice("pass:anon:".length));
-    } else if (!primaryPassId.startsWith("pass:")) {
-      candidates.add(`pass:anon:${primaryPassId}`);
-    }
-
-    const passList = Array.from(candidates);
-
-    const { data: rows, error } = await supabase
-      .from("mega_generations")
-      .select(
-        "mg_id, mg_record_type, mg_pass_id, mg_generation_id, mg_session_id, mg_platform, mg_title, mg_type, mg_prompt, mg_output_url, mg_created_at, mg_meta, mg_content_type, mg_mma_mode"
-      )
-      .in("mg_pass_id", passList)
-      .in("mg_record_type", ["generation", "feedback", "session"])
-      .order("mg_created_at", { ascending: false })
-      .limit(500);
-
-    if (error) throw error;
-
-    const all = Array.isArray(rows) ? rows : [];
-
-    const generations = all
-      .filter((r) => r.mg_record_type === "generation")
-      .map((r) => ({
-        id: String(r.mg_id || r.mg_generation_id || ""),
-        generationId: String(r.mg_generation_id || ""),
-        type: String(r.mg_type || r.mg_content_type || "image"),
-        sessionId: String(r.mg_session_id || ""),
-        passId: String(r.mg_pass_id || primaryPassId),
-        platform: String(r.mg_platform || "web"),
-        prompt: String(r.mg_prompt || ""),
-        outputUrl: String(r.mg_output_url || ""),
-        createdAt: String(r.mg_created_at || nowIso()),
-        meta: r.mg_meta ?? null,
-        mode: String(r.mg_mma_mode || ""),
-      }));
-
-    const feedbacks = all
-      .filter((r) => r.mg_record_type === "feedback")
-      .map((r) => {
-        const meta = r.mg_meta && typeof r.mg_meta === "object" ? r.mg_meta : {};
-        return {
-          id: String(r.mg_id || ""),
-          passId: String(r.mg_pass_id || primaryPassId),
-          resultType: String(meta.resultType || meta.result_type || "image"),
-          platform: String(meta.platform || "web"),
-          prompt: String(meta.prompt || ""),
-          comment: String(meta.comment || ""),
-          imageUrl: meta.imageUrl ? String(meta.imageUrl) : undefined,
-          videoUrl: meta.videoUrl ? String(meta.videoUrl) : undefined,
-          createdAt: String(r.mg_created_at || nowIso()),
-        };
-      });
-
-    return res.json({
-      ok: true,
-      passId: primaryPassId,
-      credits: { balance: credits, expiresAt },
-      generations,
-      feedbacks,
-    });
-  } catch (e) {
-    console.error("GET /history/pass/:passId failed", e);
-    return res.status(500).json({ ok: false, error: "HISTORY_FAILED", requestId, message: e?.message || String(e) });
-  }
-});
-
-
-// ✅ Matches your frontend: DELETE /history/:id
-app.delete("/history/:id", async (req, res) => {
-  const requestId = `del_${Date.now()}_${crypto.randomUUID()}`;
-
-  try {
-    if (!sbEnabled()) return res.status(503).json({ ok: false, requestId, error: "NO_SUPABASE" });
-
-    const id = safeString(req.params.id, "");
-    if (!id) return res.status(400).json({ ok: false, requestId, error: "MISSING_ID" });
-
-    const supabase = getSupabaseAdmin();
-
-    // Try delete by mg_id first
-    let del = await supabase.from("mega_generations").delete().eq("mg_id", id).select("mg_id");
-    let count = Array.isArray(del.data) ? del.data.length : 0;
-
-    // Fallback: if frontend sent a generation_id
-    if ((del.error || count === 0) && !id.startsWith("credit_transaction:")) {
-      const del2 = await supabase.from("mega_generations").delete().eq("mg_generation_id", id).select("mg_id");
-      count = Array.isArray(del2.data) ? del2.data.length : count;
-    }
-
-    return res.json({ ok: true, requestId, deleted: count > 0 });
-  } catch (e) {
-    console.error("DELETE /history/:id failed", e);
-    return res.status(500).json({ ok: false, requestId, error: "DELETE_FAILED", message: e?.message || String(e) });
-  }
-});
-
 
 // ✅ Matches your frontend: POST /feedback/like
 app.post("/feedback/like", async (req, res) => {
@@ -766,10 +747,6 @@ app.post("/feedback/like", async (req, res) => {
   }
 });
 
-// Keep legacy /feedback alias (won’t hurt)
-app.post("/feedback", async (req, res) => {
-  return app._router.handle(req, res, () => {}, "post", "/feedback/like");
-});
 
 // ======================================================
 // R2 signed upload endpoints
@@ -968,3 +945,4 @@ app.use(errorMiddleware);
 app.listen(PORT, () => {
   console.log(`Mina MMA API (MMA+MEGA) listening on port ${PORT}`);
 });
+

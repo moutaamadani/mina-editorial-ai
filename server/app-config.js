@@ -23,11 +23,12 @@ export async function getActiveAppConfig(supabaseAdmin, key) {
 
   const { data, error } = await supabaseAdmin
     .from("mega_admin")
-    .select("mg_id, mg_value, mg_key")
+    .select("mg_id, mg_value, mg_key, mg_created_at")
     .eq("mg_record_type", "app_config")
     .eq("mg_key", key)
     .contains("mg_value", { enabled: true })
-    .order("mg_created_at", { ascending: false });
+    .order("mg_created_at", { ascending: false })
+    .limit(50); // ✅ avoid scanning huge history
 
   if (error) throw error;
 
@@ -36,7 +37,13 @@ export async function getActiveAppConfig(supabaseAdmin, key) {
 
   for (const row of enabledRows) {
     const value = safeJson(row.mg_value);
-    const version = parseVersionFromId(row.mg_id) || value.version || 0;
+
+    // ✅ IMPORTANT: use ?? not || so version=0 isn't discarded
+    const idVer = parseVersionFromId(row.mg_id);
+    const valVer = typeof value.version === "number" ? value.version : Number(value.version);
+
+    const version =
+      (idVer ?? (Number.isFinite(valVer) ? valVer : null) ?? 0);
 
     if (!latest || version > latest.version) {
       latest = {

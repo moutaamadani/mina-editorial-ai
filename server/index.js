@@ -4,7 +4,7 @@
 // - Returns: { key, putUrl, publicUrl }  ✅ no expiring GET URLs
 // - Requires R2_PUBLIC_BASE_URL          ✅ permanent URLs only
 // - Sets CacheControl + ContentDisposition on uploaded objects
-// - Validates kind/customerId/filename to keep keys safe
+// - Validates kind/customerId/filename/contentType to keep keys safe
 
 import express from "express";
 import cors from "cors";
@@ -17,9 +17,45 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
 
-// --------------------
+// ============================================================================
+// CONFIG (edit these easily)
+// ============================================================================
+const JSON_LIMIT = process.env.R2_PRESIGN_JSON_LIMIT || "2mb";
+const PRESIGN_EXPIRES_SECONDS = Number(process.env.R2_PRESIGN_EXPIRES_SECONDS || 60 * 10); // 10 min
+const DEFAULT_CACHE_CONTROL =
+  process.env.R2_UPLOAD_CACHE_CONTROL || "public, max-age=31536000, immutable";
+const DEFAULT_CONTENT_DISPOSITION =
+  process.env.R2_UPLOAD_CONTENT_DISPOSITION || "inline";
+
+// If CORS_ORIGINS is empty:
+// - production: block
+// - non-prod: allow all (more convenient)
+const ALLOW_ALL_ORIGINS_IF_EMPTY_IN_DEV = true;
+
+const ALLOWED_KINDS = new Set([
+  "product",
+  "logo",
+  "inspo",
+  "inspiration", // ✅ added
+  "style",
+  "style_hero",  // ✅ optional but common
+  "generation",
+  "mma",
+  "uploads",
+]);
+
+const ALLOWED_CONTENT_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif",
+  "video/mp4",
+]);
+
+// ============================================================================
 // CORS
-// --------------------
+// ============================================================================
 const allowlist = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -28,27 +64,28 @@ const allowlist = (process.env.CORS_ORIGINS || "")
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true); // server-to-server/curl
-    if (allowlist.length === 0) return cb(new Error("CORS not configured"), false);
+
+    if (allowlist.length === 0) {
+      const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+      if (!isProd && ALLOW_ALL_ORIGINS_IF_EMPTY_IN_DEV) return cb(null, true);
+      return cb(new Error("CORS not configured"), false);
+    }
+
     if (allowlist.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked: ${origin}`), false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Mina-Pass-Id",
-    "X-Requested-With",
-  ],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Mina-Pass-Id", "X-Requested-With"],
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: JSON_LIMIT }));
 
-// --------------------
+// ============================================================================
 // Env
-// --------------------
+// ============================================================================
 const {
   R2_ACCOUNT_ID,
   R2_ACCESS_KEY_ID,
@@ -85,19 +122,9 @@ const S3 = new S3Client({
   },
 });
 
-// --------------------
+// ============================================================================
 // Key helpers
-// --------------------
-const ALLOWED_KINDS = new Set([
-  "product",
-  "logo",
-  "inspo",
-  "style",
-  "generation",
-  "mma",
-  "uploads",
-]);
-
+// ============================================================================
 function safePart(v, fallback = "anon") {
   const s = String(v || "").trim();
   if (!s) return fallback;
@@ -106,10 +133,18 @@ function safePart(v, fallback = "anon") {
 
 function safeFolder(v, fallback = "uploads") {
   const s = String(v || "").trim().toLowerCase();
-  const cleaned = s.replace(/[^a-z0-9/_-]/g, "_").replace(/\/+\/g, "/");
+  if (!s) return fallback;
+
+  // ✅ FIXED regex: collapse repeated slashes properly
+  const cleaned = s
+    .replace(/[^a-z0-9/_-]/g, "_")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+
   if (!cleaned) return fallback;
-  // prevent weird path tricks
-  if (cleaned.includes("..")) return fallback;
+  if (cleaned.includes("..")) return fallback; // prevent path tricks
+
   return cleaned.slice(0, 80);
 }
 
@@ -142,7 +177,6 @@ function makeKey({ kind, contentType, customerId, filename } = {}) {
 function makePublicUrl(key) {
   const b = baseUrl();
   if (!b || !key) return null;
-  // key is already safe, but keep URL tidy
   const encoded = String(key)
     .split("/")
     .map((p) => encodeURIComponent(p))
@@ -150,9 +184,9 @@ function makePublicUrl(key) {
   return `${b}/${encoded}`;
 }
 
-// --------------------
+// ============================================================================
 // Routes
-// --------------------
+// ============================================================================
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -173,6 +207,7 @@ app.post("/api/r2/presign", async (req, res) => {
 
     const { kind, contentType, customerId, filename } = req.body || {};
     const k = String(kind || "").trim().toLowerCase();
+    const ct = String(contentType || "").trim().toLowerCase();
 
     if (!k) return res.status(400).json({ error: "kind is required" });
     if (!ALLOWED_KINDS.has(k)) {
@@ -182,13 +217,17 @@ app.post("/api/r2/presign", async (req, res) => {
       });
     }
 
-    if (!contentType) {
-      return res.status(400).json({ error: "contentType is required" });
+    if (!ct) return res.status(400).json({ error: "contentType is required" });
+    if (!ALLOWED_CONTENT_TYPES.has(ct)) {
+      return res.status(400).json({
+        error: "contentType not allowed",
+        allowed: Array.from(ALLOWED_CONTENT_TYPES),
+      });
     }
 
     const key = makeKey({
       kind: k,
-      contentType,
+      contentType: ct,
       customerId: customerId || "anon",
       filename: filename || "upload",
     });
@@ -198,18 +237,19 @@ app.post("/api/r2/presign", async (req, res) => {
       new PutObjectCommand({
         Bucket: R2_BUCKET,
         Key: key,
-        ContentType: String(contentType),
-        CacheControl: "public, max-age=31536000, immutable",
-        ContentDisposition: "inline",
+        ContentType: ct,
+        CacheControl: DEFAULT_CACHE_CONTROL,
+        ContentDisposition: DEFAULT_CONTENT_DISPOSITION,
       }),
-      { expiresIn: 60 * 10 } // 10 minutes
+      { expiresIn: Math.max(60, Math.min(PRESIGN_EXPIRES_SECONDS, 60 * 60)) } // clamp 1m..1h
     );
 
     const publicUrl = makePublicUrl(key);
     if (!publicUrl) {
       return res.status(500).json({
         error: "R2_PUBLIC_BASE_URL_NOT_SET",
-        message: "Set R2_PUBLIC_BASE_URL to your permanent public asset domain (custom domain or r2.dev).",
+        message:
+          "Set R2_PUBLIC_BASE_URL to your permanent public asset domain (custom domain or r2.dev).",
       });
     }
 

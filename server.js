@@ -47,6 +47,7 @@ const PORT = Number(ENV.PORT || 8080);
 
 const app = express();
 app.set("trust proxy", 1);
+app.use(historyRouter);
 
 function nowIso() {
   return new Date().toISOString();

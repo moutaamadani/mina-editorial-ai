@@ -331,6 +331,42 @@ function emitLine(generationId, vars, fallbackText = "") {
   const line = lastScanLine(vars, fallbackText);
   sendScanLine(generationId, line);
 }
+// Keep Mina talking during long steps (Seedream / Kling)
+// Sends a new friendly line every few seconds as a scan_line
+function startMinaChatter({ supabase, generationId, getVars, setVars, stage = "generating", intervalMs = 2600 }) {
+  let stopped = false;
+
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      let v = getVars();
+      const line = pick(MMA_UI?.statusMap?.[stage], "");
+      if (!line) return;
+
+      v = pushUserMessageLine(v, line);
+      setVars(v);
+
+      await updateVars({ supabase, generationId, vars: v });
+      emitLine(generationId, v);
+    } catch {
+      // ignore chatter errors (never crash pipeline)
+    }
+  };
+
+  // say something immediately
+  void tick();
+
+  const id = setInterval(() => {
+    void tick();
+  }, Math.max(800, Number(intervalMs) || 2600));
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(id);
+    },
+  };
+}
 
 function setCtxAudit(vars, ctx) {
   const next = { ...(vars || {}) };

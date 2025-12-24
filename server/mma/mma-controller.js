@@ -329,7 +329,7 @@ async function getMmaCtxConfig(supabase) {
     // ---------------------------
 
     still_one_shot: [
-      "understand the user brief and give one line prompt describing the image",
+      "understand the user brief and give one line prompt describing the image, always type editorial still life, dont describe the light ever and use simple english",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
@@ -339,7 +339,7 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     still_tweak_one_shot: [
-      "understand the user tweaks and give one line prompt describing the image",
+      "understand the user tweaks and give one line prompt describing the image,  always type editorial still life, dont describe the light ever and use simple english",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',

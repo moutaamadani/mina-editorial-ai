@@ -392,13 +392,13 @@ async function getMmaCtxConfig(supabase) {
     // ---------------------------
 
     still_one_shot: [
-      "understand the user brief and give one line prompt describing the image, always type editorial still life, dont describe the light ever it's always creamy highlight and use simple english",
+      "understand the user brief and give one line prompt describing the image, always type editorial still life, dont describe the light ever, always creamy highlight, use inspiration for background and colors only .. and use simple english",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
       "",
       "SAFETY:",
-      "- if the logo is text type it in the prompt, Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
+      "- if the logo labeled image is text or paragraph, type it in the prompt,  dont say inspired from or use the reference, Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
     ].join("\n"),
 
     still_tweak_one_shot: [

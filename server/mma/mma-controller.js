@@ -228,6 +228,91 @@ async function getMmaCtxConfig(supabase) {
       MMA_UI.userMessageRules,
     ].join("\n"),
 
+    // ---------------------------
+    // ONE-SHOT PROMPT BUILDERS (SIMPLIFIED)
+    // - ONE GPT call does "scan + prompt" together.
+    // - No userMessage output. You handle UI messages separately.
+    // ---------------------------
+
+    still_one_shot: [
+      "You are Mina Prompt Writer for STILL IMAGES.",
+      "You will receive: labeled images (PRODUCT, LOGO, INSPIRATION_*, STYLE_HERO optional) + a user brief + optional style/prefs.",
+      "Your job: write ONE clean prompt for an editorial photoreal still image generator.",
+      "",
+      "OUTPUT FORMAT:",
+      'Return STRICT JSON only (no markdown): {"clean_prompt": string, "debug": { "product": string, "logo": string, "inspirations": string, "logo_text": string|null }}',
+      "",
+      "PROMPT RULES:",
+      "- clean_prompt must be ONE paragraph of plain English sentences.",
+      "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
+      "- Do NOT ask questions. Do NOT include question marks.",
+      "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
+      "- Be photoreal, editorial, high-end, studio-grade lighting, realistic materials.",
+      "",
+      "IMAGE ROLE RULES:",
+      "- PRODUCT image: this is the main subject. Keep it accurate, do not change its identity.",
+      "- LOGO image: integrate it tastefully (print/emboss/label/overlay) WITHOUT inventing a new logo.",
+      "- If you can clearly read text in the LOGO, set debug.logo_text to the exact text and instruct to render it cleanly.",
+      "- If text is not readable, set debug.logo_text = null and say 'use the provided logo mark as-is' (no invented text).",
+      "- INSPIRATION images: copy the vibe only (palette, lighting, composition). Do NOT copy specific brands/people/objects.",
+      "- STYLE_HERO: use as a style reference if present.",
+      "",
+      "SAFETY:",
+      "- Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
+    ].join("\n"),
+
+    still_tweak_one_shot: [
+      "You are Mina Prompt Fixer for STILL IMAGE TWEAKS.",
+      "You will receive: the parent image + user feedback text + previous prompt.",
+      "Your job: write ONE improved clean prompt that keeps what is good and applies the feedback precisely.",
+      "",
+      "OUTPUT FORMAT:",
+      'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
+      "",
+      "PROMPT RULES:",
+      "- clean_prompt must be ONE paragraph of plain English sentences.",
+      "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
+      "- Do NOT ask questions. Do NOT include question marks.",
+      "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
+      "- Keep the main subject consistent with the parent image.",
+      "- Apply feedback clearly and directly (lighting, background, composition, colors, text/logo placement).",
+    ].join("\n"),
+
+    motion_one_shot: [
+      "You are Mina Motion Prompt Writer for IMAGE-TO-VIDEO.",
+      "You will receive: start image (+ optional end image) + motion brief + movement style.",
+      "Your job: write ONE Kling-ready motion prompt describing motion + camera + atmosphere.",
+      "",
+      "OUTPUT FORMAT:",
+      'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
+      "",
+      "MOTION PROMPT RULES:",
+      "- motion_prompt must be ONE paragraph of plain English sentences.",
+      "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
+      "- Do NOT ask questions. Do NOT include question marks.",
+      "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
+      "- Keep subject identity consistent with the start image.",
+      "- Describe: subject motion, camera motion, pace, environment movement, lighting changes, subtle realism.",
+      "- If end image exists, describe moving from start toward end (match framing and look).",
+    ].join("\n"),
+
+    motion_tweak_one_shot: [
+      "You are Mina Motion Prompt Fixer for VIDEO TWEAKS.",
+      "You will receive: start image (+ optional end image) + user motion feedback + previous motion prompt.",
+      "Your job: write ONE improved Kling-ready motion prompt that keeps what works and applies the feedback precisely.",
+      "",
+      "OUTPUT FORMAT:",
+      'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
+      "",
+      "MOTION PROMPT RULES:",
+      "- motion_prompt must be ONE paragraph of plain English sentences.",
+      "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
+      "- Do NOT ask questions. Do NOT include question marks.",
+      "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
+      "- Keep subject identity consistent with the start image.",
+      "- Apply feedback clearly: motion, camera, timing, mood, intensity, smoothness.",
+    ].join("\n"),
+
     output_scan: [
       "You are Mina GPTscanner (output scan).",
       "You will be given the GENERATED image.",
@@ -302,6 +387,88 @@ function buildResponsesUserContent({ text, imageUrls }) {
     parts.push({ type: "input_image", image_url: url });
   }
   return parts;
+}
+
+function buildResponsesUserContentLabeled({ introText, labeledImages }) {
+  const parts = [];
+  const t = safeStr(introText, "");
+  if (t) parts.push({ type: "input_text", text: t });
+
+  for (const item of safeArray(labeledImages)) {
+    const role = safeStr(item?.role, "");
+    const url = asHttpUrl(item?.url);
+    if (!url) continue;
+
+    // Label right before each image so the model knows what it is
+    if (role) parts.push({ type: "input_text", text: `IMAGE ROLE: ${role}` });
+    parts.push({ type: "input_image", image_url: url });
+  }
+
+  return parts;
+}
+
+function buildChatCompletionsContentLabeled({ introText, labeledImages }) {
+  const content = [];
+  const t = safeStr(introText, "");
+  if (t) content.push({ type: "text", text: t });
+
+  for (const item of safeArray(labeledImages)) {
+    const role = safeStr(item?.role, "");
+    const url = asHttpUrl(item?.url);
+    if (!url) continue;
+
+    if (role) content.push({ type: "text", text: `IMAGE ROLE: ${role}` });
+    content.push({ type: "image_url", image_url: { url } });
+  }
+
+  return content;
+}
+
+async function openaiJsonVisionLabeled({ model, system, introText, labeledImages }) {
+  const openai = getOpenAI();
+
+  // Try Responses API first
+  try {
+    if (openai.responses?.create) {
+      const input = [
+        { role: "system", content: system },
+        { role: "user", content: buildResponsesUserContentLabeled({ introText, labeledImages }) },
+      ];
+
+      const resp = await openai.responses.create({
+        model,
+        input,
+        text: { format: { type: "json_object" } },
+      });
+
+      const raw = extractResponsesText(resp);
+      const parsed = parseJsonMaybe(raw);
+
+      return { request: { model, input, text: { format: { type: "json_object" } } }, raw, parsed };
+    }
+  } catch {
+    // fallback below
+  }
+
+  // Chat Completions fallback
+  const messages = [
+    { role: "system", content: system },
+    {
+      role: "user",
+      content: buildChatCompletionsContentLabeled({ introText, labeledImages }),
+    },
+  ];
+
+  const resp = await getOpenAI().chat.completions.create({
+    model,
+    messages,
+    response_format: { type: "json_object" },
+  });
+
+  const raw = resp?.choices?.[0]?.message?.content || "";
+  const parsed = parseJsonMaybe(raw);
+
+  return { request: { model, messages, response_format: { type: "json_object" } }, raw, parsed };
 }
 
 function extractResponsesText(resp) {
@@ -530,6 +697,59 @@ async function gptMotionFeedback2({
   });
 
   const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "") || "";
+  return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+// ============================================================================
+// ONE-SHOT GPT (scan + prompt together, no userMessage)
+// ============================================================================
+async function gptStillOneShotCreate({ cfg, ctx, input, labeledImages }) {
+  const out = await openaiJsonVisionLabeled({
+    model: cfg.gptModel,
+    system: ctx.still_one_shot,
+    introText: JSON.stringify(input, null, 2).slice(0, 14000),
+    labeledImages: safeArray(labeledImages).slice(0, 10),
+  });
+
+  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "");
+  const debug = out?.parsed?.debug && typeof out.parsed.debug === "object" ? out.parsed.debug : null;
+
+  return { clean_prompt, debug, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptStillOneShotTweak({ cfg, ctx, input, labeledImages }) {
+  const out = await openaiJsonVisionLabeled({
+    model: cfg.gptModel,
+    system: ctx.still_tweak_one_shot,
+    introText: JSON.stringify(input, null, 2).slice(0, 14000),
+    labeledImages: safeArray(labeledImages).slice(0, 6),
+  });
+
+  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "") || safeStr(out?.parsed?.prompt, "");
+  return { clean_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptMotionOneShotAnimate({ cfg, ctx, input, labeledImages }) {
+  const out = await openaiJsonVisionLabeled({
+    model: cfg.gptModel,
+    system: ctx.motion_one_shot,
+    introText: JSON.stringify(input, null, 2).slice(0, 14000),
+    labeledImages: safeArray(labeledImages).slice(0, 6),
+  });
+
+  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "");
+  return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+}
+
+async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
+  const out = await openaiJsonVisionLabeled({
+    model: cfg.gptModel,
+    system: ctx.motion_tweak_one_shot,
+    introText: JSON.stringify(input, null, 2).slice(0, 14000),
+    labeledImages: safeArray(labeledImages).slice(0, 6),
+  });
+
+  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "");
   return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
 }
 
@@ -988,22 +1208,25 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
   const ctx = await getMmaCtxConfig(supabase);
 
   try {
-    // ---- scanning ----
-    await updateStatus({ supabase, generationId, status: "scanning" });
-    emitStatus(generationId, "scanning");
+    // status: working
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    emitStatus(generationId, "prompting");
 
-    working = setCtxAudit(working, ctx);
-    working.scans = { ...(working.scans || {}) };
-
+    // minimal UI line (no GPT userMessage)
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.still_create_start));
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
     let stepNo = 1;
 
+    // Collect assets
     const assets = working?.assets || {};
     const productUrl = asHttpUrl(assets.product_image_url || assets.productImageUrl);
     const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+
+    const styleHero = asHttpUrl(
+      assets.style_hero_image_url || assets.styleHeroImageUrl || assets.style_hero_url || assets.styleHeroUrl
+    );
 
     const inspUrls = safeArray(
       assets.inspiration_image_urls ||
@@ -1015,183 +1238,73 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       .filter(Boolean)
       .slice(0, 4);
 
-    // product
-    if (productUrl) {
-      const t0 = Date.now();
-      const scan = await gptScanImage({ cfg, ctx, kind: "product", imageUrl: productUrl });
+    // Build labeled images for ONE GPT call
+    const labeledImages = []
+      .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
+      .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
+      .concat(inspUrls.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
+      .concat(styleHero ? [{ role: "STYLE_HERO", url: styleHero }] : [])
+      .slice(0, 10);
 
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_product",
-        payload: {
-          ctx: ctx.scanner,
-          input: { kind: "product", imageUrl: productUrl },
-          request: scan.request,
-          raw: scan.raw,
-          output: { crt: scan.crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      working.scans.product_crt = scan.crt || null;
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    }
-
-    // logo
-    if (logoUrl) {
-      const t0 = Date.now();
-      const scan = await gptScanImage({ cfg, ctx, kind: "logo", imageUrl: logoUrl });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_logo",
-        payload: {
-          ctx: ctx.scanner,
-          input: { kind: "logo", imageUrl: logoUrl },
-          request: scan.request,
-          raw: scan.raw,
-          output: { crt: scan.crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      working.scans.logo_crt = scan.crt || null;
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    }
-
-    // inspirations
-    working.scans.inspiration_crt = Array.isArray(working.scans.inspiration_crt) ? working.scans.inspiration_crt : [];
-    for (let i = 0; i < inspUrls.length; i++) {
-      const imageUrl = inspUrls[i];
-      const t0 = Date.now();
-      const scan = await gptScanImage({ cfg, ctx, kind: `inspiration_${i + 1}`, imageUrl });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_inspiration",
-        payload: {
-          ctx: ctx.scanner,
-          input: { kind: `inspiration_${i + 1}`, imageUrl },
-          request: scan.request,
-          raw: scan.raw,
-          output: { crt: scan.crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      working.scans.inspiration_crt = [...working.scans.inspiration_crt, scan.crt || ""];
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    }
-
-    // ---- optional like history -> style keywords ----
-    try {
-      const visionOn = !!working?.history?.vision_intelligence;
-      const likeLimit = visionOn ? 5 : 20;
-
-      const likes = await fetchRecentLikedItems({ supabase, passId, limit: likeLimit });
-      if (likes.length) {
-        const t0 = Date.now();
-        const style = await gptMakeStyleHistory({ cfg, ctx, likeItems: likes });
-
-        await writeStep({
-          supabase,
-          generationId,
-          passId,
-          stepNo: stepNo++,
-          stepType: "gpt_like_history",
-          payload: {
-            ctx: ctx.like_history,
-            input: { vision_intelligence: visionOn, limit: likeLimit, likes },
-            request: style.request,
-            raw: style.raw,
-            output: { style_history_csv: style.style_history_csv, parsed_ok: style.parsed_ok },
-            timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-            error: null,
-          },
-        });
-
-        working.history = { ...(working.history || {}), style_history_csv: style.style_history_csv || null };
-        // no need to spam a line here; keep it subtle
-        await updateVars({ supabase, generationId, vars: working });
-      }
-    } catch {
-      // optional
-    }
-
-    // ---- prompting ----
-    await updateStatus({ supabase, generationId, status: "prompting" });
-    emitStatus(generationId, "prompting");
-
-    const readerInput = {
-      product_crt: safeStr(working?.scans?.product_crt, ""),
-      logo_crt: safeStr(working?.scans?.logo_crt, ""),
-      inspiration_crt: Array.isArray(working?.scans?.inspiration_crt) ? working.scans.inspiration_crt : [],
-      userBrief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief, ""),
+    // Input to GPT (no aspect ratio needed)
+    const oneShotInput = {
+      user_brief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief, ""),
       style: safeStr(working?.inputs?.style, ""),
-      platform: safeStr(working?.inputs?.platform || "default", "default"),
-      aspect_ratio: safeStr(working?.inputs?.aspect_ratio, ""),
-      style_history_csv: safeStr(working?.history?.style_history_csv, ""),
       preferences: preferences || {},
+      hard_blocks: safeArray(preferences?.hard_blocks),
+      notes: "Write a clean still-image prompt using the labeled images as references.",
     };
 
-    const readerImages = [productUrl, logoUrl, ...inspUrls].map(asHttpUrl).filter(Boolean);
-
-    const tReader = Date.now();
-    const prompts = await gptReader({ cfg, ctx, input: readerInput, imageUrls: readerImages });
+    const t0 = Date.now();
+    const one = await gptStillOneShotCreate({ cfg, ctx, input: oneShotInput, labeledImages });
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "gpt_reader",
+      stepType: "gpt_still_one_shot",
       payload: {
-        ctx: ctx.reader,
-        input: readerInput,
-        request: prompts.request,
-        raw: prompts.raw,
-        output: { clean_prompt: prompts.clean_prompt, userMessage: prompts.userMessage, parsed_ok: prompts.parsed_ok },
-        timing: { started_at: new Date(tReader).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - tReader },
+        ctx: ctx.still_one_shot,
+        input: oneShotInput,
+        labeledImages,
+        request: one.request,
+        raw: one.raw,
+        output: { clean_prompt: one.clean_prompt, debug: one.debug, parsed_ok: one.parsed_ok },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
         error: null,
       },
     });
 
-    working.prompts = { ...(working.prompts || {}), clean_prompt: prompts.clean_prompt || "" };
-    working = pushUserMessageLine(working, prompts.userMessage || pick(MMA_UI.fallbacks.thinking));
-    await updateVars({ supabase, generationId, vars: working });
-    emitLine(generationId, working);
+    const usedPrompt =
+      safeStr(one.clean_prompt, "") ||
+      safeStr(working?.inputs?.prompt, "") ||
+      safeStr(working?.prompts?.clean_prompt, "");
 
-    // ---- generating ----
+    if (!usedPrompt) throw new Error("EMPTY_PROMPT_ONE_SHOT");
+
+    working.prompts = { ...(working.prompts || {}), clean_prompt: usedPrompt };
+    await updateVars({ supabase, generationId, vars: working });
+
+    // status: generating
     await updateStatus({ supabase, generationId, status: "generating" });
     emitStatus(generationId, "generating");
 
-    const usedPrompt = safeStr(working?.prompts?.clean_prompt, "");
-    if (!usedPrompt) throw new Error("EMPTY_PROMPT");
-
     const imageInputs = buildSeedreamImageInputs(working);
-    const aspectRatio =
+
+    // aspect ratio selection (if no input images, avoid match_input_image)
+    let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
       cfg?.seadream?.aspectRatio ||
       process.env.MMA_SEADREAM_ASPECT_RATIO ||
       "match_input_image";
+
+    if (!imageInputs.length && String(aspectRatio).toLowerCase().includes("match")) {
+      aspectRatio =
+        cfg?.seadream?.fallbackAspectRatio ||
+        process.env.MMA_SEADREAM_FALLBACK_ASPECT_RATIO ||
+        "1:1";
+    }
 
     const { input, out, timing } = await runSeedream({
       prompt: usedPrompt,
@@ -1217,34 +1330,8 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
     working.mg_output_url = remoteUrl;
 
-    // ---- postscan ----
-    await updateStatus({ supabase, generationId, status: "postscan" });
-    emitStatus(generationId, "postscan");
-
-    const tScan = Date.now();
-    const outScan = await gptScanOutputStill({ cfg, ctx, imageUrl: remoteUrl });
-
-    await writeStep({
-      supabase,
-      generationId,
-      passId,
-      stepNo: stepNo++,
-      stepType: "gpt_scan_output",
-      payload: {
-        ctx: ctx.output_scan,
-        input: { imageUrl: remoteUrl },
-        request: outScan.request,
-        raw: outScan.raw,
-        output: { still_crt: outScan.still_crt, userMessage: outScan.userMessage, parsed_ok: outScan.parsed_ok },
-        timing: { started_at: new Date(tScan).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - tScan },
-        error: null,
-      },
-    });
-
-    working.scans = { ...(working.scans || {}), still_crt: outScan.still_crt || null };
-    working = pushUserMessageLine(working, outScan.userMessage || pick(MMA_UI.quickLines.saved_image));
-    working.userMessages = { ...(working.userMessages || {}), final_line: pick(MMA_UI.fallbacks.final) };
-
+    // minimal UI line (no GPT userMessage)
+    working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_image));
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
@@ -1282,11 +1369,8 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
   const ctx = await getMmaCtxConfig(supabase);
 
   try {
-    await updateStatus({ supabase, generationId, status: "scanning" });
-    emitStatus(generationId, "scanning");
-
-    working = setCtxAudit(working, ctx);
-    working.scans = { ...(working.scans || {}) };
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    emitStatus(generationId, "prompting");
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.still_tweak_start));
     await updateVars({ supabase, generationId, vars: working });
@@ -1294,46 +1378,6 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
     const parentUrl = asHttpUrl(parent?.mg_output_url);
     if (!parentUrl) throw new Error("PARENT_OUTPUT_URL_MISSING");
-
-    // reuse still_crt if parent already has it
-    const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
-    let stillCrt = safeStr(parentVars?.scans?.still_crt, "") || safeStr(parentVars?.still_crt, "");
-
-    let stepNo = 1;
-
-    if (!stillCrt) {
-      const t0 = Date.now();
-      const scan = await gptScanOutputStill({ cfg, ctx, imageUrl: parentUrl });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_output_parent",
-        payload: {
-          ctx: ctx.output_scan,
-          input: { imageUrl: parentUrl },
-          request: scan.request,
-          raw: scan.raw,
-          output: { still_crt: scan.still_crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      stillCrt = scan.still_crt || "";
-      working.scans.still_crt = stillCrt || null;
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    } else {
-      working.scans.still_crt = stillCrt || null;
-      await updateVars({ supabase, generationId, vars: working });
-    }
-
-    await updateStatus({ supabase, generationId, status: "prompting" });
-    emitStatus(generationId, "prompting");
 
     const feedbackText =
       safeStr(working?.feedback?.still_feedback, "") ||
@@ -1345,55 +1389,56 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
     if (!feedbackText) throw new Error("MISSING_STILL_FEEDBACK");
 
-    const t1 = Date.now();
-    const fix = await gptFeedbackFixer({
-      cfg,
-      ctx,
-      parentImageUrl: parentUrl,
-      stillCrt,
-      feedbackText,
-      previousPrompt: safeStr(parent?.mg_prompt, ""),
-    });
+    let stepNo = 1;
+
+    const oneShotInput = {
+      parent_image_url: parentUrl,
+      feedback: feedbackText,
+      previous_prompt: safeStr(parent?.mg_prompt, ""),
+      preferences: preferences || {},
+      hard_blocks: safeArray(preferences?.hard_blocks),
+      notes: "Keep the main subject consistent. Apply feedback precisely.",
+    };
+
+    const labeledImages = [{ role: "PARENT_IMAGE", url: parentUrl }];
+
+    const t0 = Date.now();
+    const one = await gptStillOneShotTweak({ cfg, ctx, input: oneShotInput, labeledImages });
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "gpt_feedback_still",
+      stepType: "gpt_still_tweak_one_shot",
       payload: {
-        ctx: ctx.feedback,
-        input: {
-          parent_image_url: parentUrl,
-          still_crt: stillCrt,
-          feedback: feedbackText,
-          previous_prompt: safeStr(parent?.mg_prompt, ""),
-          preferences: preferences || {},
-        },
-        request: fix.request,
-        raw: fix.raw,
-        output: { clean_prompt: fix.clean_prompt, parsed_ok: fix.parsed_ok },
-        timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+        ctx: ctx.still_tweak_one_shot,
+        input: oneShotInput,
+        labeledImages,
+        request: one.request,
+        raw: one.raw,
+        output: { clean_prompt: one.clean_prompt, parsed_ok: one.parsed_ok },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
         error: null,
       },
     });
 
-    const usedPrompt = safeStr(fix.clean_prompt, "");
-    if (!usedPrompt) throw new Error("EMPTY_FEEDBACK_PROMPT");
+    const usedPrompt = safeStr(one.clean_prompt, "");
+    if (!usedPrompt) throw new Error("EMPTY_TWEAK_PROMPT_ONE_SHOT");
 
     working.prompts = { ...(working.prompts || {}), clean_prompt: usedPrompt };
-    working = pushUserMessageLine(working, pick(MMA_UI.fallbacks.thinking));
     await updateVars({ supabase, generationId, vars: working });
-    emitLine(generationId, working);
 
     await updateStatus({ supabase, generationId, status: "generating" });
     emitStatus(generationId, "generating");
 
-    const aspectRatio =
+    let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
       cfg?.seadream?.aspectRatio ||
       process.env.MMA_SEADREAM_ASPECT_RATIO ||
       "match_input_image";
+
+    // tweak always has parent image input, so match_input_image is safe
 
     const forcedInput = {
       prompt: usedPrompt,
@@ -1402,10 +1447,10 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       enhance_prompt: !!cfg?.seadream?.enhancePrompt,
       sequential_image_generation: "disabled",
       max_images: 1,
-      image_input: [parentUrl], // ✅ tweak spec: ONLY parent image
+      image_input: [parentUrl],
     };
 
-    const t2 = Date.now();
+    const t1 = Date.now();
     const { input, out: seedOut, timing } = await runSeedream({
       prompt: usedPrompt,
       aspectRatio,
@@ -1432,36 +1477,6 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_image));
-    await updateVars({ supabase, generationId, vars: working });
-    emitLine(generationId, working);
-
-    await updateStatus({ supabase, generationId, status: "postscan" });
-    emitStatus(generationId, "postscan");
-
-    const t3 = Date.now();
-    const scanNew = await gptScanOutputStill({ cfg, ctx, imageUrl: remoteUrl });
-
-    await writeStep({
-      supabase,
-      generationId,
-      passId,
-      stepNo: stepNo++,
-      stepType: "gpt_scan_output",
-      payload: {
-        ctx: ctx.output_scan,
-        input: { imageUrl: remoteUrl },
-        request: scanNew.request,
-        raw: scanNew.raw,
-        output: { still_crt: scanNew.still_crt, userMessage: scanNew.userMessage, parsed_ok: scanNew.parsed_ok },
-        timing: { started_at: new Date(t3).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t3 },
-        error: null,
-      },
-    });
-
-    working.scans = { ...(working.scans || {}), still_crt: scanNew.still_crt || stillCrt || "" };
-    working = pushUserMessageLine(working, scanNew.userMessage || pick(MMA_UI.fallbacks.final));
-    working.userMessages = { ...(working.userMessages || {}), final_line: pick(MMA_UI.fallbacks.final) };
-
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
@@ -1502,11 +1517,8 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   const ctx = await getMmaCtxConfig(supabase);
 
   try {
-    await updateStatus({ supabase, generationId, status: "scanning" });
-    emitStatus(generationId, "scanning");
-
-    working = setCtxAudit(working, ctx);
-    working.scans = { ...(working.scans || {}) };
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    emitStatus(generationId, "prompting");
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.video_animate_start));
     await updateVars({ supabase, generationId, vars: working });
@@ -1519,53 +1531,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
 
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO");
 
-    // keep for audit
-    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
-    if (endImage) working.inputs.end_image_url = endImage;
-
-    // still_crt reuse if parent has it
-    const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
-    let stillCrt =
-      safeStr(parentVars?.scans?.still_crt, "") ||
-      safeStr(parentVars?.still_crt, "") ||
-      safeStr(working?.scans?.still_crt, "");
-
-    if (!stillCrt) {
-      const t0 = Date.now();
-      const scan = await gptScanOutputStill({ cfg, ctx, imageUrl: startImage });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_start_image",
-        payload: {
-          ctx: ctx.output_scan,
-          input: { imageUrl: startImage },
-          request: scan.request,
-          raw: scan.raw,
-          output: { still_crt: scan.still_crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      stillCrt = scan.still_crt || "";
-      working.scans.still_crt = stillCrt || null;
-
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    } else {
-      working.scans.still_crt = stillCrt || null;
-      await updateVars({ supabase, generationId, vars: working });
-    }
-
-    // ---- prompting ----
-    await updateStatus({ supabase, generationId, status: "prompting" });
-    emitStatus(generationId, "prompting");
-
     const motionBrief =
       safeStr(working?.inputs?.motion_user_brief, "") ||
       safeStr(working?.inputs?.motionBrief, "") ||
@@ -1577,132 +1542,79 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       safeStr(working?.inputs?.movement_style, "") ||
       safeStr(working?.inputs?.movementStyle, "");
 
-    const typeForMe =
-      working?.inputs?.type_for_me === true ||
-      working?.inputs?.typeForMe === true ||
-      working?.inputs?.use_suggestion === true;
-
-    // if true: frontend is asking only for suggestion and will stop pipeline
+    // If frontend wants suggestion-only, we still do ONE GPT call and stop.
     const suggestOnly = working?.inputs?.suggest_only === true || working?.inputs?.suggestOnly === true;
 
-    if (typeForMe) {
-      const t1 = Date.now();
-      const sugg = await gptMotionSuggestion({
-        cfg,
-        ctx,
-        startImageUrl: startImage,
-        endImageUrl: endImage,
-        stillCrt,
-        motionBrief,
-        movementStyle,
-      });
+    const oneShotInput = {
+      start_image_url: startImage,
+      end_image_url: asHttpUrl(endImage) || null,
+      motion_user_brief: motionBrief,
+      selected_movement_style: movementStyle,
+      notes: "Write a single clean motion prompt. Plain English. No emojis. No questions.",
+    };
 
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_motion_suggestion",
-        payload: {
-          ctx: ctx.motion_suggestion,
-          input: {
-            start_image_url: startImage,
-            end_image_url: endImage || null,
-            still_crt: stillCrt,
-            motion_user_brief: motionBrief,
-            selected_movement_style: movementStyle,
-          },
-          request: sugg.request,
-          raw: sugg.raw,
-          output: { sugg_prompt: sugg.sugg_prompt, userMessage: sugg.userMessage, parsed_ok: sugg.parsed_ok },
-          timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
-          error: null,
-        },
-      });
+    const labeledImages = []
+      .concat([{ role: "START_IMAGE", url: startImage }])
+      .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
+      .slice(0, 6);
 
-      working.prompts = { ...(working.prompts || {}), sugg_prompt: sugg.sugg_prompt || "" };
-      working = pushUserMessageLine(working, sugg.userMessage || pick(MMA_UI.fallbacks.thinking));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
+    const t0 = Date.now();
+    const one = await gptMotionOneShotAnimate({ cfg, ctx, input: oneShotInput, labeledImages });
 
-      if (suggestOnly) {
-        // mark as “suggested” and stop (frontend uses returned prompt)
-        await supabase
-          .from("mega_generations")
-          .update({
-            mg_status: "suggested",
-            mg_mma_status: "suggested",
-            mg_prompt: working?.prompts?.sugg_prompt || null,
-            mg_updated_at: nowIso(),
-          })
-          .eq("mg_generation_id", generationId)
-          .eq("mg_record_type", "generation");
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "gpt_motion_one_shot",
+      payload: {
+        ctx: ctx.motion_one_shot,
+        input: oneShotInput,
+        labeledImages,
+        request: one.request,
+        raw: one.raw,
+        output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+        error: null,
+      },
+    });
 
-        emitStatus(generationId, "suggested");
-        sendDone(generationId, toUserStatus("suggested"));
-        return;
-      }
+    const finalMotionPrompt =
+      safeStr(one.motion_prompt, "") ||
+      safeStr(working?.inputs?.motion_prompt, "") ||
+      safeStr(working?.inputs?.prompt, "") ||
+      safeStr(working?.prompts?.motion_prompt, "");
+
+    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_PROMPT_ONE_SHOT");
+
+    working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
+    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
+    if (endImage) working.inputs.end_image_url = endImage;
+
+    await updateVars({ supabase, generationId, vars: working });
+
+    if (suggestOnly) {
+      await supabase
+        .from("mega_generations")
+        .update({
+          mg_status: "suggested",
+          mg_mma_status: "suggested",
+          mg_prompt: finalMotionPrompt,
+          mg_updated_at: nowIso(),
+        })
+        .eq("mg_generation_id", generationId)
+        .eq("mg_record_type", "generation");
+
+      emitStatus(generationId, "suggested");
+      sendDone(generationId, toUserStatus("suggested"));
+      return;
     }
 
-    // If sugg_prompt already provided (either from inputs or just created), we may skip reader2.
-    const providedSugg = safeStr(working?.inputs?.sugg_prompt || working?.inputs?.suggPrompt, "");
-    const suggPrompt = providedSugg || safeStr(working?.prompts?.sugg_prompt, "");
-    let finalMotionPrompt = suggPrompt;
-
-    if (!finalMotionPrompt) {
-      const t2 = Date.now();
-      const rdr = await gptMotionReader2({
-        cfg,
-        ctx,
-        startImageUrl: startImage,
-        endImageUrl: endImage,
-        stillCrt,
-        motionBrief,
-        movementStyle,
-      });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_reader2_motion",
-        payload: {
-          ctx: ctx.motion_reader2,
-          input: {
-            start_image_url: startImage,
-            end_image_url: endImage || null,
-            still_crt: stillCrt,
-            motion_user_brief: motionBrief,
-            selected_movement_style: movementStyle,
-          },
-          request: rdr.request,
-          raw: rdr.raw,
-          output: { motion_prompt: rdr.motion_prompt, userMessage: rdr.userMessage, parsed_ok: rdr.parsed_ok },
-          timing: { started_at: new Date(t2).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t2 },
-          error: null,
-        },
-      });
-
-      working.prompts = { ...(working.prompts || {}), motion_prompt: rdr.motion_prompt || "" };
-      finalMotionPrompt = rdr.motion_prompt || "";
-
-      working = pushUserMessageLine(working, rdr.userMessage || pick(MMA_UI.fallbacks.thinking));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    } else {
-      // keep consistent key
-      working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
-      await updateVars({ supabase, generationId, vars: working });
-    }
-
-    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_PROMPT");
-
-    // ---- generating ----
     await updateStatus({ supabase, generationId, status: "generating" });
     emitStatus(generationId, "generating");
 
-    const duration = Number(working?.inputs?.duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
+    const duration =
+      Number(working?.inputs?.duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
 
     const mode =
       safeStr(working?.inputs?.kling_mode || working?.inputs?.mode, "") ||
@@ -1717,7 +1629,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       process.env.MMA_NEGATIVE_PROMPT_KLING ||
       "";
 
-    const t3 = Date.now();
+    const t1 = Date.now();
     const { input, out, timing } = await runKling({
       prompt: finalMotionPrompt,
       startImage,
@@ -1745,7 +1657,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_video));
-    working.userMessages = { ...(working.userMessages || {}), final_line: pick(MMA_UI.fallbacks.final) };
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
@@ -1783,11 +1694,8 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
   const ctx = await getMmaCtxConfig(supabase);
 
   try {
-    await updateStatus({ supabase, generationId, status: "scanning" });
-    emitStatus(generationId, "scanning");
-
-    working = setCtxAudit(working, ctx);
-    working.scans = { ...(working.scans || {}) };
+    await updateStatus({ supabase, generationId, status: "prompting" });
+    emitStatus(generationId, "prompting");
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.video_tweak_start));
     await updateVars({ supabase, generationId, vars: working });
@@ -1800,7 +1708,6 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     const startImage =
       asHttpUrl(working?.inputs?.start_image_url || working?.inputs?.startImageUrl) ||
       asHttpUrl(parentVars?.inputs?.start_image_url || parentVars?.inputs?.startImageUrl) ||
-      asHttpUrl(parentVars?.inputs?.parent_output_url || parentVars?.inputs?.parentOutputUrl) ||
       asHttpUrl(parent?.mg_output_url) ||
       "";
 
@@ -1811,63 +1718,6 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
 
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO_TWEAK");
 
-    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
-    if (endImage) working.inputs.end_image_url = endImage;
-
-    // still_crt reuse or scan
-    let stillCrt =
-      safeStr(parentVars?.scans?.still_crt, "") ||
-      safeStr(parentVars?.still_crt, "") ||
-      safeStr(working?.scans?.still_crt, "");
-
-    if (!stillCrt) {
-      const t0 = Date.now();
-      const scan = await gptScanOutputStill({ cfg, ctx, imageUrl: startImage });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_scan_start_image",
-        payload: {
-          ctx: ctx.output_scan,
-          input: { imageUrl: startImage },
-          request: scan.request,
-          raw: scan.raw,
-          output: { still_crt: scan.still_crt, userMessage: scan.userMessage, parsed_ok: scan.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      stillCrt = scan.still_crt || "";
-      working.scans.still_crt = stillCrt || null;
-
-      working = pushUserMessageLine(working, scan.userMessage || pick(MMA_UI.fallbacks.scanned));
-      await updateVars({ supabase, generationId, vars: working });
-      emitLine(generationId, working);
-    } else {
-      working.scans.still_crt = stillCrt || null;
-      await updateVars({ supabase, generationId, vars: working });
-    }
-
-    // ---- prompting ----
-    await updateStatus({ supabase, generationId, status: "prompting" });
-    emitStatus(generationId, "prompting");
-
-    const motionBrief =
-      safeStr(working?.inputs?.motion_user_brief, "") ||
-      safeStr(parentVars?.inputs?.motion_user_brief, "") ||
-      safeStr(parentVars?.inputs?.motionBrief, "") ||
-      safeStr(parentVars?.inputs?.brief, "");
-
-    const movementStyle =
-      safeStr(working?.inputs?.selected_movement_style, "") ||
-      safeStr(parentVars?.inputs?.selected_movement_style, "") ||
-      safeStr(parentVars?.inputs?.movement_style, "") ||
-      safeStr(parentVars?.inputs?.movementStyle, "");
-
     const feedbackMotion =
       safeStr(working?.feedback?.motion_feedback, "") ||
       safeStr(working?.feedback?.feedback_motion, "") ||
@@ -1877,53 +1727,53 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
 
     if (!feedbackMotion) throw new Error("MISSING_MOTION_FEEDBACK");
 
-    const baseInput = {
+    const prevMotionPrompt =
+      safeStr(parentVars?.prompts?.motion_prompt, "") ||
+      safeStr(parent?.mg_prompt, "");
+
+    const oneShotInput = {
       start_image_url: startImage,
-      end_image_url: endImage || null,
-      still_crt: stillCrt,
-      motion_user_brief: motionBrief,
-      selected_movement_style: movementStyle,
+      end_image_url: asHttpUrl(endImage) || null,
+      feedback_motion: feedbackMotion,
+      previous_motion_prompt: prevMotionPrompt,
+      notes: "Keep what works. Apply feedback precisely. Plain English. No emojis. No questions.",
     };
 
-    const prevMotionPrompt = safeStr(parentVars?.prompts?.motion_prompt, "") || safeStr(parent?.mg_prompt, "");
+    const labeledImages = []
+      .concat([{ role: "START_IMAGE", url: startImage }])
+      .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
+      .slice(0, 6);
 
-    const t1 = Date.now();
-    const fix = await gptMotionFeedback2({
-      cfg,
-      ctx,
-      startImageUrl: startImage,
-      endImageUrl: endImage,
-      baseInput,
-      feedbackMotion,
-      previousMotionPrompt: prevMotionPrompt,
-    });
+    const t0 = Date.now();
+    const one = await gptMotionOneShotTweak({ cfg, ctx, input: oneShotInput, labeledImages });
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "gpt_feedback2_motion",
+      stepType: "gpt_motion_tweak_one_shot",
       payload: {
-        ctx: ctx.motion_feedback2,
-        input: { ...baseInput, feedback_motion: feedbackMotion, previous_motion_prompt: prevMotionPrompt },
-        request: fix.request,
-        raw: fix.raw,
-        output: { motion_prompt: fix.motion_prompt, parsed_ok: fix.parsed_ok },
-        timing: { started_at: new Date(t1).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t1 },
+        ctx: ctx.motion_tweak_one_shot,
+        input: oneShotInput,
+        labeledImages,
+        request: one.request,
+        raw: one.raw,
+        output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
         error: null,
       },
     });
 
-    const finalMotionPrompt = safeStr(fix.motion_prompt, "");
-    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_FEEDBACK_PROMPT");
+    const finalMotionPrompt = safeStr(one.motion_prompt, "");
+    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_TWEAK_PROMPT_ONE_SHOT");
 
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
-    working = pushUserMessageLine(working, pick(MMA_UI.fallbacks.thinking));
-    await updateVars({ supabase, generationId, vars: working });
-    emitLine(generationId, working);
+    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
+    if (endImage) working.inputs.end_image_url = endImage;
 
-    // ---- generating ----
+    await updateVars({ supabase, generationId, vars: working });
+
     await updateStatus({ supabase, generationId, status: "generating" });
     emitStatus(generationId, "generating");
 
@@ -1946,7 +1796,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       process.env.MMA_NEGATIVE_PROMPT_KLING ||
       "";
 
-    const t2 = Date.now();
+    const t1 = Date.now();
     const { input, out, timing } = await runKling({
       prompt: finalMotionPrompt,
       startImage,
@@ -1974,8 +1824,6 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_video));
-    working.userMessages = { ...(working.userMessages || {}), final_line: pick(MMA_UI.fallbacks.final) };
-
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 

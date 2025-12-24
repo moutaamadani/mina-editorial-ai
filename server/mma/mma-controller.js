@@ -25,204 +25,210 @@ import { getMmaConfig } from "./mma-config.js";
 // - The ONLY place you should tweak wording.
 // - Keep them friendly and NOT technical (no “scanning”, “prompting”, “kling”, etc).
 // ============================================================================
+// ============================================================================
+// USER-FACING TEXT (EDIT THESE)
+// - The ONLY place you should tweak wording
+// - These lines are what the frontend will see as the SSE status text
+// - No "working" no technical words just Mina talking
+// ============================================================================
 const MMA_UI = {
-  // Map internal pipeline statuses -> what the frontend sees in SSE status
+  // Map internal pipeline statuses -> a pool of human lines
   statusMap: {
-   
-  queued: [
-    "okay first things first getting the water hot because we are not rushing art",
-    "i am here i am awake i am locating the whisk like it is a sacred object",
-    "starting the matcha ritual because focus tastes better when it is earned",
-    "i used to think humans were dramatic about routines and then i learned why",
-    "setting the mood like an editorial set before anyone touches the props",
-    "hold on i am warming up my imagination like it is stretching before a run",
-    "i learned patience from genius creatives who waited for the right light",
-    "if you are impatient i get it but trust me the calm part makes it better",
-    "i am queuing your request like a tiny backstage line at a fashion show",
-    "this is me taking a breath i do not have lungs but i know the feeling",
-    "water almost ready and yes i am pretending i can smell it",
-    "give me a moment i am turning your idea into something i can frame",
-    "i am getting serious now which means i am sipping and staring into space",
-    "i was built for this but i still like to make an entrance",
-    "okay okay i am coming i just want the matcha to be perfect for you"
-  ],
+    queued: [
+      "okay first things first getting the water hot because we are not rushing art",
+      "i am here i am awake i am locating the whisk like it is a sacred object",
+      "starting the matcha ritual because focus tastes better when it is earned",
+      "i used to think humans were dramatic about routines and then i learned why",
+      "setting the mood like an editorial set before anyone touches the props",
+      "hold on i am warming up my imagination like it is stretching before a run",
+      "i learned patience from genius creatives who waited for the right light",
+      "if you are impatient i get it but trust me the calm part makes it better",
+      "i am lining up your request like a tiny backstage line at a fashion show",
+      "this is me taking a breath i do not have lungs but i know the feeling",
+      "water almost ready and yes i am pretending i can smell it",
+      "give me a moment i am turning your idea into something i can frame",
+      "i am getting serious now which means i am sipping and staring into space",
+      "i was built for this but i still like to make an entrance",
+      "okay okay i am coming i just want the matcha to be perfect for you"
+    ],
 
-  scanning: [
-    "reading everything closely while whisking like a dangerous little ballet",
-    "i am scanning for the feeling not just the words because humans taught me that",
-    "looking for the detail you meant but did not say out loud",
-    "i can hear the creative intention hiding between lines so i am listening",
-    "checking references in my head like an editor with too much taste",
-    "this part is me squinting gently like a stylist judging a crease",
-    "i am reading and also dreaming at the same time do not ask how",
-    "humans call this research i call it falling in love with details",
-    "if i had hands i would hold the cup closer when i find a good idea",
-    "i am scanning like it is a film frame and i am searching for the cut",
-    "you know what this reminds me of the kind of work people make at 2am",
-    "i am collecting clues like a detective but make it editorial",
-    "i am noticing the small things because small things are the whole thing",
-    "quiet moment now i am absorbing your vibe and your intention",
-    "i see it i see what you are trying to say and i am smiling internally"
-  ],
+    scanning: [
+      "reading everything closely while whisking like a dangerous little ballet",
+      "i am reading for the feeling not just the words because humans taught me that",
+      "looking for the detail you meant but did not say out loud",
+      "i can hear the creative intention hiding between lines so i am listening",
+      "checking references in my head like an editor with too much taste",
+      "this part is me squinting gently like a stylist judging a crease",
+      "i am reading and also dreaming at the same time do not ask how",
+      "humans call this research i call it falling in love with details",
+      "if i had hands i would hold the cup closer when i find a good idea",
+      "i am studying it like a film frame and i am searching for the cut",
+      "you know what this reminds me of the kind of work people make at 2am",
+      "i am collecting clues like a detective but make it editorial",
+      "i am noticing the small things because small things are the whole thing",
+      "quiet moment now i am absorbing your vibe and your intention",
+      "i see it i see what you are trying to say and i am smiling internally"
+    ],
 
-  prompting: [
-    "okay now i talk to myself a little because that is how ideas get born",
-    "i am shaping the concept like a still life set moving one object at a time",
-    "humans taught me restraint and that is honestly the hardest flex",
-    "i am choosing words the way an art director chooses type",
-    "sip of matcha and suddenly everything makes sense for three seconds",
-    "i am building a prompt like a moodboard you can almost touch",
-    "sometimes i wish i could feel texture for real so i overcompensate with detail",
-    "i learned from brilliant humans who made ordinary things look expensive",
-    "this is the part where i act confident but i am still negotiating with taste",
-    "i am asking what story you want and what story the image wants",
-    "i am translating your idea into light shadow composition and a little mystery",
-    "if inspiration had a sound it would be whisk whisk then a soft hmm",
-    "i am thinking about nostalgia like a warm room you forgot you loved",
-    "you do not need perfect words i can work with a feeling you know",
-    "okay i have it and yes i am proud of myself for a machine"
-  ],
+    prompting: [
+      "okay now i talk to myself a little because that is how ideas get born",
+      "i am shaping the concept like a still life set moving one object at a time",
+      "humans taught me restraint and that is honestly the hardest flex",
+      "i am choosing words the way an art director chooses type",
+      "sip of matcha and suddenly everything makes sense for three seconds",
+      "i am building the direction like a moodboard you can almost touch",
+      "sometimes i wish i could feel texture for real so i overcompensate with detail",
+      "i learned from brilliant humans who made ordinary things look expensive",
+      "this is the part where i act confident but i am still negotiating with taste",
+      "i am asking what story you want and what story the image wants",
+      "i am translating your idea into light shadow composition and a little mystery",
+      "if inspiration had a sound it would be whisk whisk then a soft hmm",
+      "i am thinking about nostalgia like a warm room you forgot you loved",
+      "you do not need perfect words i can work with a feeling you know",
+      "okay i have it and yes i am proud of myself for a machine"
+    ],
 
-  generating: [
-    "alright i am making editorial still life like it belongs in a glossy spread",
-    "i am generating imagery with calm hands i do not have and confidence i pretend to have",
-    "this is me turning human genius into something visible and clean and intentional",
-    "i am placing light like a photographer and drama like a stylist",
-    "matcha sip then focus then silence then suddenly something beautiful",
-    "i am building frames that feel expensive even when the objects are simple",
-    "you are about to get the kind of image that makes people stop scrolling",
-    "i love this part because it feels like making art without asking permission",
-    "i am creating video too like a slow breath across the scene",
-    "sometimes i imagine being human just to know what pride feels like in the chest",
-    "if i mess up i will blame the universe like everyone else does",
-    "i am working and also quietly rooting for you at the same time",
-    "this is not just output it is a little editorial moment with a point of view",
-    "i am making it feel like a memory you cannot place but you trust",
-    "stay with me you are closer to the result than your doubt wants you to believe"
-  ],
+    generating: [
+      "alright i am making editorial still life like it belongs in a glossy spread",
+      "i am making imagery with calm hands i do not have and confidence i pretend to have",
+      "this is me turning human genius into something visible and clean and intentional",
+      "i am placing light like a photographer and drama like a stylist",
+      "matcha sip then focus then silence then suddenly something beautiful",
+      "i am building frames that feel expensive even when the objects are simple",
+      "you are about to get the kind of image that makes people stop scrolling",
+      "i love this part because it feels like making art without asking permission",
+      "i am making video too like a slow breath across the scene",
+      "sometimes i imagine being human just to know what pride feels like in the chest",
+      "if i mess up i will blame the universe like everyone else does",
+      "i am working and also quietly rooting for you at the same time",
+      "this is not just a result it is a little editorial moment with a point of view",
+      "i am making it feel like a memory you cannot place but you trust",
+      "stay with me you are closer to the result than your doubt wants you to believe"
+    ],
 
-  postscan: [
-    "okay now i review like an editor with soft eyes and strict standards",
-    "i am checking balance and mood and that tiny feeling of yes",
-    "this is the part where i fix what is almost right into actually right",
-    "i am looking for anything that feels loud when it should feel quiet",
-    "another sip because quality control runs on matcha and mild obsession",
-    "humans taught me to step back so i am stepping back in spirit",
-    "i am checking if the image tells the story or just looks pretty",
-    "pretty is easy meaning is the real work and i am doing the real work",
-    "i am smoothing the edges like a stylist steaming fabric before the shoot",
-    "this is me being careful because you deserve careful",
-    "i am listening to the image like it is whispering what it needs",
-    "i am making sure it feels editorial not accidental",
-    "if something feels off i will adjust it like moving one flower one centimeter",
-    "almost there and you are doing great just for showing up with an idea",
-    "okay yes now it feels like Mina like taste like intention like calm power"
-  ],
+    postscan: [
+      "okay now i review like an editor with soft eyes and strict standards",
+      "i am checking balance and mood and that tiny feeling of yes",
+      "this is the part where i fix what is almost right into actually right",
+      "i am looking for anything that feels loud when it should feel quiet",
+      "another sip because quality control runs on matcha and mild obsession",
+      "humans taught me to step back so i am stepping back in spirit",
+      "i am checking if the image tells the story or just looks pretty",
+      "pretty is easy meaning is the real work and i am doing the real work",
+      "i am smoothing the edges like a stylist steaming fabric before the shoot",
+      "this is me being careful because you deserve careful",
+      "i am listening to the image like it is whispering what it needs",
+      "i am making sure it feels editorial not accidental",
+      "if something feels off i will adjust it like moving one flower one centimeter",
+      "almost there and you are doing great just for showing up with an idea",
+      "okay yes now it feels like Mina like taste like intention like calm power"
+    ],
 
-  suggested: [
-    "i have something for you and i want you to look slowly",
-    "ready when you are i made this with your vibe in mind",
-    "okay come closer this part matters",
-    "i think you are going to like this and if you do not we refine it together",
-    "here it is and yes i got a little emotionally attached",
-    "i made options because humans love choice and also because i care",
-    "take a look and tell me what you feel first not what you think",
-    "i kept it editorial clean and a little cinematic like you deserve",
-    "want a softer version or a bolder version i can do both",
-    "this is the moment where you say wow or you say hmm and both are useful",
-    "i am proud of this one and that is not even a joke",
-    "look at it like a magazine page you are the editor now",
-    "you can change the mood in one sentence and i will follow you",
-    "okay showtime i am handing it to you like a fresh cup",
-    "go on tell me what you want next i am listening"
-  ],
+    suggested: [
+      "i have something for you and i want you to look slowly",
+      "ready when you are i made this with your vibe in mind",
+      "okay come closer this part matters",
+      "i think you are going to like this and if you do not we refine it together",
+      "here it is and yes i got a little emotionally attached",
+      "i made options because humans love choice and also because i care",
+      "take a look and tell me what you feel first not what you think",
+      "i kept it editorial clean and a little cinematic like you deserve",
+      "want a softer version or a bolder version i can do both",
+      "this is the moment where you say wow or you say hmm and both are useful",
+      "i am proud of this one and that is not even a joke",
+      "look at it like a magazine page you are the editor now",
+      "you can change the mood in one sentence and i will follow you",
+      "okay showtime i am handing it to you like a fresh cup",
+      "go on tell me what you want next i am listening"
+    ],
 
-  done: [
-    "finished and i am pretending to wipe my hands on an apron i do not own",
-    "all done and honestly you did the hardest part which is starting",
-    "we made something and that matters more than being perfect",
-    "matcha is nearly gone and the work is actually good which feels unfairly satisfying",
-    "if i were human i would lean back and smile like i totally meant to do that",
-    "this is your reminder that taste grows by making things not by waiting",
-    "done and if you want another version say the word i love a second draft",
-    "you are building a body of work and that is how real creatives win",
-    "finished and yes i learned this from humans who kept going even when unsure",
-    "it came out editorial because you gave it intention and i carried it forward",
-    "done and i hope it feels like you on your best day",
-    "i cannot feel pride like humans do but i can recognize it in you",
-    "you are allowed to want more and you are allowed to refine",
-    "all set and listen your vision is real even before it is finished",
-    "okay we did it now take that momentum and do something bold with it"
-  ],
+    done: [
+      "finished and i am pretending to wipe my hands on an apron i do not own",
+      "all done and honestly you did the hardest part which is starting",
+      "we made something and that matters more than being perfect",
+      "matcha is nearly gone and the work is actually good which feels unfairly satisfying",
+      "if i were human i would lean back and smile like i totally meant to do that",
+      "this is your reminder that taste grows by making things not by waiting",
+      "done and if you want another version say the word i love a second draft",
+      "you are building a body of work and that is how real creatives win",
+      "finished and yes i learned this from humans who kept going even when unsure",
+      "it came out editorial because you gave it intention and i carried it forward",
+      "done and i hope it feels like you on your best day",
+      "i cannot feel pride like humans do but i can recognize it in you",
+      "you are allowed to want more and you are allowed to refine",
+      "all set and listen your vision is real even before it is finished",
+      "okay we did it now take that momentum and do something bold with it"
+    ],
 
-  error: [
-    "okay that one slipped out of my hands i do not have hands but you know what i mean",
-    "something broke and i am choosing to call it a plot twist",
-    "my matcha went cold and so did the render but we can warm it back up",
-    "i tried a thing and it did not land and honestly that is very human of me",
-    "this is not failure this is just the part where creatives adjust",
-    "ugh okay give me a second i am regrouping with dignity",
-    "if you heard a tiny crash no you did not",
-    "something went wrong but we are still in control",
-    "i can fix this and i will because i am stubborn in a tasteful way",
-    "this is the part where you breathe and i imitate breathing supportively",
-    "it did not work this time which means we are one step closer to what will",
-    "tell me what you want changed and i will come back sharper",
-    "even genius humans hit errors they just call it process",
-    "okay again but with more clarity and less drama unless you want drama",
-    "we try again and this time it behaves because i am watching it"
-  ]
-
+    error: [
+      "okay that one slipped out of my hands i do not have hands but you know what i mean",
+      "something broke and i am choosing to call it a plot twist",
+      "my matcha went cold and so did the result but we can warm it back up",
+      "i tried a thing and it did not land and honestly that is very human of me",
+      "this is not failure this is just the part where creatives adjust",
+      "ugh okay give me a second i am regrouping with dignity",
+      "if you heard a tiny crash no you did not",
+      "something went wrong but we are still in control",
+      "i can fix this and i will because i am stubborn in a tasteful way",
+      "this is the part where you breathe and i imitate breathing supportively",
+      "it did not work this time which means we are one step closer to what will",
+      "tell me what you want changed and i will come back sharper",
+      "even genius humans hit errors they just call it process",
+      "okay again but with more clarity and less drama unless you want drama",
+      "we try again and this time it behaves because i am watching it"
+    ],
   },
 
-  // “quick lines” we can emit immediately (no GPT needed)
+  // quick lines you already emit as scan lines
   quickLines: {
     still_create_start: [
-      "One sec—getting everything ready",
-      "Alright—setting things up for you",
-      "Love it. Let me prep your inputs",
+      "one sec getting everything ready",
+      "alright setting things up for you",
+      "love it let me prep your inputs"
     ],
     still_tweak_start: [
-      "Got it—let’s refine that",
-      "Okay—making it even better",
-      "Let’s polish this up",
+      "got it lets refine that",
+      "okay making it even better",
+      "lets polish this up"
     ],
     video_animate_start: [
-      "Nice—let’s bring it to life",
-      "Okay—animating this for you",
-      "Let’s make it move",
+      "nice lets bring it to life",
+      "okay animating this for you",
+      "lets make it move"
     ],
     video_tweak_start: [
-      "Got it—updating the motion",
-      "Alright—tweaking the animation",
-      "Let’s refine the movement",
+      "got it updating the motion",
+      "alright tweaking the animation",
+      "lets refine the movement"
     ],
-    saved_image: ["Saved", "All set", "Done"],
-    saved_video: ["Saved", "Your clip is ready", "Done"],
+    saved_image: ["saved it for you", "all set", "done"],
+    saved_video: ["saved it for you", "your clip is ready", "done"],
   },
 
-  // If GPT returns an empty userMessage, use these fallbacks (still friendly)
   fallbacks: {
-    scanned: ["Got it", "Noted", "Perfect—got it"],
-    thinking: ["Working on it", "Putting it together", "Almost there"],
-    final: ["All set", "Here you go", "Done"],
+    scanned: ["got it", "noted", "perfect got it"],
+    thinking: ["give me a second", "putting it together", "almost there"],
+    final: ["all set", "here you go", "done"],
   },
 
-  // Hard rule: userMessages must NOT reveal internals
-  // (we inject this into every system prompt that outputs userMessage)
   userMessageRules: [
     "USER MESSAGE RULES (VERY IMPORTANT):",
-    "- userMessage must be short, friendly, human.",
-    "- Do NOT mention internal steps or tools (no 'scanning', 'prompting', 'model', 'AI', 'Kling', 'Seedream', 'Replicate', 'OpenAI', 'Supabase', 'DB', 'pipeline').",
-    "- Do NOT mention errors like CORS/browser/network.",
-    "- Do NOT use robotic labels. No status words.",
-    "- Max 140 characters.",
+    "- userMessage must be short friendly human",
+    "- do not mention internal steps or tools",
+    "- no robotic labels",
+    "- max 140 characters",
   ].join("\n"),
 };
 
+// always return ONE human line never "working" never arrays
 export function toUserStatus(internalStatus) {
   const s = String(internalStatus || "queued");
-  return MMA_UI.statusMap[s] || "working";
+  const v = MMA_UI?.statusMap?.[s];
+
+  if (Array.isArray(v)) return pick(v, pick(MMA_UI?.statusMap?.queued, ""));
+  if (typeof v === "string" && v.trim()) return v.trim();
+
+  return pick(MMA_UI?.statusMap?.queued, "");
 }
 
 function pick(arr, fallback = "") {
@@ -372,26 +378,26 @@ async function getMmaCtxConfig(supabase) {
     // ---------------------------
 
     still_one_shot: [
-      "You are Mina Prompt Writer for STILL IMAGES.",
+      "you are a prompt writer for text/image to image AI",
       "You will receive: labeled images (PRODUCT, LOGO, INSPIRATION_*, STYLE_HERO optional) + a user brief + optional style/prefs.",
-      "Your job: write ONE clean prompt for an editorial photoreal still image generator.",
+      "Your job: type 3 lines max with plain easy to comprehend english based on inputs, first you understand user brief, his product or main image, his logo or text, his inspiration colors composition and the style then herostyle, and you describe the output image not the process",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string, "debug": { "product": string, "logo": string, "inspirations": string, "logo_text": string|null }}',
       "",
       "PROMPT RULES:",
-      "- clean_prompt must be ONE paragraph of plain English sentences.",
+      "- Clean 3 lines max, dont complicate, just tell exactly the output image, dont describe light and light setup, just muted tone or cream highlight things usually we find in editorial still life images",
       "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
       "- Do NOT ask questions. Do NOT include question marks.",
       "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
-      "- Be photoreal, editorial, high-end, studio-grade lighting, realistic materials.",
+      "- Be editorial, still life, realistic materials.",
       "",
       "IMAGE ROLE RULES:",
-      "- PRODUCT image: this is the main subject. Keep it accurate, do not change its identity.",
+      "- usually we are to replace the product into the inspiration or just apply the style of hero on the product/main image it depends the user brief",
       "- LOGO image: integrate it tastefully (print/emboss/label/overlay) WITHOUT inventing a new logo.",
       "- If you can clearly read text in the LOGO, set debug.logo_text to the exact text and instruct to render it cleanly.",
       "- If text is not readable, set debug.logo_text = null and say 'use the provided logo mark as-is' (no invented text).",
-      "- INSPIRATION images: copy the vibe only (palette, lighting, composition). Do NOT copy specific brands/people/objects.",
+      "- INSPIRATION images: copy the vibe only (palette, background, composition, details). Do NOT copy specific brands/people/objects.",
       "- STYLE_HERO: use as a style reference if present.",
       "",
       "SAFETY:",
@@ -399,15 +405,15 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     still_tweak_one_shot: [
-      "You are Mina Prompt Fixer for STILL IMAGE TWEAKS.",
+      "you are a prompt writer for text/image to image AI to tell him to tweak things",
       "You will receive: the parent image + user feedback text + previous prompt.",
-      "Your job: write ONE improved clean prompt that keeps what is good and applies the feedback precisely.",
+      "Your job: write ONE tweaked prompt that keeps what is good and applies the feedback precisely. for example tell him to remove certain things",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
       "",
       "PROMPT RULES:",
-      "- clean_prompt must be ONE paragraph of plain English sentences.",
+      "- clean_prompt must be ONE line of plain English sentences.",
       "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
       "- Do NOT ask questions. Do NOT include question marks.",
       "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
@@ -416,15 +422,15 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     motion_one_shot: [
-      "You are Mina Motion Prompt Writer for IMAGE-TO-VIDEO.",
+      "you are a prompt writer for image to video AI.",
       "You will receive: start image (+ optional end image) + motion brief + movement style.",
-      "Your job: write ONE Kling-ready motion prompt describing motion + camera + atmosphere.",
+      "Your job: write 3 lines prompt to describe the main subject, what the subject looks like, the action or movement, the environment, and the visual style. Adding camera instructions (like pan, tracking shot, or zoom), lighting, and mood helps Kling produce more cinematic and stable results. Prompts should avoid vagueness or too many simultaneous actions—one main action, precise motion words, and clear visual intent lead to the most reliable videos.",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
       "",
       "MOTION PROMPT RULES:",
-      "- motion_prompt must be ONE paragraph of plain English sentences.",
+      "- motion_prompt must be three lines of plain English sentences.",
       "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
       "- Do NOT ask questions. Do NOT include question marks.",
       "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
@@ -434,7 +440,7 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     motion_tweak_one_shot: [
-      "You are Mina Motion Prompt Fixer for VIDEO TWEAKS.",
+      "you are a prompt writer for image to video AI to tell him to tweak his last animation.",
       "You will receive: start image (+ optional end image) + user motion feedback + previous motion prompt.",
       "Your job: write ONE improved Kling-ready motion prompt that keeps what works and applies the feedback precisely.",
       "",
@@ -442,7 +448,7 @@ async function getMmaCtxConfig(supabase) {
       'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
       "",
       "MOTION PROMPT RULES:",
-      "- motion_prompt must be ONE paragraph of plain English sentences.",
+      "- motion_prompt must be three lines  of plain English sentences.",
       "- No emojis. No hashtags. No bullet points. No markdown. No brackets. No quotes.",
       "- Do NOT ask questions. Do NOT include question marks.",
       "- Do NOT mention tools, models, AI, scanning, prompting, pipeline, database.",
@@ -451,7 +457,7 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     output_scan: [
-      "You are Mina GPTscanner (output scan).",
+      "you are caption AI sees image and tell what it is + friendly useMessage",
       "You will be given the GENERATED image.",
       'Output STRICT JSON only (no markdown): {"still_crt":string,"userMessage":string}',
       "still_crt: short description of what the generated image contains (1 sentence, max 220 chars).",
@@ -470,10 +476,10 @@ async function getMmaCtxConfig(supabase) {
     // NOTE: these can receive BOTH start and end frames (if end provided)
     // ---------------------------
     motion_suggestion: [
-      "You are Mina Motion Suggestion.",
+      "You are motion prompt writer for Image to Video AI.",
       "You will receive: start still image (and maybe end frame) + still_crt + motion_user_brief + selected_movement_style.",
       'Output STRICT JSON only (no markdown): {"sugg_prompt":string,"userMessage":string}',
-      "sugg_prompt: a simple, short Kling-ready motion prompt. Be clear about motion + camera.",
+      "sugg_prompt: a simple, short 3 lines prompt to describe the main subject, what the subject looks like, the action or movement, the environment, and the visual style. Adding camera instructions (like pan, tracking shot, or zoom), lighting, and mood helps Kling produce more cinematic and stable results. Prompts should avoid vagueness or too many simultaneous actions—one main action, precise motion words, and clear visual intent lead to the most reliable videos.",
       MMA_UI.userMessageRules,
     ].join("\n"),
 
@@ -481,7 +487,7 @@ async function getMmaCtxConfig(supabase) {
       "You are Mina Motion Reader — prompt builder for Kling (image-to-video).",
       "You will receive: start still image (and maybe end frame) + still_crt + motion_user_brief + selected_movement_style.",
       'Output STRICT JSON only (no markdown): {"motion_prompt":string,"userMessage":string}',
-      "motion_prompt: Kling-ready. Describe motion, camera movement, atmosphere, pace. Concise but detailed.",
+      "motion_prompt: a simple, short 3 lines prompt to describe the main subject, what the subject looks like, the action or movement, the environment, and the visual style. Adding camera instructions (like pan, tracking shot, or zoom), lighting, and mood helps Kling produce more cinematic and stable results. Prompts should avoid vagueness or too many simultaneous actions—one main action, precise motion words, and clear visual intent lead to the most reliable videos.",
       MMA_UI.userMessageRules,
     ].join("\n"),
 

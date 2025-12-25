@@ -1733,56 +1733,100 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       safeStr(working?.inputs?.movement_style, "") ||
       safeStr(working?.inputs?.movementStyle, "");
 
-    // If frontend wants suggestion-only, we still do ONE GPT call and stop.
-    const suggestOnly = working?.inputs?.suggest_only === true || working?.inputs?.suggestOnly === true;
+        // If frontend wants suggestion-only, we still do ONE prompt build and stop.
+        const suggestOnly = working?.inputs?.suggest_only === true || working?.inputs?.suggestOnly === true;
+    
+        // ✅ If frontend already has a final motion prompt ("Type for me"), skip GPT completely.
+        const usePromptOverride =
+          working?.inputs?.use_prompt_override === true || working?.inputs?.usePromptOverride === true;
+    
+        const promptOverride = safeStr(
+          working?.inputs?.prompt_override || working?.inputs?.promptOverride || "",
+          ""
+        ).trim();
+    
+        let finalMotionPrompt = "";
+    
+        if (usePromptOverride && promptOverride) {
+          finalMotionPrompt = promptOverride;
+    
+          const t0 = Date.now();
+          await writeStep({
+            supabase,
+            generationId,
+            passId,
+            stepNo: stepNo++,
+            stepType: "motion_prompt_override",
+            payload: {
+              used: true,
+              note: "Skipped GPT motion prompt builder because frontend provided prompt_override.",
+              input: {
+                use_prompt_override: true,
+                prompt_override: finalMotionPrompt,
+              },
+              timing: {
+                started_at: new Date(t0).toISOString(),
+                ended_at: nowIso(),
+                duration_ms: Date.now() - t0,
+              },
+              error: null,
+            },
+          });
+        } else {
+          const oneShotInput = {
+            start_image_url: startImage,
+            end_image_url: asHttpUrl(endImage) || null,
+            motion_user_brief: motionBrief,
+            selected_movement_style: movementStyle,
+            notes: "Write a single clean motion prompt. Plain English. No emojis. No questions.",
+          };
+    
+          const labeledImages = []
+            .concat([{ role: "START_IMAGE", url: startImage }])
+            .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
+            .slice(0, 6);
+    
+          const t0 = Date.now();
+          const one = await gptMotionOneShotAnimate({ cfg, ctx, input: oneShotInput, labeledImages });
+    
+          await writeStep({
+            supabase,
+            generationId,
+            passId,
+            stepNo: stepNo++,
+            stepType: "gpt_motion_one_shot",
+            payload: {
+              ctx: ctx.motion_one_shot,
+              input: oneShotInput,
+              labeledImages,
+              request: one.request,
+              raw: one.raw,
+              output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
+              timing: {
+                started_at: new Date(t0).toISOString(),
+                ended_at: nowIso(),
+                duration_ms: Date.now() - t0,
+              },
+              error: null,
+            },
+          });
+    
+          finalMotionPrompt =
+            safeStr(one.motion_prompt, "") ||
+            safeStr(working?.inputs?.motion_prompt, "") ||
+            safeStr(working?.inputs?.prompt, "") ||
+            safeStr(working?.prompts?.motion_prompt, "");
+        }
+    
+        finalMotionPrompt = safeStr(finalMotionPrompt, "").trim();
+        if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_PROMPT_ONE_SHOT");
+    
+        working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
+        working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
+        if (endImage) working.inputs.end_image_url = endImage;
+    
+        await updateVars({ supabase, generationId, vars: working });
 
-    const oneShotInput = {
-      start_image_url: startImage,
-      end_image_url: asHttpUrl(endImage) || null,
-      motion_user_brief: motionBrief,
-      selected_movement_style: movementStyle,
-      notes: "Write a single clean motion prompt. Plain English. No emojis. No questions.",
-    };
-
-    const labeledImages = []
-      .concat([{ role: "START_IMAGE", url: startImage }])
-      .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
-      .slice(0, 6);
-
-    const t0 = Date.now();
-    const one = await gptMotionOneShotAnimate({ cfg, ctx, input: oneShotInput, labeledImages });
-
-    await writeStep({
-      supabase,
-      generationId,
-      passId,
-      stepNo: stepNo++,
-      stepType: "gpt_motion_one_shot",
-      payload: {
-        ctx: ctx.motion_one_shot,
-        input: oneShotInput,
-        labeledImages,
-        request: one.request,
-        raw: one.raw,
-        output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
-        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-        error: null,
-      },
-    });
-
-    const finalMotionPrompt =
-      safeStr(one.motion_prompt, "") ||
-      safeStr(working?.inputs?.motion_prompt, "") ||
-      safeStr(working?.inputs?.prompt, "") ||
-      safeStr(working?.prompts?.motion_prompt, "");
-
-    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_PROMPT_ONE_SHOT");
-
-    working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
-    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
-    if (endImage) working.inputs.end_image_url = endImage;
-
-    await updateVars({ supabase, generationId, vars: working });
 
     if (suggestOnly) {
       await supabase

@@ -398,7 +398,7 @@ async function getMmaCtxConfig(supabase) {
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
       "",
       "SAFETY:",
-      "- if the brief tells you to remove or change something your prompt should be only that. if the logo labeled image is text or paragraph, type it in the prompt,  dont say inspired from or use the reference, Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
+      "- if the brief tells you to remove or change something your prompt should be only that. dont type text comping from inspiration images, if the logo labeled image is text or paragraph, type it in the prompt,  dont say inspired from or use the reference, Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
     ].join("\n"),
 
     still_tweak_one_shot: [

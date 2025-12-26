@@ -1,8 +1,5 @@
 // ./server/mma/mma-router.js
-// Express router for Mina Mind API (MMA)
-// - Routes fan out to controller helpers
-// - SSE replay endpoint
-// - IMPORTANT: we resolve passId ONCE from request + inject into body so controller uses SAME passId
+"use strict";
 
 import express from "express";
 import {
@@ -17,28 +14,35 @@ import {
   toUserStatus,
 } from "./mma-controller.js";
 import { getSupabaseAdmin } from "../../supabase.js";
-import { resolvePassId as megaResolvePassId } from "../../mega-db.js";
 
 const router = express.Router();
 
-// ----------------------------
-// helper: inject passId
-// ----------------------------
-function withPassId(req, rawBody) {
-  const body = rawBody && typeof rawBody === "object" ? rawBody : {};
-  const passId = megaResolvePassId(req, body);
-  return { passId, body: { ...body, passId } };
+// ✅ IMPORTANT: server.js already injects req.body.passId / pass_id.
+// We just reuse it, and set response header for frontend convenience.
+function getPassIdFromReq(req) {
+  const b = req.body || {};
+  return (
+    b.passId ||
+    b.pass_id ||
+    req.get("x-mina-pass-id") ||
+    req.get("X-Mina-Pass-Id") ||
+    ""
+  );
+}
+
+function setPassIdHeader(res, passId) {
+  if (passId) res.set("X-Mina-Pass-Id", passId);
 }
 
 // ======================================================
-// Routes
+// MMA endpoints
 // ======================================================
 router.post("/still/create", async (req, res) => {
-  const { passId, body } = withPassId(req, req.body);
+  const passId = getPassIdFromReq(req);
+  setPassIdHeader(res, passId);
 
   try {
-    res.set("X-Mina-Pass-Id", passId);
-    const result = await handleMmaCreate({ mode: "still", body });
+    const result = await handleMmaCreate({ mode: "still", body: req.body || {} });
     res.json(result);
   } catch (err) {
     console.error("[mma] still/create error", err);
@@ -51,13 +55,13 @@ router.post("/still/create", async (req, res) => {
 });
 
 router.post("/still/:generation_id/tweak", async (req, res) => {
-  const { passId, body } = withPassId(req, req.body);
+  const passId = getPassIdFromReq(req);
+  setPassIdHeader(res, passId);
 
   try {
-    res.set("X-Mina-Pass-Id", passId);
     const result = await handleMmaStillTweak({
       parentGenerationId: req.params.generation_id,
-      body,
+      body: req.body || {},
     });
     res.json(result);
   } catch (err) {
@@ -71,11 +75,11 @@ router.post("/still/:generation_id/tweak", async (req, res) => {
 });
 
 router.post("/video/animate", async (req, res) => {
-  const { passId, body } = withPassId(req, req.body);
+  const passId = getPassIdFromReq(req);
+  setPassIdHeader(res, passId);
 
   try {
-    res.set("X-Mina-Pass-Id", passId);
-    const result = await handleMmaCreate({ mode: "video", body });
+    const result = await handleMmaCreate({ mode: "video", body: req.body || {} });
     res.json(result);
   } catch (err) {
     console.error("[mma] video/animate error", err);
@@ -88,13 +92,13 @@ router.post("/video/animate", async (req, res) => {
 });
 
 router.post("/video/:generation_id/tweak", async (req, res) => {
-  const { passId, body } = withPassId(req, req.body);
+  const passId = getPassIdFromReq(req);
+  setPassIdHeader(res, passId);
 
   try {
-    res.set("X-Mina-Pass-Id", passId);
     const result = await handleMmaVideoTweak({
       parentGenerationId: req.params.generation_id,
-      body,
+      body: req.body || {},
     });
     res.json(result);
   } catch (err) {
@@ -108,12 +112,12 @@ router.post("/video/:generation_id/tweak", async (req, res) => {
 });
 
 router.post("/events", async (req, res) => {
-  const { passId, body } = withPassId(req, req.body);
+  const passId = getPassIdFromReq(req);
+  setPassIdHeader(res, passId);
 
   try {
-    res.set("X-Mina-Pass-Id", passId);
-    // ✅ never charge credits for events
-    const result = await handleMmaEvent(body || {});
+    // ✅ never charge credits here (controller handles all credit logic in pipelines)
+    const result = await handleMmaEvent(req.body || {});
     res.json(result);
   } catch (err) {
     console.error("[mma] events error", err);
@@ -121,6 +125,9 @@ router.post("/events", async (req, res) => {
   }
 });
 
+// ======================================================
+// Fetch single generation
+// ======================================================
 router.get("/generations/:generation_id", async (req, res) => {
   try {
     const payload = await fetchGeneration(req.params.generation_id);
@@ -132,6 +139,9 @@ router.get("/generations/:generation_id", async (req, res) => {
   }
 });
 
+// ======================================================
+// SSE stream
+// ======================================================
 router.get("/stream/:generation_id", async (req, res) => {
   try {
     const supabase = getSupabaseAdmin();
@@ -145,22 +155,15 @@ router.get("/stream/:generation_id", async (req, res) => {
     });
     res.flushHeaders?.();
 
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("mega_generations")
       .select("mg_mma_vars, mg_mma_status")
       .eq("mg_generation_id", req.params.generation_id)
       .eq("mg_record_type", "generation")
       .maybeSingle();
 
-    if (error) {
-      try {
-        res.write(`event: error\ndata: ${JSON.stringify({ error: "SSE_BOOTSTRAP_FAILED" })}\n\n`);
-      } catch {}
-      return res.end();
-    }
-
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = toUserStatus(data?.mg_mma_status || "queued"); // ✅ friendly status text
+    const status = toUserStatus(data?.mg_mma_status || "queued");
 
     const keepAlive = setInterval(() => {
       try {
@@ -179,6 +182,9 @@ router.get("/stream/:generation_id", async (req, res) => {
   }
 });
 
+// ======================================================
+// Optional admin helpers (if you use them)
+// ======================================================
 router.get("/admin/errors", async (_req, res) => {
   try {
     const errors = await listErrors();

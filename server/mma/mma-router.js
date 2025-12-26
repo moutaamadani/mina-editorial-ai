@@ -1,11 +1,8 @@
 // ./server/mma/mma-router.js
-// Express router for Mina Mind API
-// Routes fan out to controller helpers and expose SSE replay.
-//
-// IMPORTANT:
-// - This router does NOT charge credits.
-// - Credits are handled inside mma-controller pipelines (charge + refund logic).
-// - Router keeps request dedupe (idempotency_key) to prevent double generations on retries/double-clicks.
+// Express router for Mina Mind API (MMA)
+// - Routes fan out to controller helpers
+// - SSE replay endpoint
+// - IMPORTANT: we resolve passId ONCE from request + inject into body so controller uses SAME passId
 
 import express from "express";
 import {
@@ -20,111 +17,28 @@ import {
   toUserStatus,
 } from "./mma-controller.js";
 import { getSupabaseAdmin } from "../../supabase.js";
-
-import { resolvePassId as megaResolvePassId, megaEnsureCustomer } from "../../mega-db.js";
+import { resolvePassId as megaResolvePassId } from "../../mega-db.js";
 
 const router = express.Router();
 
-// ======================================================
-// ✅ SERVER-SIDE REQUEST DEDUPE (prevents 2 generations)
-// - Same idempotency_key => same in-flight promise
-// - Also caches briefly (covers retry / refresh)
-// ======================================================
-const MMA_REQ_TTL_MS = 2 * 60 * 1000; // 2 minutes
-const _mmaInFlight = new Map(); // key -> Promise<result>
-const _mmaCache = new Map(); // key -> { at, result }
-
-function _now() {
-  return Date.now();
-}
-
-function _pruneCache() {
-  const t = _now();
-  for (const [k, v] of _mmaCache.entries()) {
-    if (!v || !v.at || t - v.at > MMA_REQ_TTL_MS) _mmaCache.delete(k);
-  }
-}
-
-function safeString(v, fallback = "") {
-  if (v === null || v === undefined) return fallback;
-  const s = typeof v === "string" ? v : String(v);
-  const t = s.trim();
-  return t ? t : fallback;
-}
-
-// ✅ Idempotency key (lets us dedupe requests)
-function extractIdempotencyKey(body = {}) {
-  return safeString(
-    body?.idempotency_key ??
-      body?.idempotencyKey ??
-      body?.inputs?.idempotency_key ??
-      body?.inputs?.idempotencyKey ??
-      "",
-    ""
-  );
-}
-
-// Make a stable dedupe key
-function makeReqKey({ op, mode, passId, parentId, idem }) {
-  const p = String(passId || "");
-  const i = String(idem || "");
-  const par = parentId ? String(parentId) : "";
-  return `${op}:${mode}:${p}:${par}:idem:${i}`.toLowerCase();
-}
-
-async function runWithDedupe(key, fn) {
-  if (!key) {
-    const result = await fn();
-    return { result, deduped: false };
-  }
-
-  _pruneCache();
-
-  const cached = _mmaCache.get(key);
-  if (cached && cached.result) return { result: cached.result, deduped: true };
-
-  const inflight = _mmaInFlight.get(key);
-  if (inflight) {
-    const result = await inflight;
-    return { result, deduped: true };
-  }
-
-  const p = (async () => {
-    const result = await fn();
-    _mmaCache.set(key, { at: _now(), result });
-    return result;
-  })();
-
-  _mmaInFlight.set(key, p);
-
-  try {
-    const result = await p;
-    return { result, deduped: false };
-  } finally {
-    const cur = _mmaInFlight.get(key);
-    if (cur === p) _mmaInFlight.delete(key);
-  }
+// ----------------------------
+// helper: inject passId
+// ----------------------------
+function withPassId(req, rawBody) {
+  const body = rawBody && typeof rawBody === "object" ? rawBody : {};
+  const passId = megaResolvePassId(req, body);
+  return { passId, body: { ...body, passId } };
 }
 
 // ======================================================
 // Routes
 // ======================================================
 router.post("/still/create", async (req, res) => {
-  const body = req.body || {};
-  const idem = extractIdempotencyKey(body);
+  const { passId, body } = withPassId(req, req.body);
 
   try {
-    const passId = megaResolvePassId(req, body);
     res.set("X-Mina-Pass-Id", passId);
-    await megaEnsureCustomer({ passId });
-
-    const key = idem ? makeReqKey({ op: "still_create", mode: "still", passId, parentId: null, idem }) : null;
-
-    const { result, deduped } = await runWithDedupe(key, async () => {
-      return await handleMmaCreate({ mode: "still", body });
-    });
-
-    if (deduped) res.set("X-Mina-Deduped", "1");
+    const result = await handleMmaCreate({ mode: "still", body });
     res.json(result);
   } catch (err) {
     console.error("[mma] still/create error", err);
@@ -137,25 +51,14 @@ router.post("/still/create", async (req, res) => {
 });
 
 router.post("/still/:generation_id/tweak", async (req, res) => {
-  const body = req.body || {};
-  const idem = extractIdempotencyKey(body);
+  const { passId, body } = withPassId(req, req.body);
 
   try {
-    const passId = megaResolvePassId(req, body);
     res.set("X-Mina-Pass-Id", passId);
-    await megaEnsureCustomer({ passId });
-
-    const parentId = req.params.generation_id;
-    const key = idem ? makeReqKey({ op: "still_tweak", mode: "still", passId, parentId, idem }) : null;
-
-    const { result, deduped } = await runWithDedupe(key, async () => {
-      return await handleMmaStillTweak({
-        parentGenerationId: parentId,
-        body,
-      });
+    const result = await handleMmaStillTweak({
+      parentGenerationId: req.params.generation_id,
+      body,
     });
-
-    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] still tweak error", err);
@@ -168,24 +71,14 @@ router.post("/still/:generation_id/tweak", async (req, res) => {
 });
 
 router.post("/video/animate", async (req, res) => {
-  const body = req.body || {};
-  const idem = extractIdempotencyKey(body);
+  const { passId, body } = withPassId(req, req.body);
 
   try {
-    const passId = megaResolvePassId(req, body);
     res.set("X-Mina-Pass-Id", passId);
-    await megaEnsureCustomer({ passId });
-
-    const key = idem ? makeReqKey({ op: "video_animate", mode: "video", passId, parentId: null, idem }) : null;
-
-    const { result, deduped } = await runWithDedupe(key, async () => {
-      return await handleMmaCreate({ mode: "video", body });
-    });
-
-    if (deduped) res.set("X-Mina-Deduped", "1");
+    const result = await handleMmaCreate({ mode: "video", body });
     res.json(result);
   } catch (err) {
-    console.error("[mma] video animate error", err);
+    console.error("[mma] video/animate error", err);
     res.status(err?.statusCode || 500).json({
       error: err?.message === "INSUFFICIENT_CREDITS" ? "INSUFFICIENT_CREDITS" : "MMA_ANIMATE_FAILED",
       message: err?.message,
@@ -195,25 +88,14 @@ router.post("/video/animate", async (req, res) => {
 });
 
 router.post("/video/:generation_id/tweak", async (req, res) => {
-  const body = req.body || {};
-  const idem = extractIdempotencyKey(body);
+  const { passId, body } = withPassId(req, req.body);
 
   try {
-    const passId = megaResolvePassId(req, body);
     res.set("X-Mina-Pass-Id", passId);
-    await megaEnsureCustomer({ passId });
-
-    const parentId = req.params.generation_id;
-    const key = idem ? makeReqKey({ op: "video_tweak", mode: "video", passId, parentId, idem }) : null;
-
-    const { result, deduped } = await runWithDedupe(key, async () => {
-      return await handleMmaVideoTweak({
-        parentGenerationId: parentId,
-        body,
-      });
+    const result = await handleMmaVideoTweak({
+      parentGenerationId: req.params.generation_id,
+      body,
     });
-
-    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] video tweak error", err);
@@ -226,9 +108,12 @@ router.post("/video/:generation_id/tweak", async (req, res) => {
 });
 
 router.post("/events", async (req, res) => {
+  const { passId, body } = withPassId(req, req.body);
+
   try {
-    // ✅ Never charge credits for events
-    const result = await handleMmaEvent(req.body || {});
+    res.set("X-Mina-Pass-Id", passId);
+    // ✅ never charge credits for events
+    const result = await handleMmaEvent(body || {});
     res.json(result);
   } catch (err) {
     console.error("[mma] events error", err);
@@ -275,7 +160,7 @@ router.get("/stream/:generation_id", async (req, res) => {
     }
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = toUserStatus(data?.mg_mma_status || "queued"); // ✅ don't leak internals
+    const status = toUserStatus(data?.mg_mma_status || "queued"); // ✅ friendly status text
 
     const keepAlive = setInterval(() => {
       try {
@@ -286,7 +171,8 @@ router.get("/stream/:generation_id", async (req, res) => {
     res.on("close", () => clearInterval(keepAlive));
 
     registerSseClient(req.params.generation_id, res, { scanLines, status });
-  } catch {
+  } catch (err) {
+    console.error("[mma] stream error", err);
     try {
       res.status(500).end();
     } catch {}

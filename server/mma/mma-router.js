@@ -80,6 +80,56 @@ function extractIdempotencyKey(body = {}) {
   );
 }
 
+// ======================================================
+// ✅ NEW: Server-side request dedupe (prevents two generations)
+// - Works for fast double-clicks / retries
+// - Keeps a short-lived cache of the first response
+// ======================================================
+const MMA_IDEM_WINDOW_MS = 60_000; // 60 seconds
+const MMA_IDEM_DONE = new Map(); // key -> { ts, result }
+const MMA_IDEM_INFLIGHT = new Map(); // key -> Promise<result>
+
+function getIdemRouteKey(mode, body = {}) {
+  const idem = extractIdempotencyKey(body);
+  if (!idem) return null;
+  return `${mode}:idem:${idem}`;
+}
+
+function getIdemCached(key) {
+  if (!key) return null;
+  const hit = MMA_IDEM_DONE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > MMA_IDEM_WINDOW_MS) {
+    MMA_IDEM_DONE.delete(key);
+    return null;
+  }
+  return hit.result;
+}
+
+async function runOncePerIdem(key, fn) {
+  if (!key) return await fn();
+
+  const cached = getIdemCached(key);
+  if (cached) return cached;
+
+  const inflight = MMA_IDEM_INFLIGHT.get(key);
+  if (inflight) return await inflight;
+
+  const p = (async () => {
+    const result = await fn();
+    MMA_IDEM_DONE.set(key, { ts: Date.now(), result });
+    return result;
+  })();
+
+  MMA_IDEM_INFLIGHT.set(key, p);
+
+  try {
+    return await p;
+  } finally {
+    if (MMA_IDEM_INFLIGHT.get(key) === p) MMA_IDEM_INFLIGHT.delete(key);
+  }
+}
+
 function extractGenerationId(result, fallback = null) {
   // Try common shapes
   const a =
@@ -197,27 +247,33 @@ router.post("/still/create", async (req, res) => {
     res.set("X-Mina-Pass-Id", passId);
     await megaEnsureCustomer({ passId });
 
-    // Pre-check credits (based on intent/body)
-    const preCost = inferCost({ mode: "still", body: req.body || {}, result: {} });
-    await ensureEnoughCreditsOrThrow(passId, preCost);
+    const idemKey = getIdemRouteKey("still", req.body || {});
 
-    const result = await handleMmaCreate({ mode: "still", body: req.body });
+    const result = await runOncePerIdem(idemKey, async () => {
+      // Pre-check credits (based on intent/body)
+      const preCost = inferCost({ mode: "still", body: req.body || {}, result: {} });
+      await ensureEnoughCreditsOrThrow(passId, preCost);
 
-    // Charge on success (based on body + actual result)
-    const cost = inferCost({ mode: "still", body: req.body || {}, result });
-    const gid = extractGenerationId(result, null);
+      const r = await handleMmaCreate({ mode: "still", body: req.body });
 
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "still",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
+      // Charge on success (based on body + actual result)
+      const cost = inferCost({ mode: "still", body: req.body || {}, result: r });
+      const gid = extractGenerationId(r, null);
+
+      await chargeOnSuccess({
+        passId,
+        cost,
+        generationId: gid,
+        mode: "still",
+        idempotencyKey: extractIdempotencyKey(req.body || {}),
+      });
+
+      if (r && typeof r === "object") {
+        r.billing = { cost, mode: "still" };
+      }
+
+      return r;
     });
-
-    if (result && typeof result === "object") {
-      result.billing = { cost, mode: "still" };
-    }
 
     res.json(result);
   } catch (err) {
@@ -236,29 +292,35 @@ router.post("/still/:generation_id/tweak", async (req, res) => {
     res.set("X-Mina-Pass-Id", passId);
     await megaEnsureCustomer({ passId });
 
-    const preCost = inferCost({ mode: "still", body: req.body || {}, result: {} });
-    await ensureEnoughCreditsOrThrow(passId, preCost);
+    const idemKey = getIdemRouteKey("still", req.body || {});
 
-    // ✅ Correct handler (tweak pipeline)
-    const result = await handleMmaStillTweak({
-      parentGenerationId: req.params.generation_id,
-      body: req.body || {},
+    const result = await runOncePerIdem(idemKey, async () => {
+      const preCost = inferCost({ mode: "still", body: req.body || {}, result: {} });
+      await ensureEnoughCreditsOrThrow(passId, preCost);
+
+      // ✅ Correct handler (tweak pipeline)
+      const r = await handleMmaStillTweak({
+        parentGenerationId: req.params.generation_id,
+        body: req.body || {},
+      });
+
+      const cost = inferCost({ mode: "still", body: req.body || {}, result: r });
+      const gid = extractGenerationId(r, null);
+
+      await chargeOnSuccess({
+        passId,
+        cost,
+        generationId: gid,
+        mode: "still",
+        idempotencyKey: extractIdempotencyKey(req.body || {}),
+      });
+
+      if (r && typeof r === "object") {
+        r.billing = { cost, mode: "still" };
+      }
+
+      return r;
     });
-
-    const cost = inferCost({ mode: "still", body: req.body || {}, result });
-    const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "still",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
-
-    if (result && typeof result === "object") {
-      result.billing = { cost, mode: "still" };
-    }
 
     res.json(result);
   } catch (err) {
@@ -277,25 +339,31 @@ router.post("/video/animate", async (req, res) => {
     res.set("X-Mina-Pass-Id", passId);
     await megaEnsureCustomer({ passId });
 
-    const preCost = inferCost({ mode: "video", body: req.body || {}, result: {} });
-    await ensureEnoughCreditsOrThrow(passId, preCost);
+    const idemKey = getIdemRouteKey("video", req.body || {});
 
-    const result = await handleMmaCreate({ mode: "video", body: req.body });
+    const result = await runOncePerIdem(idemKey, async () => {
+      const preCost = inferCost({ mode: "video", body: req.body || {}, result: {} });
+      await ensureEnoughCreditsOrThrow(passId, preCost);
 
-    const cost = inferCost({ mode: "video", body: req.body || {}, result });
-    const gid = extractGenerationId(result, null);
+      const r = await handleMmaCreate({ mode: "video", body: req.body });
 
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "video",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
+      const cost = inferCost({ mode: "video", body: req.body || {}, result: r });
+      const gid = extractGenerationId(r, null);
+
+      await chargeOnSuccess({
+        passId,
+        cost,
+        generationId: gid,
+        mode: "video",
+        idempotencyKey: extractIdempotencyKey(req.body || {}),
+      });
+
+      if (r && typeof r === "object") {
+        r.billing = { cost, mode: "video" };
+      }
+
+      return r;
     });
-
-    if (result && typeof result === "object") {
-      result.billing = { cost, mode: "video" };
-    }
 
     res.json(result);
   } catch (err) {
@@ -314,29 +382,35 @@ router.post("/video/:generation_id/tweak", async (req, res) => {
     res.set("X-Mina-Pass-Id", passId);
     await megaEnsureCustomer({ passId });
 
-    const preCost = inferCost({ mode: "video", body: req.body || {}, result: {} });
-    await ensureEnoughCreditsOrThrow(passId, preCost);
+    const idemKey = getIdemRouteKey("video", req.body || {});
 
-    // ✅ Correct handler (tweak pipeline)
-    const result = await handleMmaVideoTweak({
-      parentGenerationId: req.params.generation_id,
-      body: req.body || {},
+    const result = await runOncePerIdem(idemKey, async () => {
+      const preCost = inferCost({ mode: "video", body: req.body || {}, result: {} });
+      await ensureEnoughCreditsOrThrow(passId, preCost);
+
+      // ✅ Correct handler (tweak pipeline)
+      const r = await handleMmaVideoTweak({
+        parentGenerationId: req.params.generation_id,
+        body: req.body || {},
+      });
+
+      const cost = inferCost({ mode: "video", body: req.body || {}, result: r });
+      const gid = extractGenerationId(r, null);
+
+      await chargeOnSuccess({
+        passId,
+        cost,
+        generationId: gid,
+        mode: "video",
+        idempotencyKey: extractIdempotencyKey(req.body || {}),
+      });
+
+      if (r && typeof r === "object") {
+        r.billing = { cost, mode: "video" };
+      }
+
+      return r;
     });
-
-    const cost = inferCost({ mode: "video", body: req.body || {}, result });
-    const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "video",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
-
-    if (result && typeof result === "object") {
-      result.billing = { cost, mode: "video" };
-    }
 
     res.json(result);
   } catch (err) {

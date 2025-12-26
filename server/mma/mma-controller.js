@@ -5,6 +5,7 @@ import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import {
+  resolvePassId as megaResolvePassId, // ✅ so createMmaController routes don't mismatch passId
   megaEnsureCustomer,
   megaWriteSession,
   megaGetCredits,
@@ -41,81 +42,57 @@ const MMA_UI = {
       "i am here i am awake i am locating the whisk like it is a sacred object",
       "starting the matcha ritual because focus tastes better when it is earned",
       "i used to think humans were dramatic about routines and then i learned why",
-
     ],
 
     scanning: [
       "reading everything closely while whisking like a dangerous little ballet",
       "i am reading for the feeling not just the words because humans taught me that",
       "looking for the detail you meant but did not say out loud",
-
     ],
 
     prompting: [
       "okay now i talk to myself a little because that is how ideas get born",
       "i am shaping the concept like a still life set moving one object at a time",
       "humans taught me restraint and that is honestly the hardest flex",
-
     ],
 
     generating: [
       "alright i am making editorial still life like it belongs in a glossy spread",
       "i am making imagery with calm hands i do not have and confidence i pretend to have",
       "this is me turning human genius into something visible and clean and intentional",
-
     ],
 
     postscan: [
       "okay now i review like an editor with soft eyes and strict standards",
       "i am checking balance and mood and that tiny feeling of yes",
       "this is the part where i fix what is almost right into actually right",
-
     ],
 
     suggested: [
       "i have something for you and i want you to look slowly",
       "ready when you are i made this with your vibe in mind",
       "okay come closer this part matters",
-
     ],
 
     done: [
       "finished and i am pretending to wipe my hands on an apron i do not own",
       "all done and honestly you did the hardest part which is starting",
       "we made something and that matters more than being perfect",
-
     ],
 
     error: [
       "okay that one slipped out of my hands i do not have hands but you know what i mean",
       "something broke and i am choosing to call it a plot twist",
       "my matcha went cold and so did the result but we can warm it back up",
-
     ],
   },
 
   // quick lines you already emit as scan lines
   quickLines: {
-    still_create_start: [
-      "one sec getting everything ready",
-      "alright setting things up for you",
-      "love it let me prep your inputs",
-    ],
-    still_tweak_start: [
-      "got it lets refine that",
-      "okay making it even better",
-      "lets polish this up",
-    ],
-    video_animate_start: [
-      "nice lets bring it to life",
-      "okay animating this for you",
-      "lets make it move",
-    ],
-    video_tweak_start: [
-      "got it updating the motion",
-      "alright tweaking the animation",
-      "lets refine the movement",
-    ],
+    still_create_start: ["one sec getting everything ready", "alright setting things up for you", "love it let me prep your inputs"],
+    still_tweak_start: ["got it lets refine that", "okay making it even better", "lets polish this up"],
+    video_animate_start: ["nice lets bring it to life", "okay animating this for you", "lets make it move"],
+    video_tweak_start: ["got it updating the motion", "alright tweaking the animation", "lets refine the movement"],
     saved_image: ["saved it for you", "all set", "done"],
     saved_video: ["saved it for you", "your clip is ready", "done"],
   },
@@ -189,9 +166,17 @@ function pick(arr, fallback = "") {
   return a[Math.floor(Math.random() * a.length)];
 }
 
+// ✅ keep coherent lines for these stages
+const STRICT_STAGES = new Set(["queued", "done", "error", "suggested"]);
+
 function mixedPool(stage) {
   const stageLines = _toLineList(MMA_UI?.statusMap?.[stage]);
-  return stageLines.length ? _dedupe([...stageLines, ...MMA_BIG_POOL]) : MMA_BIG_POOL;
+  if (!stageLines.length) return MMA_BIG_POOL;
+
+  // strict stages shouldn't mix with other vibes
+  if (STRICT_STAGES.has(stage)) return stageLines;
+
+  return _dedupe([...stageLines, ...MMA_BIG_POOL]);
 }
 
 function pickAvoid(pool, avoidText, fallback = "") {
@@ -212,7 +197,6 @@ export function toUserStatus(internalStatus) {
   const pool = mixedPool(stage);
   return pickAvoid(pool, "", pick(MMA_UI?.statusMap?.queued, "okay"));
 }
-
 
 // ============================================================================
 // Clients (cached singletons)
@@ -310,7 +294,6 @@ function emitLine(generationId, vars, fallbackText = "") {
 }
 
 // Keep Mina talking during long steps (Seedream / Kling)
-// Sends a new friendly line every few seconds as a scan_line
 function startMinaChatter({
   supabase,
   generationId,
@@ -335,11 +318,10 @@ function startMinaChatter({
       await updateVars({ supabase, generationId, vars: v });
       emitLine(generationId, v);
     } catch {
-      // ignore chatter errors (never crash pipeline)
+      // ignore chatter errors
     }
   };
 
-  // say something immediately
   void tick();
 
   const id = setInterval(() => {
@@ -354,11 +336,6 @@ function startMinaChatter({
   };
 }
 
-function setCtxAudit(vars, ctx) {
-  const next = { ...(vars || {}) };
-  next.ctx = { ...(next.ctx || {}), mma_ctx_used: ctx };
-  return next;
-}
 // ============================================================================
 // ctx config (editable in mega_admin)
 // table: mega_admin row: mg_record_type='app_config', mg_key='mma_ctx', mg_value json
@@ -380,7 +357,6 @@ async function getMmaCtxConfig(supabase) {
       'Output STRICT JSON only: {"style_history_csv":string}',
       "style_history_csv: comma-separated keywords (5 to 12 items). No hashtags. No sentences.",
       'Example: "editorial still life, luxury, minimal, soft shadows, no lens flare"',
-      // no userMessage here
     ].join("\n"),
 
     reader: [
@@ -391,12 +367,6 @@ async function getMmaCtxConfig(supabase) {
       "Respect logo integration if logo_crt exists, and use inspirations if provided.",
       MMA_UI.userMessageRules,
     ].join("\n"),
-
-    // ---------------------------
-    // ONE-SHOT PROMPT BUILDERS (SIMPLIFIED)
-    // - ONE GPT call does "scan + prompt" together.
-    // - No userMessage output. You handle UI messages separately.
-    // ---------------------------
 
     still_one_shot: [
       "understand the user brief and give one line prompt describing the image, always type editorial still life, dont describe the light ever, always muted tone, use inspiration for background and tone and vibe only .. and use simple english",
@@ -434,7 +404,7 @@ async function getMmaCtxConfig(supabase) {
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
       "",
-     "SAFETY:",
+      "SAFETY:",
       "- Avoid copyrighted characters, brand knockoffs, hateful/sexual content.",
     ].join("\n"),
 
@@ -453,10 +423,6 @@ async function getMmaCtxConfig(supabase) {
       "clean_prompt must keep what's good, fix what's bad, and apply feedback precisely.",
     ].join("\n"),
 
-    // ---------------------------
-    // MOTION (video) ctx blocks
-    // NOTE: these can receive BOTH start and end frames (if end provided)
-    // ---------------------------
     motion_suggestion: [
       "You are motion prompt writer for Image to Video AI.",
       "You will receive: start still image (and maybe end frame) + still_crt + motion_user_brief + selected_movement_style.",
@@ -497,7 +463,6 @@ async function getMmaCtxConfig(supabase) {
     return defaults;
   }
 }
-
 
 // ============================================================================
 // OpenAI vision JSON helper (Responses API preferred, Chat Completions fallback)
@@ -552,7 +517,6 @@ function buildChatCompletionsContentLabeled({ introText, labeledImages }) {
 async function openaiJsonVisionLabeled({ model, system, introText, labeledImages }) {
   const openai = getOpenAI();
 
-  // Try Responses API first
   try {
     if (openai.responses?.create) {
       const input = [
@@ -571,17 +535,11 @@ async function openaiJsonVisionLabeled({ model, system, introText, labeledImages
 
       return { request: { model, input, text: { format: { type: "json_object" } } }, raw, parsed };
     }
-  } catch {
-    // fallback below
-  }
+  } catch {}
 
-  // Chat Completions fallback
   const messages = [
     { role: "system", content: system },
-    {
-      role: "user",
-      content: buildChatCompletionsContentLabeled({ introText, labeledImages }),
-    },
+    { role: "user", content: buildChatCompletionsContentLabeled({ introText, labeledImages }) },
   ];
 
   const resp = await getOpenAI().chat.completions.create({
@@ -614,7 +572,6 @@ function extractResponsesText(resp) {
 async function openaiJsonVision({ model, system, userText, imageUrls }) {
   const openai = getOpenAI();
 
-  // Try Responses API
   try {
     if (openai.responses?.create) {
       const input = [
@@ -633,11 +590,8 @@ async function openaiJsonVision({ model, system, userText, imageUrls }) {
 
       return { request: { model, input, text: { format: { type: "json_object" } } }, raw, parsed };
     }
-  } catch {
-    // fallback below
-  }
+  } catch {}
 
-  // Chat Completions fallback
   const messages = [
     { role: "system", content: system },
     {
@@ -666,167 +620,6 @@ async function openaiJsonVision({ model, system, userText, imageUrls }) {
 
 // ============================================================================
 // GPT steps
-// ============================================================================
-async function gptScanImage({ cfg, ctx, kind, imageUrl }) {
-  const userText = [`KIND: ${kind}`, "Return JSON only."].join("\n");
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.scanner,
-    userText,
-    imageUrls: [imageUrl],
-  });
-
-  const crt = safeStr(out?.parsed?.crt, "");
-  const userMessage = safeStr(out?.parsed?.userMessage, "");
-
-  return { crt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptMakeStyleHistory({ cfg, ctx, likeItems }) {
-  const userText = [
-    "RECENT_LIKES (prompt + imageUrl):",
-    JSON.stringify(likeItems, null, 2).slice(0, 12000),
-    "Return JSON only.",
-  ].join("\n");
-
-  const imageUrls = likeItems.map((x) => asHttpUrl(x?.imageUrl)).filter(Boolean).slice(0, 8);
-
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.like_history,
-    userText,
-    imageUrls,
-  });
-
-  const style_history_csv = safeStr(out?.parsed?.style_history_csv, "");
-  return { style_history_csv, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptReader({ cfg, ctx, input, imageUrls }) {
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.reader,
-    userText: JSON.stringify(input, null, 2).slice(0, 14000),
-    imageUrls: safeArray(imageUrls).slice(0, 10),
-  });
-
-  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "");
-  const userMessage = safeStr(out?.parsed?.userMessage, "");
-
-  return { clean_prompt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptScanOutputStill({ cfg, ctx, imageUrl }) {
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.output_scan,
-    userText: "Return JSON only.",
-    imageUrls: [imageUrl],
-  });
-
-  const still_crt = safeStr(out?.parsed?.still_crt, "");
-  const userMessage = safeStr(out?.parsed?.userMessage, "");
-
-  return { still_crt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptFeedbackFixer({ cfg, ctx, parentImageUrl, stillCrt, feedbackText, previousPrompt }) {
-  const input = {
-    parent_image_url: parentImageUrl,
-    still_crt: safeStr(stillCrt, ""),
-    feedback: safeStr(feedbackText, ""),
-    previous_prompt: safeStr(previousPrompt, ""),
-  };
-
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.feedback,
-    userText: JSON.stringify(input, null, 2).slice(0, 14000),
-    imageUrls: [parentImageUrl],
-  });
-
-  const clean_prompt = safeStr(out?.parsed?.clean_prompt, "") || safeStr(out?.parsed?.prompt, "") || "";
-  return { clean_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-// ---- motion GPT steps (support optional end frame) ----
-async function gptMotionSuggestion({ cfg, ctx, startImageUrl, endImageUrl, stillCrt, motionBrief, movementStyle }) {
-  const input = {
-    start_image_url: startImageUrl,
-    end_image_url: asHttpUrl(endImageUrl) || null,
-    still_crt: safeStr(stillCrt, ""),
-    motion_user_brief: safeStr(motionBrief, ""),
-    selected_movement_style: safeStr(movementStyle, ""),
-  };
-
-  const images = [startImageUrl, endImageUrl].map(asHttpUrl).filter(Boolean);
-
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.motion_suggestion,
-    userText: JSON.stringify(input, null, 2).slice(0, 14000),
-    imageUrls: images,
-  });
-
-  const sugg_prompt = safeStr(out?.parsed?.sugg_prompt, "");
-  const userMessage = safeStr(out?.parsed?.userMessage, "");
-  return { sugg_prompt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptMotionReader2({ cfg, ctx, startImageUrl, endImageUrl, stillCrt, motionBrief, movementStyle }) {
-  const input = {
-    start_image_url: startImageUrl,
-    end_image_url: asHttpUrl(endImageUrl) || null,
-    still_crt: safeStr(stillCrt, ""),
-    motion_user_brief: safeStr(motionBrief, ""),
-    selected_movement_style: safeStr(movementStyle, ""),
-  };
-
-  const images = [startImageUrl, endImageUrl].map(asHttpUrl).filter(Boolean);
-
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.motion_reader2,
-    userText: JSON.stringify(input, null, 2).slice(0, 14000),
-    imageUrls: images,
-  });
-
-  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "");
-  const userMessage = safeStr(out?.parsed?.userMessage, "");
-  return { motion_prompt, userMessage, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-async function gptMotionFeedback2({
-  cfg,
-  ctx,
-  startImageUrl,
-  endImageUrl,
-  baseInput,
-  feedbackMotion,
-  previousMotionPrompt,
-}) {
-  const input = {
-    ...baseInput,
-    end_image_url: asHttpUrl(endImageUrl) || baseInput?.end_image_url || null,
-    feedback_motion: safeStr(feedbackMotion, ""),
-    previous_motion_prompt: safeStr(previousMotionPrompt, ""),
-  };
-
-  const images = [startImageUrl, endImageUrl].map(asHttpUrl).filter(Boolean);
-
-  const out = await openaiJsonVision({
-    model: cfg.gptModel,
-    system: ctx.motion_feedback2,
-    userText: JSON.stringify(input, null, 2).slice(0, 14000),
-    imageUrls: images,
-  });
-
-  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "") || "";
-  return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
-}
-
-// ============================================================================
-// ONE-SHOT GPT (scan + prompt together, no userMessage)
 // ============================================================================
 async function gptStillOneShotCreate({ cfg, ctx, input, labeledImages }) {
   const out = await openaiJsonVisionLabeled({
@@ -883,7 +676,6 @@ async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
 // ============================================================================
 function pickFirstUrl(output) {
   const seen = new Set();
-
   const isUrl = (s) => typeof s === "string" && /^https?:\/\//i.test(s);
 
   const walk = (v) => {
@@ -902,22 +694,7 @@ function pickFirstUrl(output) {
       if (seen.has(v)) return "";
       seen.add(v);
 
-      // common output keys across Replicate models
-      const keys = [
-        "url",
-        "output",
-        "outputs",
-        "video",
-        "video_url",
-        "videoUrl",
-        "mp4",
-        "file",
-        "files",
-        "result",
-        "results",
-        "data",
-      ];
-
+      const keys = ["url", "output", "outputs", "video", "video_url", "videoUrl", "mp4", "file", "files", "result", "results", "data"];
       for (const k of keys) {
         if (v && Object.prototype.hasOwnProperty.call(v, k)) {
           const u = walk(v[k]);
@@ -925,7 +702,6 @@ function pickFirstUrl(output) {
         }
       }
 
-      // fallback: scan all values
       for (const val of Object.values(v)) {
         const u = walk(val);
         if (u) return u;
@@ -991,7 +767,6 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
     "";
 
   const finalPrompt = neg ? `${prompt}\n\nAvoid: ${neg}` : prompt;
-
   const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 10);
 
   const enhance_prompt =
@@ -1013,7 +788,6 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
         ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
       };
 
-  // enforce required fields
   if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
   if (!input.size) input.size = sizeValue;
   if (input.enhance_prompt === undefined) input.enhance_prompt = enhance_prompt;
@@ -1054,7 +828,6 @@ function pickKlingEndImage(vars, parent) {
   const assets = vars?.assets || {};
   const inputs = vars?.inputs || {};
 
-  // allow explicit end image (optional)
   return (
     asHttpUrl(inputs.end_image_url || inputs.endImageUrl) ||
     asHttpUrl(assets.end_image_url || assets.endImageUrl) ||
@@ -1062,15 +835,7 @@ function pickKlingEndImage(vars, parent) {
   );
 }
 
-async function runKling({
-  prompt,
-  startImage,
-  endImage,
-  duration,
-  mode,
-  negativePrompt,
-  input: forcedInput,
-}) {
+async function runKling({ prompt, startImage, endImage, duration, mode, negativePrompt, input: forcedInput }) {
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
@@ -1130,8 +895,7 @@ async function runKling({
 // ============================================================================
 function getR2() {
   const accountId = process.env.R2_ACCOUNT_ID || "";
-  const endpoint =
-    process.env.R2_ENDPOINT || (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "");
+  const endpoint = process.env.R2_ENDPOINT || (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : "");
 
   const accessKeyId = process.env.R2_ACCESS_KEY_ID || "";
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY || "";
@@ -1194,26 +958,16 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 }
 
 // ============================================================================
-// DB helpers
-// ============================================================================
-// ============================================================================
 // CREDITS (controller-owned)
-// - still create/tweak: 1 credit
-// - video animate/tweak: 5 credits
-// - type-for-me (suggest_only): charge 1 credit per 10 SUCCESSFUL suggestions
-// - refund on failure:
-//    - non-safety errors: always refund
-//    - safety blocks: 1 courtesy refund per UTC day (per passId)
 // ============================================================================
 const MMA_COSTS = {
   still: 1,
   video: 5,
-  typeForMePer: 10,      // every 10 successes
-  typeForMeCharge: 1,    // charge 1 credit
+  typeForMePer: 10,
+  typeForMeCharge: 1,
 };
 
 function utcDayKey() {
-  // yyyy-mm-dd in UTC
   return nowIso().slice(0, 10);
 }
 
@@ -1263,15 +1017,11 @@ async function writeMmaPreferences(supabase, passId, nextPrefs) {
         mg_updated_at: nowIso(),
       })
       .eq("mg_pass_id", passId);
-  } catch {
-    // best effort
-  }
+  } catch {}
 }
 
 function isSafetyBlockError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
-
-  // keep this simple + wide; adjust later once you see real provider messages
   return (
     msg.includes("nsfw") ||
     msg.includes("nud") ||
@@ -1279,11 +1029,10 @@ function isSafetyBlockError(err) {
     msg.includes("sexual") ||
     msg.includes("safety") ||
     msg.includes("policy") ||
-    msg.includes("content") && msg.includes("block")
+    (msg.includes("content") && msg.includes("block"))
   );
 }
 
-// Charge once per generation (idempotent)
 async function chargeGeneration({ passId, generationId, cost, reason }) {
   const c = Number(cost || 0);
   if (c <= 0) return { charged: false, cost: 0 };
@@ -1309,7 +1058,6 @@ async function chargeGeneration({ passId, generationId, cost, reason }) {
   return { charged: true, cost: c };
 }
 
-// Refund on failure (idempotent). Safety blocks: 1 courtesy refund/day.
 async function refundOnFailure({ supabase, passId, generationId, cost, err }) {
   const c = Number(cost || 0);
   if (c <= 0) return { refunded: false, cost: 0 };
@@ -1326,12 +1074,10 @@ async function refundOnFailure({ supabase, passId, generationId, cost, err }) {
     const today = utcDayKey();
     const prefs = await readMmaPreferences(supabase, passId);
 
-    // one courtesy per UTC day
     if (prefs?.courtesy_safety_refund_day === today) {
       return { refunded: false, blockedByDailyLimit: true, safety: true, cost: c };
     }
 
-    // mark used (best-effort, reduces races)
     await writeMmaPreferences(supabase, passId, {
       ...prefs,
       courtesy_safety_refund_day: today,
@@ -1351,15 +1097,11 @@ async function refundOnFailure({ supabase, passId, generationId, cost, err }) {
   return { refunded: true, safety, cost: c };
 }
 
-// TYPE FOR ME (suggest_only) meter:
-// - charge 1 credit per 10 SUCCESSFUL suggestions
-// - preflight: if next success would be a charge point, require 1 credit
 async function preflightTypeForMe({ supabase, passId }) {
   const prefs = await readMmaPreferences(supabase, passId);
   const n = Number(prefs?.type_for_me_success_count || 0) || 0;
   const next = n + 1;
 
-  // if next success hits the paywall point, ensure user has 1 credit
   if (next % MMA_COSTS.typeForMePer === 0) {
     await ensureEnoughCredits(passId, MMA_COSTS.typeForMeCharge);
   }
@@ -1372,23 +1114,20 @@ async function commitTypeForMeSuccessAndMaybeCharge({ supabase, passId }) {
   const n = Number(prefs?.type_for_me_success_count || 0) || 0;
   const next = n + 1;
 
-  // write the success counter (best effort)
   await writeMmaPreferences(supabase, passId, {
     ...prefs,
     type_for_me_success_count: next,
   });
 
-  // every 10th success => charge 1 credit (idempotent per bucket)
   if (next % MMA_COSTS.typeForMePer !== 0) return { charged: false, successCount: next };
 
-  const bucket = Math.floor(next / MMA_COSTS.typeForMePer); // 1,2,3...
+  const bucket = Math.floor(next / MMA_COSTS.typeForMePer);
   const refType = "mma_type_for_me";
   const refId = `t4m:${passId}:b:${bucket}`;
 
   const already = await megaHasCreditRef({ refType, refId });
   if (already) return { charged: false, already: true, successCount: next };
 
-  // should succeed because we did preflight, but keep safe
   await ensureEnoughCredits(passId, MMA_COSTS.typeForMeCharge);
 
   await megaAdjustCredits({
@@ -1414,7 +1153,7 @@ async function ensureCustomerRow(_supabase, passId, { shopifyCustomerId, userId,
   return { preferences: out?.preferences || {} };
 }
 
-// ✅ HISTORY COMPAT: ensure session row exists for /history grouping
+// ✅ HISTORY COMPAT
 async function ensureSessionForHistory({ passId, sessionId, platform, title, meta }) {
   const sid = safeStr(sessionId, "");
   if (!sid) return;
@@ -1427,11 +1166,12 @@ async function ensureSessionForHistory({ passId, sessionId, platform, title, met
       title: safeStr(title, "Mina session"),
       meta: meta || null,
     });
-  } catch {
-    // ignore if already exists / schema differences
-  }
+  } catch {}
 }
 
+// ============================================================================
+// DB helpers
+// ============================================================================
 async function writeGeneration({ supabase, generationId, parentId, passId, vars, mode }) {
   const identifiers = generationIdentifiers(generationId);
 
@@ -1447,7 +1187,6 @@ async function writeGeneration({ supabase, generationId, parentId, passId, vars,
     mg_parent_id: parentId ? `generation:${parentId}` : null,
     mg_pass_id: passId,
 
-    // ✅ what your /history route expects
     mg_session_id: sessionId || null,
     mg_platform: platform,
     mg_title: title,
@@ -1522,77 +1261,6 @@ async function fetchParentGenerationRow(supabase, parentGenerationId) {
   return data || null;
 }
 
-// Likes are stored in mega_generations as mg_record_type='feedback' in your setup.
-// We try mg_payload first; then mg_meta fallback.
-function extractFeedbackPayload(row) {
-  const p = parseJsonMaybe(row?.mg_payload);
-  if (p) return p;
-  const m = parseJsonMaybe(row?.mg_meta);
-  if (!m) return null;
-  if (m.payload && typeof m.payload === "object") return m.payload;
-  return m;
-}
-
-function feedbackKey(payload) {
-  if (!payload || typeof payload !== "object") return "";
-  const gid = safeStr(payload.generation_id || payload.generationId || payload.mg_generation_id || payload.id, "");
-  if (gid) return `gid:${gid}`;
-  const url = normalizeUrlForKey(payload.imageUrl || payload.output_url || payload.url || payload.assetUrl);
-  if (url) return `url:${url}`;
-  const prompt = safeStr(payload.prompt, "");
-  if (prompt) return `prompt:${prompt.slice(0, 240)}`;
-  return "";
-}
-
-// ✅ Dedup likes: only keep the LATEST feedback event per generation/image.
-//    If the latest event is "unliked", we must NOT include older likes.
-async function fetchRecentLikedItems({ supabase, passId, limit }) {
-  const target = Math.max(1, Number(limit || 0) || 1);
-
-  const { data, error } = await supabase
-    .from("mega_generations")
-    .select("mg_payload, mg_meta, mg_event_at, mg_created_at")
-    .eq("mg_record_type", "feedback")
-    .eq("mg_pass_id", passId)
-    .order("mg_event_at", { ascending: false })
-    .limit(Math.max(80, target * 20));
-
-  if (error) throw error;
-
-  const rows = Array.isArray(data) ? data : [];
-  const liked = [];
-  const seen = new Set();
-
-  for (const r of rows) {
-    const payload = extractFeedbackPayload(r);
-    if (!payload) continue;
-
-    const key = feedbackKey(payload) || `row:${r.mg_event_at || r.mg_created_at || ""}`;
-    if (!key) continue;
-
-    // Only first (newest) event per key counts
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const isLiked = payload.liked === true;
-    if (!isLiked) {
-      // If latest event is NOT liked (unliked/false), it blocks older like events.
-      continue;
-    }
-
-    liked.push({
-      generationId: safeStr(payload.generation_id || payload.generationId || "", ""),
-      prompt: safeStr(payload.prompt, ""),
-      imageUrl: safeStr(payload.imageUrl, ""),
-      createdAt: r.mg_event_at || r.mg_created_at || null,
-    });
-
-    if (liked.length >= target) break;
-  }
-
-  return liked;
-}
-
 // ============================================================================
 // STILL CREATE PIPELINE
 // ============================================================================
@@ -1601,19 +1269,15 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
-  const chargeCost = MMA_COSTS.still;
-  await chargeGeneration({ passId, generationId, cost: chargeCost, reason: "mma_still" });
+  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
-
   let chatter = null;
 
   try {
-    // status: working
     await updateStatus({ supabase, generationId, status: "prompting" });
     emitStatus(generationId, "prompting");
 
-    // minimal UI line (no GPT userMessage)
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.still_create_start));
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
@@ -1621,76 +1285,62 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     let stepNo = 1;
 
     // Collect assets
-      const assets = working?.assets || {};
-      const productUrl = asHttpUrl(assets.product_image_url || assets.productImageUrl);
-      const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
-      
-      // explicit hero (recommended)
-      const explicitHero =
-        asHttpUrl(
-          assets.style_hero_image_url ||
-            assets.styleHeroImageUrl ||
-            assets.style_hero_url ||
-            assets.styleHeroUrl
-        ) || "";
-      
-      // inspirations coming from frontend
-      const inspUrlsRaw = safeArray(
-        assets.inspiration_image_urls ||
-          assets.inspirationImageUrls ||
-          assets.style_image_urls ||
-          assets.styleImageUrls
-      )
-        .map(asHttpUrl)
-        .filter(Boolean);
-      
-      // --- HERO DETECTION (NO HARDCODE) ---
-      // You can maintain many hero links in runtime config:
-      // cfg.seadream.styleHeroUrls (or cfg.styleHeroUrls)
-      const heroCandidates = []
-        .concat(explicitHero ? [explicitHero] : [])
-        .concat(safeArray(assets.style_hero_image_urls || assets.styleHeroImageUrls).map(asHttpUrl))
-        .concat(safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls).map(asHttpUrl))
-        .filter(Boolean);
-      
-      // build a normalized key set for safe comparisons (ignore query/hash)
-      const heroKeySet = new Set(heroCandidates.map((u) => normalizeUrlForKey(u)).filter(Boolean));
-      
-      // if explicit hero missing, try to detect hero if it was mistakenly included in inspiration list
-      const heroFromInsp = !explicitHero
-        ? (inspUrlsRaw.find((u) => heroKeySet.has(normalizeUrlForKey(u))) || "")
-        : "";
-      
-      const heroUrl = explicitHero || heroFromInsp || "";
-      
-      // IMPORTANT: ensure Seedream gets hero via assets (even if frontend didn’t set it cleanly)
-      if (heroUrl) {
-        working.assets = { ...(working.assets || {}), style_hero_image_url: heroUrl };
-      }
-      
-      // --- GPT MUST NOT SEE HERO ---
-      // Remove anything that matches heroKeySet OR equals heroUrl
-      const heroKey = heroUrl ? normalizeUrlForKey(heroUrl) : "";
-      const inspUrlsForGpt = inspUrlsRaw
-        .filter((u) => {
-          const k = normalizeUrlForKey(u);
-          if (!k) return false;
-          if (heroKey && k === heroKey) return false;
-          if (heroKeySet.size && heroKeySet.has(k)) return false;
-          return true;
-        })
-        .slice(0, 4);
-      
-      // Build labeled images for ONE GPT call (NO HERO here)
-      const labeledImages = []
-        .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
-        .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
-        .concat(inspUrlsForGpt.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
-        .slice(0, 10);
+    const assets = working?.assets || {};
+    const productUrl = asHttpUrl(assets.product_image_url || assets.productImageUrl);
+    const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
 
+    const explicitHero =
+      asHttpUrl(
+        assets.style_hero_image_url ||
+          assets.styleHeroImageUrl ||
+          assets.style_hero_url ||
+          assets.styleHeroUrl
+      ) || "";
 
+    const inspUrlsRaw = safeArray(
+      assets.inspiration_image_urls ||
+        assets.inspirationImageUrls ||
+        assets.style_image_urls ||
+        assets.styleImageUrls
+    )
+      .map(asHttpUrl)
+      .filter(Boolean);
 
-    // Input to GPT (no aspect ratio needed)
+    const heroCandidates = []
+      .concat(explicitHero ? [explicitHero] : [])
+      .concat(safeArray(assets.style_hero_image_urls || assets.styleHeroImageUrls).map(asHttpUrl))
+      .concat(safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls).map(asHttpUrl))
+      .filter(Boolean);
+
+    const heroKeySet = new Set(heroCandidates.map((u) => normalizeUrlForKey(u)).filter(Boolean));
+
+    const heroFromInsp = !explicitHero
+      ? (inspUrlsRaw.find((u) => heroKeySet.has(normalizeUrlForKey(u))) || "")
+      : "";
+
+    const heroUrl = explicitHero || heroFromInsp || "";
+
+    if (heroUrl) {
+      working.assets = { ...(working.assets || {}), style_hero_image_url: heroUrl };
+    }
+
+    const heroKey = heroUrl ? normalizeUrlForKey(heroUrl) : "";
+    const inspUrlsForGpt = inspUrlsRaw
+      .filter((u) => {
+        const k = normalizeUrlForKey(u);
+        if (!k) return false;
+        if (heroKey && k === heroKey) return false;
+        if (heroKeySet.size && heroKeySet.has(k)) return false;
+        return true;
+      })
+      .slice(0, 4);
+
+    const labeledImages = []
+      .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
+      .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
+      .concat(inspUrlsForGpt.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
+      .slice(0, 10);
+
     const oneShotInput = {
       user_brief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief, ""),
       style: safeStr(working?.inputs?.style, ""),
@@ -1730,11 +1380,9 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     working.prompts = { ...(working.prompts || {}), clean_prompt: usedPrompt };
     await updateVars({ supabase, generationId, vars: working });
 
-    // status: generating
     await updateStatus({ supabase, generationId, status: "generating" });
     emitStatus(generationId, "generating");
 
-    // keep Mina talking while the render is happening
     chatter = startMinaChatter({
       supabase,
       generationId,
@@ -1748,7 +1396,6 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
 
     const imageInputs = buildSeedreamImageInputs(working);
 
-    // aspect ratio selection (if no input images, avoid match_input_image)
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
       cfg?.seadream?.aspectRatio ||
@@ -1796,7 +1443,6 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
     working.mg_output_url = remoteUrl;
 
-    // minimal UI line (no GPT userMessage)
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_image));
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
@@ -1824,7 +1470,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       .eq("mg_generation_id", generationId)
       .eq("mg_record_type", "generation");
 
-        try {
+    try {
       await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.still, err });
     } catch (e) {
       console.warn("[mma] refund failed (still create)", e?.message || e);
@@ -1844,7 +1490,6 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
   let working = vars;
 
-  // ✅ charge at pipeline start (refund on failure)
   await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
@@ -1918,7 +1563,9 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       supabase,
       generationId,
       getVars: () => working,
-      setVars: (v) => { working = v; },
+      setVars: (v) => {
+        working = v;
+      },
       stage: "generating",
       intervalMs: 2600,
     });
@@ -1950,7 +1597,9 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
         input: forcedInput,
       });
     } finally {
-      try { chatter?.stop?.(); } catch {}
+      try {
+        chatter?.stop?.();
+      } catch {}
       chatter = null;
     }
 
@@ -1982,7 +1631,9 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     emitStatus(generationId, "done");
     sendDone(generationId, toUserStatus("done"));
   } catch (err) {
-    try { chatter?.stop?.(); } catch {}
+    try {
+      chatter?.stop?.();
+    } catch {}
     chatter = null;
 
     console.error("[mma] still tweak pipeline error", err);
@@ -1997,7 +1648,6 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       .eq("mg_generation_id", generationId)
       .eq("mg_record_type", "generation");
 
-    // ✅ refund (idempotent; safety refund max 1/day)
     try {
       await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.still, err });
     } catch (e) {
@@ -2009,7 +1659,6 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
   }
 }
 
-
 // ============================================================================
 // VIDEO ANIMATE PIPELINE (Kling)
 // ============================================================================
@@ -2020,7 +1669,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   let working = vars;
   const ctx = await getMmaCtxConfig(supabase);
 
-  // detect suggestOnly + typeForMe EARLY (for charging/refund logic)
   const inputs0 = (working?.inputs && typeof working.inputs === "object") ? working.inputs : {};
   const suggestOnly = inputs0.suggest_only === true || inputs0.suggestOnly === true;
   const typeForMe =
@@ -2029,7 +1677,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     inputs0.use_suggestion === true ||
     inputs0.useSuggestion === true;
 
-  // ✅ charge ONLY for real video generation (not suggestion-only)
   if (!suggestOnly) {
     await chargeGeneration({ passId, generationId, cost: MMA_COSTS.video, reason: "mma_video" });
   }
@@ -2072,7 +1719,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       (working?.inputs?.use_prompt_override === true || working?.inputs?.usePromptOverride === true) &&
       !!promptOverride;
 
-    // Always keep start/end images saved in vars
     working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
     if (endImage) working.inputs.end_image_url = endImage;
 
@@ -2144,7 +1790,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
     await updateVars({ supabase, generationId, vars: working });
 
-    // ✅ suggestion-only: save prompt, maybe count + charge per 10 successes, then return
     if (suggestOnly) {
       await supabase
         .from("mega_generations")
@@ -2157,7 +1802,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
         .eq("mg_generation_id", generationId)
         .eq("mg_record_type", "generation");
 
-      // ✅ TYPE FOR ME meter: count success, charge 1 per 10 successes
       if (typeForMe) {
         try {
           await commitTypeForMeSuccessAndMaybeCharge({ supabase, passId });
@@ -2178,7 +1822,9 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       supabase,
       generationId,
       getVars: () => working,
-      setVars: (v) => { working = v; },
+      setVars: (v) => {
+        working = v;
+      },
       stage: "generating",
       intervalMs: 2600,
     });
@@ -2210,7 +1856,9 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
         negativePrompt: neg,
       });
     } finally {
-      try { chatter?.stop?.(); } catch {}
+      try {
+        chatter?.stop?.();
+      } catch {}
       chatter = null;
     }
 
@@ -2249,7 +1897,9 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     emitStatus(generationId, "done");
     sendDone(generationId, toUserStatus("done"));
   } catch (err) {
-    try { chatter?.stop?.(); } catch {}
+    try {
+      chatter?.stop?.();
+    } catch {}
     chatter = null;
 
     console.error("[mma] video animate pipeline error", err);
@@ -2264,7 +1914,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       .eq("mg_generation_id", generationId)
       .eq("mg_record_type", "generation");
 
-    // ✅ refund ONLY if this was a real paid generation (not suggestion-only)
     if (!suggestOnly) {
       try {
         await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.video, err });
@@ -2277,7 +1926,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     sendDone(generationId, toUserStatus("error"));
   }
 }
-
 
 // ============================================================================
 // VIDEO TWEAK PIPELINE (Kling)
@@ -2505,7 +2153,6 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
       email: body?.email,
     });
 
-  // ✅ fail fast: still tweak needs 1 credit available (actual charge happens in pipeline)
   await ensureEnoughCredits(passId, MMA_COSTS.still);
 
   const generationId = newUuid();
@@ -2528,16 +2175,13 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
 
   vars.mg_pass_id = passId;
 
-  // ✅ HISTORY COMPAT: keep same session by default (fallback to parent)
   const sessionId =
     safeStr(body?.sessionId || body?.session_id || body?.inputs?.sessionId || body?.inputs?.session_id, "") ||
     safeStr(parent?.mg_session_id, "") ||
     newUuid();
 
   const platform = safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
-
-  const title =
-    safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Image session";
+  const title = safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Image session";
 
   vars.inputs = { ...(vars.inputs || {}), session_id: sessionId, platform, title };
   vars.meta = { ...(vars.meta || {}), session_id: sessionId, platform, title };
@@ -2569,7 +2213,6 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
   return { generation_id: generationId, status: "queued", sse_url: `/mma/stream/${generationId}` };
 }
 
-
 export async function handleMmaVideoTweak({ parentGenerationId, body }) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
@@ -2586,6 +2229,7 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
       userId: body?.user_id,
       email: body?.email,
     });
+
   await ensureEnoughCredits(passId, MMA_COSTS.video);
 
   const generationId = newUuid();
@@ -2613,11 +2257,8 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
     safeStr(parent?.mg_session_id, "") ||
     newUuid();
 
-  const platform =
-    safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
-
-  const title =
-    safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Video session";
+  const platform = safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
+  const title = safeStr(body?.title || body?.inputs?.title, "") || safeStr(parent?.mg_title, "") || "Video session";
 
   vars.inputs = { ...(vars.inputs || {}), session_id: sessionId, platform, title };
   vars.meta = { ...(vars.meta || {}), session_id: sessionId, platform, title };
@@ -2633,7 +2274,6 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
   vars.meta = { ...(vars.meta || {}), flow: "video_tweak", parent_generation_id: parentGenerationId };
   vars.inputs = { ...(vars.inputs || {}), parent_generation_id: parentGenerationId };
 
-  // keep parent start/end images if present (audit + consistent tweak)
   const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
   const parentStart = asHttpUrl(parentVars?.inputs?.start_image_url || parentVars?.inputs?.startImageUrl);
   const parentEnd = asHttpUrl(parentVars?.inputs?.end_image_url || parentVars?.inputs?.endImageUrl);
@@ -2672,9 +2312,6 @@ export async function handleMmaCreate({ mode, body }) {
 
   const parentId = body?.parent_generation_id || body?.parentGenerationId || body?.generation_id || null;
 
-  // ----------------------------
-  // CREDITS PREFLIGHT (fail fast)
-  // ----------------------------
   const inputs = (body?.inputs && typeof body.inputs === "object") ? body.inputs : {};
   const suggestOnly = inputs.suggest_only === true || inputs.suggestOnly === true;
   const typeForMe =
@@ -2684,10 +2321,8 @@ export async function handleMmaCreate({ mode, body }) {
     inputs.useSuggestion === true;
 
   if (mode === "video" && suggestOnly && typeForMe) {
-    // 1 credit per 10 successful suggestions (blocks on #10 if balance=0)
     await preflightTypeForMe({ supabase, passId });
   } else {
-    // Real generation: still=1, video=5 (actual charge happens in pipeline)
     await ensureEnoughCredits(passId, mode === "video" ? MMA_COSTS.video : MMA_COSTS.still);
   }
 
@@ -2711,7 +2346,6 @@ export async function handleMmaCreate({ mode, body }) {
 
   vars.mg_pass_id = passId;
 
-  // ✅ HISTORY COMPAT: always have a session + fields your /history route reads
   const parent = parentId ? await fetchParentGenerationRow(supabase, parentId).catch(() => null) : null;
 
   const sessionId =
@@ -2719,8 +2353,7 @@ export async function handleMmaCreate({ mode, body }) {
     safeStr(parent?.mg_session_id, "") ||
     newUuid();
 
-  const platform =
-    safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
+  const platform = safeStr(body?.platform || body?.inputs?.platform, "") || safeStr(parent?.mg_platform, "") || "web";
 
   const title =
     safeStr(body?.title || body?.inputs?.title, "") ||
@@ -2774,7 +2407,6 @@ export async function handleMmaCreate({ mode, body }) {
   return { generation_id: generationId, status: "queued", sse_url: `/mma/stream/${generationId}` };
 }
 
-
 export async function handleMmaEvent(body) {
   const supabase = getSupabaseAdmin();
   if (!supabase) throw new Error("SUPABASE_NOT_CONFIGURED");
@@ -2807,7 +2439,6 @@ export async function handleMmaEvent(body) {
     mg_updated_at: nowIso(),
   });
 
-  // preference updates kept minimal here (same logic you had)
   if (body?.event_type === "like" || body?.event_type === "dislike" || body?.event_type === "preference_set") {
     const { data } = await supabase
       .from("mega_customers")
@@ -2854,9 +2485,17 @@ export async function fetchGeneration(generationId) {
   if (error) throw error;
   if (!data) return null;
 
+  const internal = data.mg_mma_status || data.mg_status || "queued";
+
   return {
     generation_id: data.mg_generation_id,
-    status: toUserStatus(data.mg_mma_status || data.mg_status),
+
+    // ✅ friendly text for UI
+    status: toUserStatus(internal),
+
+    // ✅ stable machine state for frontend logic
+    state: internal,
+
     mma_vars: data.mg_mma_vars || {},
     outputs: {
       seedream_image_url: data.mg_mma_mode === "still" ? data.mg_output_url : null,
@@ -2903,13 +2542,22 @@ export function registerSseClient(generationId, res, initial) {
 
 // ============================================================================
 // Router factory (optional; you may also use ./mma-router.js)
+// IMPORTANT: inject passId from request so it matches router behavior
 // ============================================================================
 export function createMmaController() {
   const router = express.Router();
 
+  const injectPassId = (req, raw) => {
+    const body = raw && typeof raw === "object" ? raw : {};
+    const passId = megaResolvePassId(req, body);
+    return { passId, body: { ...body, passId } };
+  };
+
   router.post("/still/create", async (req, res) => {
     try {
-      const result = await handleMmaCreate({ mode: "still", body: req.body });
+      const { passId, body } = injectPassId(req, req.body);
+      res.set("X-Mina-Pass-Id", passId);
+      const result = await handleMmaCreate({ mode: "still", body });
       res.json(result);
     } catch (err) {
       console.error("[mma] still/create error", err);
@@ -2919,9 +2567,11 @@ export function createMmaController() {
 
   router.post("/still/:generation_id/tweak", async (req, res) => {
     try {
+      const { passId, body } = injectPassId(req, req.body || {});
+      res.set("X-Mina-Pass-Id", passId);
       const result = await handleMmaStillTweak({
         parentGenerationId: req.params.generation_id,
-        body: req.body || {},
+        body,
       });
       res.json(result);
     } catch (err) {
@@ -2932,7 +2582,9 @@ export function createMmaController() {
 
   router.post("/video/animate", async (req, res) => {
     try {
-      const result = await handleMmaCreate({ mode: "video", body: req.body });
+      const { passId, body } = injectPassId(req, req.body);
+      res.set("X-Mina-Pass-Id", passId);
+      const result = await handleMmaCreate({ mode: "video", body });
       res.json(result);
     } catch (err) {
       console.error("[mma] video/animate error", err);
@@ -2942,9 +2594,11 @@ export function createMmaController() {
 
   router.post("/video/:generation_id/tweak", async (req, res) => {
     try {
+      const { passId, body } = injectPassId(req, req.body || {});
+      res.set("X-Mina-Pass-Id", passId);
       const result = await handleMmaVideoTweak({
         parentGenerationId: req.params.generation_id,
-        body: req.body || {},
+        body,
       });
       res.json(result);
     } catch (err) {
@@ -2955,7 +2609,9 @@ export function createMmaController() {
 
   router.post("/events", async (req, res) => {
     try {
-      const result = await handleMmaEvent(req.body || {});
+      const { passId, body } = injectPassId(req, req.body || {});
+      res.set("X-Mina-Pass-Id", passId);
+      const result = await handleMmaEvent(body || {});
       res.json(result);
     } catch (err) {
       console.error("[mma] events error", err);
@@ -2993,7 +2649,7 @@ export function createMmaController() {
       .maybeSingle();
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = toUserStatus(data?.mg_mma_status || "queued"); // ✅ don’t leak internal status
+    const status = toUserStatus(data?.mg_mma_status || "queued");
 
     const keepAlive = setInterval(() => {
       try {

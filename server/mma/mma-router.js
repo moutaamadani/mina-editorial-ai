@@ -1,6 +1,11 @@
 // ./server/mma/mma-router.js
 // Express router for Mina Mind API
 // Routes fan out to controller helpers and expose SSE replay.
+//
+// IMPORTANT:
+// - This router does NOT charge credits.
+// - Credits are handled inside mma-controller pipelines (charge + refund logic).
+// - Router keeps request dedupe (idempotency_key) to prevent double generations on retries/double-clicks.
 
 import express from "express";
 import {
@@ -16,52 +21,14 @@ import {
 } from "./mma-controller.js";
 import { getSupabaseAdmin } from "../../supabase.js";
 
-// ✅ MEGA credits helpers
-import {
-  resolvePassId as megaResolvePassId,
-  megaEnsureCustomer,
-  megaGetCredits,
-  megaAdjustCredits,
-  megaHasCreditRef,
-} from "../../mega-db.js";
+import { resolvePassId as megaResolvePassId, megaEnsureCustomer } from "../../mega-db.js";
 
 const router = express.Router();
 
 // ======================================================
-// CREDIT CONFIG (edit here)
-// ======================================================
-const MMA_CREDIT_COSTS = {
-  still: 1, // image
-  video: 5, // video
-  type: 0, // text-only (suggest/prompt-only)
-};
-
-// If any of these appear in the request intent, we treat it as text-only (0 credits)
-const MMA_ZERO_CREDIT_INTENTS = new Set([
-  "type",
-  "type_for_me",
-  "typeforme",
-  "typing",
-  "text",
-  "text_only",
-  "textonly",
-  "prompt_only",
-  "promptonly",
-  "suggest",
-  "suggest_only",
-  "suggestonly",
-]);
-
-// Ledger idempotency
-const MMA_CHARGE_REF_TYPE = "mma_charge";
-
-// What to return when user has insufficient credits
-const MMA_INSUFFICIENT_STATUS = 402;
-
-// ======================================================
 // ✅ SERVER-SIDE REQUEST DEDUPE (prevents 2 generations)
 // - Same idempotency_key => same in-flight promise
-// - Also caches for a short time (covers retry / refresh)
+// - Also caches briefly (covers retry / refresh)
 // ======================================================
 const MMA_REQ_TTL_MS = 2 * 60 * 1000; // 2 minutes
 const _mmaInFlight = new Map(); // key -> Promise<result>
@@ -76,6 +43,25 @@ function _pruneCache() {
   for (const [k, v] of _mmaCache.entries()) {
     if (!v || !v.at || t - v.at > MMA_REQ_TTL_MS) _mmaCache.delete(k);
   }
+}
+
+function safeString(v, fallback = "") {
+  if (v === null || v === undefined) return fallback;
+  const s = typeof v === "string" ? v : String(v);
+  const t = s.trim();
+  return t ? t : fallback;
+}
+
+// ✅ Idempotency key (lets us dedupe requests)
+function extractIdempotencyKey(body = {}) {
+  return safeString(
+    body?.idempotency_key ??
+      body?.idempotencyKey ??
+      body?.inputs?.idempotency_key ??
+      body?.inputs?.idempotencyKey ??
+      "",
+    ""
+  );
 }
 
 // Make a stable dedupe key
@@ -121,150 +107,6 @@ async function runWithDedupe(key, fn) {
 }
 
 // ======================================================
-// Helpers
-// ======================================================
-function safeString(v, fallback = "") {
-  if (v === null || v === undefined) return fallback;
-  const s = typeof v === "string" ? v : String(v);
-  const t = s.trim();
-  return t ? t : fallback;
-}
-
-// ✅ Idempotency key (lets us dedupe requests + charges)
-function extractIdempotencyKey(body = {}) {
-  return safeString(
-    body?.idempotency_key ??
-      body?.idempotencyKey ??
-      body?.inputs?.idempotency_key ??
-      body?.inputs?.idempotencyKey ??
-      "",
-    ""
-  );
-}
-
-function extractGenerationId(result, fallback = null) {
-  // Try common shapes
-  const a =
-    result?.generation_id ??
-    result?.generationId ??
-    result?.generation?.id ??
-    result?.generation?.generation_id ??
-    result?.mg_generation_id ??
-    null;
-
-  const gid = safeString(a || fallback || "", "");
-  return gid || null;
-}
-
-function hasTextOnlyFlags(body = {}) {
-  // top-level
-  if (body?.suggestOnly === true || body?.suggest_only === true) return true;
-  if (body?.textOnly === true || body?.text_only === true) return true;
-  if (body?.promptOnly === true || body?.prompt_only === true) return true;
-  if (body?.onlyText === true || body?.only_text === true) return true;
-
-  // nested inputs (common)
-  if (body?.inputs?.suggestOnly === true || body?.inputs?.suggest_only === true) return true;
-  if (body?.inputs?.textOnly === true || body?.inputs?.text_only === true) return true;
-  if (body?.inputs?.promptOnly === true || body?.inputs?.prompt_only === true) return true;
-  if (body?.inputs?.onlyText === true || body?.inputs?.only_text === true) return true;
-
-  return false;
-}
-
-function isTextOnlyRequest({ body = {}, result = {} } = {}) {
-  // Explicit flags always win
-  if (hasTextOnlyFlags(body)) return true;
-
-  // Intent/action string
-  const intent =
-    body?.intent ||
-    body?.action ||
-    body?.op ||
-    body?.operation ||
-    body?.mode ||
-    body?.type ||
-    body?.inputs?.intent ||
-    body?.inputs?.action ||
-    body?.inputs?.op;
-
-  const s = safeString(intent, "").toLowerCase();
-  if (s && MMA_ZERO_CREDIT_INTENTS.has(s)) return true;
-
-  // Or result comes back text-like
-  const rt = safeString(result?.resultType || result?.type || result?.kind || "", "").toLowerCase();
-  if (rt && (rt === "text" || rt === "typing" || rt === "suggestion")) return true;
-
-  const ct = safeString(result?.contentType || result?.content_type || "", "").toLowerCase();
-  if (ct && ct.startsWith("text/")) return true;
-
-  return false;
-}
-
-function inferCost({ mode, body, result }) {
-  // Only zero-credit when request is truly text-only (suggest/prompt-only)
-  if (isTextOnlyRequest({ body, result })) return MMA_CREDIT_COSTS.type;
-  if (mode === "video") return MMA_CREDIT_COSTS.video;
-  return MMA_CREDIT_COSTS.still;
-}
-
-async function ensureEnoughCreditsOrThrow(passId, cost) {
-  if (!cost || cost <= 0) return;
-
-  const { credits } = await megaGetCredits(passId);
-  if (Number(credits || 0) < cost) {
-    const err = new Error("INSUFFICIENT_CREDITS");
-    err.statusCode = MMA_INSUFFICIENT_STATUS;
-    err.details = { required: cost, balance: Number(credits || 0) };
-    throw err;
-  }
-}
-
-// ✅ IMPORTANT FIX:
-// Use ONE canonical refId = `mma:<generationId>` whenever generationId exists.
-// This makes your charge dedupe compatible with the other billing path you’re seeing.
-async function chargeOnSuccess({ passId, cost, generationId, mode, idempotencyKey }) {
-  if (!cost || cost <= 0) return { charged: 0, already: false };
-
-  const idem = safeString(idempotencyKey, "");
-  const gid = safeString(generationId, "");
-
-  // Canonical refIds we treat as equivalent
-  const refIdsToCheck = [];
-
-  if (gid) {
-    // ✅ this matches the OTHER transaction you showed: "mma:<gid>"
-    refIdsToCheck.push(`mma:${gid}`);
-  }
-  if (idem) {
-    // also check old router pattern in case it exists already
-    refIdsToCheck.push(`${mode}:idem:${idem}`);
-    refIdsToCheck.push(`mma:idem:${idem}`);
-  }
-
-  for (const refId of refIdsToCheck) {
-    if (!refId) continue;
-    const already = await megaHasCreditRef({ refType: MMA_CHARGE_REF_TYPE, refId });
-    if (already) return { charged: 0, already: true };
-  }
-
-  // Choose canonical refId for the write
-  const refId = gid ? `mma:${gid}` : idem ? `mma:idem:${idem}` : `mma:ts:${Date.now()}`;
-
-  await megaAdjustCredits({
-    passId,
-    delta: -Math.abs(cost),
-    reason: mode === "video" ? "mma-video" : "mma-still",
-    source: "mma",
-    refType: MMA_CHARGE_REF_TYPE,
-    refId,
-    grantedAt: null,
-  });
-
-  return { charged: cost, already: false };
-}
-
-// ======================================================
 // Routes
 // ======================================================
 router.post("/still/create", async (req, res) => {
@@ -278,32 +120,11 @@ router.post("/still/create", async (req, res) => {
 
     const key = idem ? makeReqKey({ op: "still_create", mode: "still", passId, parentId: null, idem }) : null;
 
-    const { result } = await runWithDedupe(key, async () => {
-      // Pre-check credits (based on intent/body)
-      const preCost = inferCost({ mode: "still", body, result: {} });
-      await ensureEnoughCreditsOrThrow(passId, preCost);
-
-      const created = await handleMmaCreate({ mode: "still", body });
-
-      // Charge on success (based on body + actual result)
-      const cost = inferCost({ mode: "still", body, result: created });
-      const gid = extractGenerationId(created, null);
-
-      await chargeOnSuccess({
-        passId,
-        cost,
-        generationId: gid,
-        mode: "still",
-        idempotencyKey: idem,
-      });
-
-      if (created && typeof created === "object") {
-        created.billing = { cost, mode: "still" };
-      }
-
-      return created;
+    const { result, deduped } = await runWithDedupe(key, async () => {
+      return await handleMmaCreate({ mode: "still", body });
     });
 
+    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] still/create error", err);
@@ -327,33 +148,14 @@ router.post("/still/:generation_id/tweak", async (req, res) => {
     const parentId = req.params.generation_id;
     const key = idem ? makeReqKey({ op: "still_tweak", mode: "still", passId, parentId, idem }) : null;
 
-    const { result } = await runWithDedupe(key, async () => {
-      const preCost = inferCost({ mode: "still", body, result: {} });
-      await ensureEnoughCreditsOrThrow(passId, preCost);
-
-      const created = await handleMmaStillTweak({
+    const { result, deduped } = await runWithDedupe(key, async () => {
+      return await handleMmaStillTweak({
         parentGenerationId: parentId,
         body,
       });
-
-      const cost = inferCost({ mode: "still", body, result: created });
-      const gid = extractGenerationId(created, null);
-
-      await chargeOnSuccess({
-        passId,
-        cost,
-        generationId: gid,
-        mode: "still",
-        idempotencyKey: idem,
-      });
-
-      if (created && typeof created === "object") {
-        created.billing = { cost, mode: "still" };
-      }
-
-      return created;
     });
 
+    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] still tweak error", err);
@@ -376,30 +178,11 @@ router.post("/video/animate", async (req, res) => {
 
     const key = idem ? makeReqKey({ op: "video_animate", mode: "video", passId, parentId: null, idem }) : null;
 
-    const { result } = await runWithDedupe(key, async () => {
-      const preCost = inferCost({ mode: "video", body, result: {} });
-      await ensureEnoughCreditsOrThrow(passId, preCost);
-
-      const created = await handleMmaCreate({ mode: "video", body });
-
-      const cost = inferCost({ mode: "video", body, result: created });
-      const gid = extractGenerationId(created, null);
-
-      await chargeOnSuccess({
-        passId,
-        cost,
-        generationId: gid,
-        mode: "video",
-        idempotencyKey: idem,
-      });
-
-      if (created && typeof created === "object") {
-        created.billing = { cost, mode: "video" };
-      }
-
-      return created;
+    const { result, deduped } = await runWithDedupe(key, async () => {
+      return await handleMmaCreate({ mode: "video", body });
     });
 
+    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] video animate error", err);
@@ -423,33 +206,14 @@ router.post("/video/:generation_id/tweak", async (req, res) => {
     const parentId = req.params.generation_id;
     const key = idem ? makeReqKey({ op: "video_tweak", mode: "video", passId, parentId, idem }) : null;
 
-    const { result } = await runWithDedupe(key, async () => {
-      const preCost = inferCost({ mode: "video", body, result: {} });
-      await ensureEnoughCreditsOrThrow(passId, preCost);
-
-      const created = await handleMmaVideoTweak({
+    const { result, deduped } = await runWithDedupe(key, async () => {
+      return await handleMmaVideoTweak({
         parentGenerationId: parentId,
         body,
       });
-
-      const cost = inferCost({ mode: "video", body, result: created });
-      const gid = extractGenerationId(created, null);
-
-      await chargeOnSuccess({
-        passId,
-        cost,
-        generationId: gid,
-        mode: "video",
-        idempotencyKey: idem,
-      });
-
-      if (created && typeof created === "object") {
-        created.billing = { cost, mode: "video" };
-      }
-
-      return created;
     });
 
+    if (deduped) res.set("X-Mina-Deduped", "1");
     res.json(result);
   } catch (err) {
     console.error("[mma] video tweak error", err);

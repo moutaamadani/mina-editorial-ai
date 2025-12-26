@@ -1575,33 +1575,74 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     let stepNo = 1;
 
     // Collect assets
-    const assets = working?.assets || {};
-    const productUrl = asHttpUrl(assets.product_image_url || assets.productImageUrl);
-    const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+      const assets = working?.assets || {};
+      const productUrl = asHttpUrl(assets.product_image_url || assets.productImageUrl);
+      const logoUrl = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+      
+      // explicit hero (recommended)
+      const explicitHero =
+        asHttpUrl(
+          assets.style_hero_image_url ||
+            assets.styleHeroImageUrl ||
+            assets.style_hero_url ||
+            assets.styleHeroUrl
+        ) || "";
+      
+      // inspirations coming from frontend
+      const inspUrlsRaw = safeArray(
+        assets.inspiration_image_urls ||
+          assets.inspirationImageUrls ||
+          assets.style_image_urls ||
+          assets.styleImageUrls
+      )
+        .map(asHttpUrl)
+        .filter(Boolean);
+      
+      // --- HERO DETECTION (NO HARDCODE) ---
+      // You can maintain many hero links in runtime config:
+      // cfg.seadream.styleHeroUrls (or cfg.styleHeroUrls)
+      const heroCandidates = []
+        .concat(explicitHero ? [explicitHero] : [])
+        .concat(safeArray(assets.style_hero_image_urls || assets.styleHeroImageUrls).map(asHttpUrl))
+        .concat(safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls).map(asHttpUrl))
+        .filter(Boolean);
+      
+      // build a normalized key set for safe comparisons (ignore query/hash)
+      const heroKeySet = new Set(heroCandidates.map((u) => normalizeUrlForKey(u)).filter(Boolean));
+      
+      // if explicit hero missing, try to detect hero if it was mistakenly included in inspiration list
+      const heroFromInsp = !explicitHero
+        ? (inspUrlsRaw.find((u) => heroKeySet.has(normalizeUrlForKey(u))) || "")
+        : "";
+      
+      const heroUrl = explicitHero || heroFromInsp || "";
+      
+      // IMPORTANT: ensure Seedream gets hero via assets (even if frontend didn’t set it cleanly)
+      if (heroUrl) {
+        working.assets = { ...(working.assets || {}), style_hero_image_url: heroUrl };
+      }
+      
+      // --- GPT MUST NOT SEE HERO ---
+      // Remove anything that matches heroKeySet OR equals heroUrl
+      const heroKey = heroUrl ? normalizeUrlForKey(heroUrl) : "";
+      const inspUrlsForGpt = inspUrlsRaw
+        .filter((u) => {
+          const k = normalizeUrlForKey(u);
+          if (!k) return false;
+          if (heroKey && k === heroKey) return false;
+          if (heroKeySet.size && heroKeySet.has(k)) return false;
+          return true;
+        })
+        .slice(0, 4);
+      
+      // Build labeled images for ONE GPT call (NO HERO here)
+      const labeledImages = []
+        .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
+        .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
+        .concat(inspUrlsForGpt.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
+        .slice(0, 10);
 
-    const styleHero = asHttpUrl(
-      assets.style_hero_image_url ||
-        assets.styleHeroImageUrl ||
-        assets.style_hero_url ||
-        assets.styleHeroUrl
-    );
 
-    const inspUrls = safeArray(
-      assets.inspiration_image_urls ||
-        assets.inspirationImageUrls ||
-        assets.style_image_urls ||
-        assets.styleImageUrls
-    )
-      .map(asHttpUrl)
-      .filter(Boolean)
-      .slice(0, 4);
-
-    // Build labeled images for ONE GPT call
-    const labeledImages = []
-      .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
-      .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
-      .concat(inspUrls.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
-      .slice(0, 10);
 
     // Input to GPT (no aspect ratio needed)
     const oneShotInput = {

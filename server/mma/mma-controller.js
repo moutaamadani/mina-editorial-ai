@@ -882,14 +882,60 @@ async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
 // Replicate helpers (Seedream + Kling)
 // ============================================================================
 function pickFirstUrl(output) {
-  if (!output) return "";
-  if (typeof output === "string") return output;
-  if (Array.isArray(output)) return pickFirstUrl(output[0]);
-  if (typeof output === "object") {
-    if (typeof output.url === "string") return output.url;
-    if (typeof output.output === "string") return output.output;
-  }
-  return "";
+  const seen = new Set();
+
+  const isUrl = (s) => typeof s === "string" && /^https?:\/\//i.test(s);
+
+  const walk = (v) => {
+    if (!v) return "";
+    if (typeof v === "string") return isUrl(v) ? v : "";
+
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        const u = walk(item);
+        if (u) return u;
+      }
+      return "";
+    }
+
+    if (typeof v === "object") {
+      if (seen.has(v)) return "";
+      seen.add(v);
+
+      // common output keys across Replicate models
+      const keys = [
+        "url",
+        "output",
+        "outputs",
+        "video",
+        "video_url",
+        "videoUrl",
+        "mp4",
+        "file",
+        "files",
+        "result",
+        "results",
+        "data",
+      ];
+
+      for (const k of keys) {
+        if (v && Object.prototype.hasOwnProperty.call(v, k)) {
+          const u = walk(v[k]);
+          if (u) return u;
+        }
+      }
+
+      // fallback: scan all values
+      for (const val of Object.values(v)) {
+        const u = walk(val);
+        if (u) return u;
+      }
+    }
+
+    return "";
+  };
+
+  return walk(output);
 }
 
 function buildSeedreamImageInputs(vars) {
@@ -1555,8 +1601,8 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
-    const chargeCost = MMA_COSTS.still;
-  await chargeGeneration({ passId, generationId, cost: chargeCost, reason: "mma_image" });
+  const chargeCost = MMA_COSTS.still;
+  await chargeGeneration({ passId, generationId, cost: chargeCost, reason: "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
 
@@ -1799,7 +1845,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
   let working = vars;
 
   // ✅ charge at pipeline start (refund on failure)
-  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_image" });
+  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
   let chatter = null;
@@ -2182,7 +2228,13 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     const remote = pickFirstUrl(out);
     if (!remote) throw new Error("KLING_NO_URL");
 
-    const remoteUrl = await storeRemoteToR2Public(remote, `mma/video/${generationId}`);
+    let remoteUrl = remote;
+    try {
+      remoteUrl = await storeRemoteToR2Public(remote, `mma/video/${generationId}`);
+    } catch (e) {
+      console.warn("[mma] storeRemoteToR2Public failed (video), using provider url:", e?.message || e);
+      remoteUrl = remote;
+    }
 
     working.outputs = { ...(working.outputs || {}), kling_video_url: remoteUrl };
     working.mg_output_url = remoteUrl;
@@ -2236,6 +2288,8 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
 
   let working = vars;
   const ctx = await getMmaCtxConfig(supabase);
+
+  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.video, reason: "mma_video" });
 
   let chatter = null;
 
@@ -2419,6 +2473,12 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       })
       .eq("mg_generation_id", generationId)
       .eq("mg_record_type", "generation");
+
+    try {
+      await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.video, err });
+    } catch (e) {
+      console.warn("[mma] refund failed (video tweak)", e?.message || e);
+    }
 
     emitStatus(generationId, "error");
     sendDone(generationId, toUserStatus("error"));

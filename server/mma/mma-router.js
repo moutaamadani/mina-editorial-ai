@@ -33,7 +33,7 @@ const router = express.Router();
 const MMA_CREDIT_COSTS = {
   still: 1, // image
   video: 5, // video
-  type: 0, // text-only (suggest/prompt-only)
+  type: 0,  // text-only (suggest/prompt-only)
 };
 
 // If any of these appear in the request intent, we treat it as text-only (0 credits)
@@ -66,18 +66,6 @@ function safeString(v, fallback = "") {
   const s = typeof v === "string" ? v : String(v);
   const t = s.trim();
   return t ? t : fallback;
-}
-
-// ✅ Idempotency key (lets us dedupe charges if the client double-fires)
-function extractIdempotencyKey(body = {}) {
-  return safeString(
-    body?.idempotency_key ??
-      body?.idempotencyKey ??
-      body?.inputs?.idempotency_key ??
-      body?.inputs?.idempotencyKey ??
-      "",
-    ""
-  );
 }
 
 function extractGenerationId(result, fallback = null) {
@@ -158,19 +146,12 @@ async function ensureEnoughCreditsOrThrow(passId, cost) {
   }
 }
 
-async function chargeOnSuccess({ passId, cost, generationId, mode, idempotencyKey }) {
+async function chargeOnSuccess({ passId, cost, generationId, mode }) {
   if (!cost || cost <= 0) return { charged: 0, already: false };
 
-  const idem = safeString(idempotencyKey, "");
   const gid = safeString(generationId, "");
-
-  // ✅ If client sent idempotency key, use it for dedupe (best)
-  // Otherwise fall back to generation id
-  const refId = idem
-    ? `${mode}:idem:${idem}`
-    : gid
-      ? `${mode}:${gid}`
-      : `${mode}:no_generation_id:${Date.now()}`;
+  // We can still charge without a gid, but idempotency is best with one.
+  const refId = gid ? `${mode}:${gid}` : `${mode}:no_generation_id:${Date.now()}`;
 
   const already = await megaHasCreditRef({ refType: MMA_CHARGE_REF_TYPE, refId });
   if (already) return { charged: 0, already: true };
@@ -206,14 +187,7 @@ router.post("/still/create", async (req, res) => {
     // Charge on success (based on body + actual result)
     const cost = inferCost({ mode: "still", body: req.body || {}, result });
     const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "still",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
+    await chargeOnSuccess({ passId, cost, generationId: gid, mode: "still" });
 
     if (result && typeof result === "object") {
       result.billing = { cost, mode: "still" };
@@ -247,14 +221,7 @@ router.post("/still/:generation_id/tweak", async (req, res) => {
 
     const cost = inferCost({ mode: "still", body: req.body || {}, result });
     const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "still",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
+    await chargeOnSuccess({ passId, cost, generationId: gid, mode: "still" });
 
     if (result && typeof result === "object") {
       result.billing = { cost, mode: "still" };
@@ -284,14 +251,7 @@ router.post("/video/animate", async (req, res) => {
 
     const cost = inferCost({ mode: "video", body: req.body || {}, result });
     const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "video",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
+    await chargeOnSuccess({ passId, cost, generationId: gid, mode: "video" });
 
     if (result && typeof result === "object") {
       result.billing = { cost, mode: "video" };
@@ -325,14 +285,7 @@ router.post("/video/:generation_id/tweak", async (req, res) => {
 
     const cost = inferCost({ mode: "video", body: req.body || {}, result });
     const gid = extractGenerationId(result, null);
-
-    await chargeOnSuccess({
-      passId,
-      cost,
-      generationId: gid,
-      mode: "video",
-      idempotencyKey: extractIdempotencyKey(req.body || {}),
-    });
+    await chargeOnSuccess({ passId, cost, generationId: gid, mode: "video" });
 
     if (result && typeof result === "object") {
       result.billing = { cost, mode: "video" };

@@ -134,6 +134,24 @@ export function getMmaConfig() {
   ).trim();
 
   // -----------------------------
+  // NanoBanana (still image - niche)
+  // -----------------------------
+  const nanobananaModel = pickEnv(
+    ["MMA_NANOBANANA_VERSION", "MMA_NANOBANANA_MODEL_VERSION", "NANOBANANA_MODEL_VERSION"],
+    ""
+  );
+
+  const nanobananaResolution = pickEnv(["MMA_NANOBANANA_RESOLUTION"], "4K"); // 1K | 2K | 4K
+  const nanobananaAspectRatio = pickEnv(["MMA_NANOBANANA_ASPECT_RATIO"], "match_input_image");
+
+  const nanobananaOutputFormat = pickEnv(["MMA_NANOBANANA_OUTPUT_FORMAT"], "jpg"); // jpg | png
+
+  const nanobananaSafetyFilterLevel = pickEnv(
+    ["MMA_NANOBANANA_SAFETY_FILTER_LEVEL"],
+    "block_only_high"
+  ); // block_low_and_above | block_medium_and_above | block_only_high
+
+  // -----------------------------
   // ✅ Style hero URLs (for filtering GPT inputs + feeding Seedream)
   // -----------------------------
   // Put ALL hero URLs for your 3 styles into any of these env vars (CSV/newlines or JSON array):
@@ -199,6 +217,14 @@ export function getMmaConfig() {
 
       // optional (not required by the controller patch)
       styleHeroMap,
+    },
+
+    nanobanana: {
+      model: nanobananaModel,
+      resolution: nanobananaResolution,
+      aspectRatio: nanobananaAspectRatio,
+      outputFormat: nanobananaOutputFormat,
+      safetyFilterLevel: nanobananaSafetyFilterLevel,
     },
 
     kling: {

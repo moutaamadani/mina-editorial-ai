@@ -766,32 +766,78 @@ function maxStillImagesForTier(tier) {
   return tier === "niche" ? 14 : 10;
 }
 
-function getStylePackUrls(cfg, styleKey) {
-  const key = safeStr(styleKey, "").trim();
-  const map = cfg?.seadream?.styleHeroMap || null;
-
-  if (map && key) {
-    const hit = map[key] || map[key.toLowerCase()];
-    if (Array.isArray(hit)) return hit.map(asHttpUrl).filter(Boolean);
-  }
-
-  // fallback (if you didn't configure the map)
-  return safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls)
-    .map(asHttpUrl)
-    .filter(Boolean);
+function isNoMoodboardStyleKey(k) {
+  const s = safeStr(k, "").trim().toLowerCase();
+  return (
+    !s ||
+    s === "none" ||
+    s === "no" ||
+    s === "off" ||
+    s === "false" ||
+    s === "null" ||
+    s === "0"
+  );
 }
 
 /**
- * Builds the still model "image_input" list like you described:
- * - product (1) + logo (1) + inspiration (up to 4)
- * - then fill remaining slots with style-pack urls
- * - cap: main=10, niche=14
+ * Moodboard URLs source priority (max 10):
+ * 1) Frontend-provided URLs (optional, if you already send them)
+ * 2) cfg.seadream.styleHeroMap[styleKey]
+ * 3) cfg.seadream.styleHeroUrls (global list) — ONLY if styleKey exists (meaning moodboard chosen)
+ *
+ * If user selected NO moodboard -> return [] (no auto-fill).
  */
-function buildStillImageInputs(vars, { cfg, tier, parentVars } = {}) {
+function getMoodboardUrlsForVars(cfg, vars) {
+  const assets = (vars && vars.assets) || {};
+  const inputs = (vars && vars.inputs) || {};
+
+  const styleKey = safeStr(inputs.style || inputs.styleKey, "");
+
+  // If frontend ever sends moodboard urls directly (safe optional support)
+  const fromAssets = safeArray(
+    assets.moodboard_image_urls ||
+      assets.moodboardImageUrls ||
+      assets.moodboard_urls ||
+      assets.moodboardUrls ||
+      assets.style_pack_urls ||
+      assets.stylePackUrls ||
+      assets.style_hero_image_urls ||
+      assets.styleHeroImageUrls
+  )
+    .map(asHttpUrl)
+    .filter(Boolean);
+
+  // If user explicitly chose "no moodboard" AND didn't provide URLs => none
+  if (isNoMoodboardStyleKey(styleKey) && !fromAssets.length) return [];
+
+  // Style map (per-style moodboard)
+  const map = cfg?.seadream?.styleHeroMap || null;
+  let fromMap = [];
+  if (map && !isNoMoodboardStyleKey(styleKey)) {
+    const hit = map[styleKey] || map[String(styleKey).toLowerCase()];
+    if (Array.isArray(hit)) fromMap = hit.map(asHttpUrl).filter(Boolean);
+  }
+
+  // Global list (only if styleKey exists => moodboard chosen)
+  const fromGlobal = !isNoMoodboardStyleKey(styleKey)
+    ? safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls).map(asHttpUrl).filter(Boolean)
+    : [];
+
+  const list = fromAssets.length ? fromAssets : fromMap.length ? fromMap : fromGlobal;
+  return list.slice(0, 10);
+}
+
+/**
+ * Builds the still model "image_input" list EXACTLY like your spec:
+ * - product (1) + logo (1) + inspiration (up to 4)
+ * - THEN (only if moodboard selected) fill with moodboard urls (max 10)
+ * - cap: main=10, niche=14
+ * - if no uploads and no moodboard => []
+ */
+function buildStillImageInputs(vars, { cfg, tier } = {}) {
   const cap = maxStillImagesForTier(tier || "main");
 
-  const assets = vars?.assets || {};
-  const inputs = vars?.inputs || {};
+  const assets = (vars && vars.assets) || {};
 
   const product = asHttpUrl(assets.product_image_url || assets.productImageUrl);
   const logo = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
@@ -806,29 +852,8 @@ function buildStillImageInputs(vars, { cfg, tier, parentVars } = {}) {
     .filter(Boolean)
     .slice(0, 4);
 
-  const styleKey = safeStr(inputs.style || inputs.styleKey, "");
-
-  // style pack urls (hero + extra urls)
-  const stylePack = getStylePackUrls(cfg, styleKey);
-
-  // If styleKey is empty, allow explicit hero url(s) as fallback
-  const explicitHero =
-    asHttpUrl(
-      assets.style_hero_image_url ||
-        assets.styleHeroImageUrl ||
-        assets.style_hero_url ||
-        assets.styleHeroUrl
-    ) || "";
-
-  const explicitHeroList = safeArray(assets.style_hero_image_urls || assets.styleHeroImageUrls)
-    .map(asHttpUrl)
-    .filter(Boolean);
-
-  const fallbackStyle = []
-    .concat(explicitHero ? [explicitHero] : [])
-    .concat(explicitHeroList);
-
-  const styleFill = styleKey ? stylePack : (fallbackStyle.length ? fallbackStyle : stylePack);
+  // ✅ moodboard urls are optional; only used when selected
+  const moodboard = getMoodboardUrlsForVars(cfg, vars); // <= max 10 or []
 
   // Build + dedupe (normalized)
   const out = [];
@@ -848,8 +873,8 @@ function buildStillImageInputs(vars, { cfg, tier, parentVars } = {}) {
   add(logo);
   for (const u of inspiration) add(u);
 
-  // Fill: style pack
-  for (const u of styleFill) {
+  // Fill ONLY from moodboard (no global fallback when moodboard not selected)
+  for (const u of moodboard) {
     if (out.length >= cap) break;
     add(u);
   }

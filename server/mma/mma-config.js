@@ -134,20 +134,6 @@ export function getMmaConfig() {
   ).trim();
 
   // -----------------------------
-  // Nano Banana Pro (still image - niche tier)
-  // -----------------------------
-  const nanoModel = pickEnv(
-    ["MMA_NANO_BANANA_VERSION", "MMA_NANO_BANANA_MODEL_VERSION", "NANO_BANANA_MODEL_VERSION"],
-    "google/nano-banana-pro"
-  );
-
-  // Matches the schema you posted (resolution/aspect_ratio/output_format/safety_filter_level)
-  const nanoResolution = pickEnv(["MMA_NANO_BANANA_RESOLUTION"], "4K"); // 1K | 2K | 4K
-  const nanoAspectRatio = pickEnv(["MMA_NANO_BANANA_ASPECT_RATIO"], "match_input_image");
-  const nanoOutputFormat = pickEnv(["MMA_NANO_BANANA_OUTPUT_FORMAT"], "jpg"); // jpg | png
-  const nanoSafety = pickEnv(["MMA_NANO_BANANA_SAFETY_FILTER_LEVEL"], "block_only_high");
-
-  // -----------------------------
   // NanoBanana (still image - niche)
   // -----------------------------
   const nanobananaModel = pickEnv(
@@ -231,14 +217,6 @@ export function getMmaConfig() {
 
       // optional (not required by the controller patch)
       styleHeroMap,
-    },
-
-    nanoBananaPro: {
-      model: nanoModel,
-      resolution: nanoResolution,
-      aspectRatio: nanoAspectRatio,
-      outputFormat: nanoOutputFormat,
-      safetyFilterLevel: nanoSafety,
     },
 
     nanobanana: {

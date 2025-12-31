@@ -761,6 +761,160 @@ function buildSeedreamImageInputs(vars) {
     .slice(0, 10);
 }
 
+// ============================================================================
+// Nano Banana (Replicate) still-image helper (niche lane)
+// Model: google/nano-banana-pro
+// Input schema: prompt (required), resolution, image_input[], aspect_ratio, output_format, safety_filter_level
+// Output schema: single URL string
+// Source: Replicate model API schema (Dec 2025) :contentReference[oaicite:5]{index=5}
+// ============================================================================
+function resolveStillLane(vars) {
+  const inputs = vars?.inputs && typeof vars.inputs === "object" ? vars.inputs : {};
+  const raw = safeStr(
+    inputs.still_lane ||
+      inputs.stillLane ||
+      inputs.model_lane ||
+      inputs.modelLane ||
+      inputs.lane ||
+      inputs.create_lane ||
+      inputs.createLane,
+    "main"
+  ).toLowerCase();
+  return raw === "niche" ? "niche" : "main";
+}
+
+function nanoBananaEnabled() {
+  return !!safeStr(process.env.MMA_NANOBANANA_VERSION, "");
+}
+
+function buildNanoBananaImageInputs(vars) {
+  // nano-banana supports up to 14 reference images :contentReference[oaicite:6]{index=6}
+  const assets = vars?.assets || {};
+  const product = asHttpUrl(assets.product_image_url || assets.productImageUrl);
+  const logo = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
+
+  const styleHero = asHttpUrl(
+    assets.style_hero_image_url ||
+      assets.styleHeroImageUrl ||
+      assets.style_hero_url ||
+      assets.styleHeroUrl
+  );
+
+  const inspiration = safeArray(
+    assets.inspiration_image_urls ||
+      assets.inspirationImageUrls ||
+      assets.style_image_urls ||
+      assets.styleImageUrls
+  )
+    .map(asHttpUrl)
+    .filter(Boolean)
+    .slice(0, 10); // keep total <=14
+
+  return []
+    .concat(product ? [product] : [])
+    .concat(logo ? [logo] : [])
+    .concat(inspiration)
+    .concat(styleHero ? [styleHero] : [])
+    .filter(Boolean)
+    .slice(0, 14);
+}
+
+async function runNanoBanana({
+  prompt,
+  aspectRatio,
+  imageInputs = [],
+  resolution,
+  outputFormat,
+  safetyFilterLevel,
+  input: forcedInput,
+}) {
+  const replicate = getReplicate();
+  const cfg = getMmaConfig();
+
+  const version =
+    safeStr(process.env.MMA_NANOBANANA_VERSION, "") ||
+    safeStr(cfg?.nanobanana?.model, "") ||
+    "google/nano-banana-pro";
+
+  const defaultAspect =
+    safeStr(cfg?.nanobanana?.aspectRatio, "") ||
+    safeStr(process.env.MMA_NANOBANANA_ASPECT_RATIO, "") ||
+    "match_input_image";
+
+  const defaultResolution =
+    safeStr(
+      String(resolution ?? cfg?.nanobanana?.resolution ?? process.env.MMA_NANOBANANA_RESOLUTION ?? "2K"),
+      "2K"
+    ) || "2K";
+
+  const defaultFmt =
+    safeStr(
+      String(outputFormat ?? cfg?.nanobanana?.outputFormat ?? process.env.MMA_NANOBANANA_OUTPUT_FORMAT ?? "jpg"),
+      "jpg"
+    ) || "jpg";
+
+  const defaultSafety =
+    safeStr(
+      String(
+        safetyFilterLevel ??
+          cfg?.nanobanana?.safetyFilterLevel ??
+          process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL ??
+          "block_only_high"
+      ),
+      "block_only_high"
+    ) || "block_only_high";
+
+  const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 14);
+
+  const input = forcedInput
+    ? { ...forcedInput, prompt: forcedInput.prompt || prompt }
+    : {
+        prompt,
+        resolution: defaultResolution,
+        aspect_ratio: aspectRatio || defaultAspect,
+        output_format: defaultFmt,
+        safety_filter_level: defaultSafety,
+        ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
+      };
+
+  // normalize fields
+  if (!input.prompt) input.prompt = prompt;
+  if (!input.resolution) input.resolution = defaultResolution;
+  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
+  if (!input.output_format) input.output_format = defaultFmt;
+  if (!input.safety_filter_level) input.safety_filter_level = defaultSafety;
+  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+
+  const t0 = Date.now();
+
+  const pred = await replicatePredictWithTimeout({
+    replicate,
+    version,
+    input,
+    timeoutMs: REPLICATE_MAX_MS,
+    pollMs: REPLICATE_POLL_MS,
+    callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
+  });
+
+  const prediction = pred.prediction || {};
+  const out = prediction.output;
+
+  return {
+    input,
+    out,
+    prediction_id: pred.predictionId,
+    prediction_status: prediction.status || null,
+    timed_out: !!pred.timedOut,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+    provider: { prediction },
+  };
+}
+
 // ---- HARD TIMEOUT settings (4 minutes default) ----
 const REPLICATE_MAX_MS = Number(process.env.MMA_REPLICATE_MAX_MS || 240000) || 240000;
 const REPLICATE_POLL_MS = Number(process.env.MMA_REPLICATE_POLL_MS || 2500) || 2500;
@@ -1453,32 +1607,53 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       intervalMs: 2600,
     });
 
-    const imageInputs = buildSeedreamImageInputs(working);
+    // lane: "main" (default) => Seedream, "niche" => Nano Banana (if enabled)
+    const stillLane = resolveStillLane(working);
+    const useNano = stillLane === "niche" && nanoBananaEnabled();
+
+    working.meta = { ...(working.meta || {}), still_lane: stillLane, still_engine: useNano ? "nanobanana" : "seedream" };
+    await updateVars({ supabase, generationId, vars: working });
+
+    const imageInputs = useNano ? buildNanoBananaImageInputs(working) : buildSeedreamImageInputs(working);
 
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
-      cfg?.seadream?.aspectRatio ||
-      process.env.MMA_SEADREAM_ASPECT_RATIO ||
+      (useNano
+        ? process.env.MMA_NANOBANANA_ASPECT_RATIO || cfg?.nanobanana?.aspectRatio
+        : cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO) ||
       "match_input_image";
 
+    // If user chose match_input_image but no inputs exist, force a safe fallback aspect ratio
     if (!imageInputs.length && String(aspectRatio).toLowerCase().includes("match")) {
-      aspectRatio =
-        cfg?.seadream?.fallbackAspectRatio ||
-        process.env.MMA_SEADREAM_FALLBACK_ASPECT_RATIO ||
-        "1:1";
+      aspectRatio = useNano
+        ? process.env.MMA_NANOBANANA_FALLBACK_ASPECT_RATIO || cfg?.nanobanana?.fallbackAspectRatio || "1:1"
+        : cfg?.seadream?.fallbackAspectRatio || process.env.MMA_SEADREAM_FALLBACK_ASPECT_RATIO || "1:1";
     }
 
-    let seedRes;
+    let genRes;
     try {
-      seedRes = await runSeedream({
-        prompt: usedPrompt,
-        aspectRatio,
-        imageInputs,
-        size: cfg?.seadream?.size,
-        enhancePrompt: cfg?.seadream?.enhancePrompt,
-      });
+      genRes = useNano
+        ? await runNanoBanana({
+            prompt: usedPrompt,
+            aspectRatio,
+            imageInputs,
+            resolution: cfg?.nanobanana?.resolution, // optional (env handles your Render vars)
+            outputFormat: cfg?.nanobanana?.outputFormat,
+            safetyFilterLevel: cfg?.nanobanana?.safetyFilterLevel,
+          })
+        : await runSeedream({
+            prompt: usedPrompt,
+            aspectRatio,
+            imageInputs,
+            size: cfg?.seadream?.size,
+            enhancePrompt: cfg?.seadream?.enhancePrompt,
+          });
+
       // ✅ store prediction id for recovery later
-      working.outputs = { ...(working.outputs || {}), seedream_prediction_id: seedRes.prediction_id || null };
+      working.outputs = { ...(working.outputs || {}) };
+      if (useNano) working.outputs.nanobanana_prediction_id = genRes.prediction_id || null;
+      else working.outputs.seedream_prediction_id = genRes.prediction_id || null;
+
       await updateVars({ supabase, generationId, vars: working });
     } finally {
       try {
@@ -1487,22 +1662,25 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       chatter = null;
     }
 
-    const { input, out, timing } = seedRes;
+    const { input, out, timing } = genRes;
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "seedream_generate",
+      stepType: useNano ? "nanobanana_generate" : "seedream_generate",
       payload: { input, output: out, timing, error: null },
     });
 
     const url = pickFirstUrl(out);
-    if (!url) throw new Error("SEADREAM_NO_URL");
+    if (!url) throw new Error(useNano ? "NANOBANANA_NO_URL" : "SEADREAM_NO_URL");
 
     const remoteUrl = await storeRemoteToR2Public(url, `mma/still/${generationId}`);
-    working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
+    working.outputs = { ...(working.outputs || {}) };
+    if (useNano) working.outputs.nanobanana_image_url = remoteUrl;
+    else working.outputs.seedream_image_url = remoteUrl;
+
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_image));
@@ -1632,32 +1810,61 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       intervalMs: 2600,
     });
 
+    const stillLane = resolveStillLane(working);
+    const useNano = stillLane === "niche" && nanoBananaEnabled();
+
+    working.meta = { ...(working.meta || {}), still_lane: stillLane, still_engine: useNano ? "nanobanana" : "seedream" };
+    await updateVars({ supabase, generationId, vars: working });
+
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
-      cfg?.seadream?.aspectRatio ||
-      process.env.MMA_SEADREAM_ASPECT_RATIO ||
+      (useNano
+        ? process.env.MMA_NANOBANANA_ASPECT_RATIO || cfg?.nanobanana?.aspectRatio
+        : cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO) ||
       "match_input_image";
 
-    const forcedInput = {
-      prompt: usedPrompt,
-      size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
-      aspect_ratio: aspectRatio,
-      enhance_prompt: !!cfg?.seadream?.enhancePrompt,
-      sequential_image_generation: "disabled",
-      max_images: 1,
-      image_input: [parentUrl],
-    };
+    // tweak always has a parent image, so match_input_image is fine, but keep fallback anyway
+    if (String(aspectRatio).toLowerCase().includes("match") && !parentUrl) {
+      aspectRatio = "1:1";
+    }
 
-    let seedRes;
+    const forcedInput = useNano
+      ? {
+          prompt: usedPrompt,
+          resolution: cfg?.nanobanana?.resolution || process.env.MMA_NANOBANANA_RESOLUTION || "2K",
+          aspect_ratio: aspectRatio,
+          output_format: cfg?.nanobanana?.outputFormat || process.env.MMA_NANOBANANA_OUTPUT_FORMAT || "jpg",
+          safety_filter_level:
+            cfg?.nanobanana?.safetyFilterLevel || process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL || "block_only_high",
+          image_input: [parentUrl],
+        }
+      : {
+          prompt: usedPrompt,
+          size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
+          aspect_ratio: aspectRatio,
+          enhance_prompt: !!cfg?.seadream?.enhancePrompt,
+          sequential_image_generation: "disabled",
+          max_images: 1,
+          image_input: [parentUrl],
+        };
+
+    let genRes;
     try {
-      seedRes = await runSeedream({
-        prompt: usedPrompt,
-        aspectRatio,
-        imageInputs: [parentUrl],
-        size: cfg?.seadream?.size,
-        enhancePrompt: cfg?.seadream?.enhancePrompt,
-        input: forcedInput,
-      });
+      genRes = useNano
+        ? await runNanoBanana({
+            prompt: usedPrompt,
+            aspectRatio,
+            imageInputs: [parentUrl],
+            input: forcedInput,
+          })
+        : await runSeedream({
+            prompt: usedPrompt,
+            aspectRatio,
+            imageInputs: [parentUrl],
+            size: cfg?.seadream?.size,
+            enhancePrompt: cfg?.seadream?.enhancePrompt,
+            input: forcedInput,
+          });
     } finally {
       try {
         chatter?.stop?.();
@@ -1665,22 +1872,26 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       chatter = null;
     }
 
-    const { input, out: seedOut, timing } = seedRes;
+    const { input, out, timing } = genRes;
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "seedream_generate_tweak",
-      payload: { input, output: seedOut, timing, error: null },
+      stepType: useNano ? "nanobanana_generate_tweak" : "seedream_generate_tweak",
+      payload: { input, output: out, timing, error: null },
     });
 
-    const seedUrl = pickFirstUrl(seedOut);
-    if (!seedUrl) throw new Error("SEADREAM_NO_URL_TWEAK");
+    const genUrl = pickFirstUrl(out);
+    if (!genUrl) throw new Error(useNano ? "NANOBANANA_NO_URL_TWEAK" : "SEADREAM_NO_URL_TWEAK");
 
-    const remoteUrl = await storeRemoteToR2Public(seedUrl, `mma/still/${generationId}`);
-    working.outputs = { ...(working.outputs || {}), seedream_image_url: remoteUrl };
+    const remoteUrl = await storeRemoteToR2Public(genUrl, `mma/still/${generationId}`);
+
+    working.outputs = { ...(working.outputs || {}) };
+    if (useNano) working.outputs.nanobanana_image_url = remoteUrl;
+    else working.outputs.seedream_image_url = remoteUrl;
+
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_image));
@@ -2563,7 +2774,11 @@ export async function refreshFromReplicate({ generationId, passId }) {
   const predictionId =
     mode === "video"
       ? outputs.kling_prediction_id || outputs.klingPredictionId || ""
-      : outputs.seedream_prediction_id || outputs.seedreamPredictionId || "";
+      : outputs.nanobanana_prediction_id ||
+        outputs.nanobananaPredictionId ||
+        outputs.seedream_prediction_id ||
+        outputs.seedreamPredictionId ||
+        "";
 
   if (!predictionId) {
     return { ok: false, error: "NO_PREDICTION_ID" };
@@ -2587,8 +2802,16 @@ export async function refreshFromReplicate({ generationId, passId }) {
   // update vars + final row
   const nextVars = { ...vars, mg_output_url: remoteUrl };
   nextVars.outputs = { ...(nextVars.outputs || {}) };
-  if (mode === "video") nextVars.outputs.kling_video_url = remoteUrl;
-  else nextVars.outputs.seedream_image_url = remoteUrl;
+  if (mode === "video") {
+    nextVars.outputs.kling_video_url = remoteUrl;
+  } else {
+    // prefer storing under the engine that was used
+    if (outputs.nanobanana_prediction_id || outputs.nanobananaPredictionId) {
+      nextVars.outputs.nanobanana_image_url = remoteUrl;
+    } else {
+      nextVars.outputs.seedream_image_url = remoteUrl;
+    }
+  }
 
   await supabase
     .from("mega_generations")

@@ -237,23 +237,36 @@ function safeArray(x) {
   return Array.isArray(x) ? x : [];
 }
 
-function readStillTierFromInputs(inputs, fallback = "main") {
-  const t = safeStr(
-    inputs?.still_tier ||
-      inputs?.stillTier ||
-      inputs?.render_tier ||
-      inputs?.renderTier ||
-      "",
-    ""
-  )
-    .trim()
-    .toLowerCase();
+function resolveStillTierFromInputs(inputs, parentVars) {
+  const i = inputs && typeof inputs === "object" ? inputs : {};
+  const p = parentVars && typeof parentVars === "object" ? parentVars : {};
+  const pInputs = p?.inputs && typeof p.inputs === "object" ? p.inputs : {};
 
-  return t === "niche" ? "niche" : fallback;
-}
+  const raw =
+    safeStr(
+      i.still_tier ||
+        i.stillTier ||
+        i.tier ||
+        i.model_tier ||
+        i.modelTier ||
+        i.quality_tier ||
+        i.qualityTier,
+      ""
+    ) ||
+    safeStr(
+      pInputs.still_tier ||
+        pInputs.stillTier ||
+        pInputs.tier ||
+        pInputs.model_tier ||
+        pInputs.modelTier ||
+        pInputs.quality_tier ||
+        pInputs.qualityTier,
+      ""
+    );
 
-function stillCostForTier(tier) {
-  return tier === "niche" ? 2 : 1; // ✅ niche costs 2 credits
+  const s = raw.trim().toLowerCase();
+  if (s === "niche" || s === "nano") return "niche";
+  return "main"; // ✅ default
 }
 
 function parseJsonMaybe(v) {
@@ -749,17 +762,39 @@ function pickFirstUrl(output) {
   return walk(output);
 }
 
-function buildSeedreamImageInputs(vars) {
+function maxStillImagesForTier(tier) {
+  return tier === "niche" ? 14 : 10;
+}
+
+function getStylePackUrls(cfg, styleKey) {
+  const key = safeStr(styleKey, "").trim();
+  const map = cfg?.seadream?.styleHeroMap || null;
+
+  if (map && key) {
+    const hit = map[key] || map[key.toLowerCase()];
+    if (Array.isArray(hit)) return hit.map(asHttpUrl).filter(Boolean);
+  }
+
+  // fallback (if you didn't configure the map)
+  return safeArray(cfg?.seadream?.styleHeroUrls || cfg?.styleHeroUrls)
+    .map(asHttpUrl)
+    .filter(Boolean);
+}
+
+/**
+ * Builds the still model "image_input" list like you described:
+ * - product (1) + logo (1) + inspiration (up to 4)
+ * - then fill remaining slots with style-pack urls
+ * - cap: main=10, niche=14
+ */
+function buildStillImageInputs(vars, { cfg, tier, parentVars } = {}) {
+  const cap = maxStillImagesForTier(tier || "main");
+
   const assets = vars?.assets || {};
+  const inputs = vars?.inputs || {};
+
   const product = asHttpUrl(assets.product_image_url || assets.productImageUrl);
   const logo = asHttpUrl(assets.logo_image_url || assets.logoImageUrl);
-
-  const styleHero = asHttpUrl(
-    assets.style_hero_image_url ||
-      assets.styleHeroImageUrl ||
-      assets.style_hero_url ||
-      assets.styleHeroUrl
-  );
 
   const inspiration = safeArray(
     assets.inspiration_image_urls ||
@@ -771,13 +806,55 @@ function buildSeedreamImageInputs(vars) {
     .filter(Boolean)
     .slice(0, 4);
 
-  return []
-    .concat(product ? [product] : [])
-    .concat(logo ? [logo] : [])
-    .concat(inspiration)
-    .concat(styleHero ? [styleHero] : [])
-    .filter(Boolean)
-    .slice(0, 10);
+  const styleKey = safeStr(inputs.style || inputs.styleKey, "");
+
+  // style pack urls (hero + extra urls)
+  const stylePack = getStylePackUrls(cfg, styleKey);
+
+  // If styleKey is empty, allow explicit hero url(s) as fallback
+  const explicitHero =
+    asHttpUrl(
+      assets.style_hero_image_url ||
+        assets.styleHeroImageUrl ||
+        assets.style_hero_url ||
+        assets.styleHeroUrl
+    ) || "";
+
+  const explicitHeroList = safeArray(assets.style_hero_image_urls || assets.styleHeroImageUrls)
+    .map(asHttpUrl)
+    .filter(Boolean);
+
+  const fallbackStyle = []
+    .concat(explicitHero ? [explicitHero] : [])
+    .concat(explicitHeroList);
+
+  const styleFill = styleKey ? stylePack : (fallbackStyle.length ? fallbackStyle : stylePack);
+
+  // Build + dedupe (normalized)
+  const out = [];
+  const seen = new Set();
+
+  const add = (u) => {
+    const url = asHttpUrl(u);
+    if (!url) return;
+    const k = normalizeUrlForKey(url);
+    if (!k || seen.has(k)) return;
+    seen.add(k);
+    out.push(url);
+  };
+
+  // Base: product + logo + inspirations
+  add(product);
+  add(logo);
+  for (const u of inspiration) add(u);
+
+  // Fill: style pack
+  for (const u of styleFill) {
+    if (out.length >= cap) break;
+    add(u);
+  }
+
+  return out.slice(0, cap);
 }
 
 // ---- HARD TIMEOUT settings (4 minutes default) ----
@@ -869,37 +946,28 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
   };
 }
 
-async function runNanoBanana({ prompt, aspectRatio, imageInputs = [], input: forcedInput }) {
+async function runNanoBananaPro({
+  prompt,
+  aspectRatio,
+  imageInputs = [],
+  resolution,
+  outputFormat,
+  safetyFilterLevel,
+  input: forcedInput,
+}) {
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
   const version =
-    process.env.MMA_NANOBANANA_VERSION ||
-    process.env.MMA_NANOBANANA_MODEL_VERSION ||
-    cfg?.nanobanana?.model ||
-    "";
+    process.env.MMA_NANO_BANANA_VERSION ||
+    process.env.MMA_NANO_BANANA_MODEL_VERSION ||
+    cfg?.nanoBananaPro?.model ||
+    "google/nano-banana-pro";
 
-  if (!version) throw new Error("MMA_NANOBANANA_VERSION_MISSING");
-
-  const defaultAspect =
-    cfg?.nanobanana?.aspectRatio ||
-    process.env.MMA_NANOBANANA_ASPECT_RATIO ||
-    "match_input_image";
-
-  const resolution =
-    cfg?.nanobanana?.resolution ||
-    process.env.MMA_NANOBANANA_RESOLUTION ||
-    "4K";
-
-  const output_format =
-    cfg?.nanobanana?.outputFormat ||
-    process.env.MMA_NANOBANANA_OUTPUT_FORMAT ||
-    "jpg";
-
-  const safety_filter_level =
-    cfg?.nanobanana?.safetyFilterLevel ||
-    process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL ||
-    "block_only_high";
+  const resValue = resolution || cfg?.nanoBananaPro?.resolution || "4K";
+  const aspectValue = aspectRatio || cfg?.nanoBananaPro?.aspectRatio || "match_input_image";
+  const fmtValue = outputFormat || cfg?.nanoBananaPro?.outputFormat || "jpg";
+  const safetyValue = safetyFilterLevel || cfg?.nanoBananaPro?.safetyFilterLevel || "block_only_high";
 
   const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 14);
 
@@ -907,18 +975,12 @@ async function runNanoBanana({ prompt, aspectRatio, imageInputs = [], input: for
     ? { ...forcedInput, prompt: forcedInput.prompt || prompt }
     : {
         prompt,
-        resolution,
-        aspect_ratio: aspectRatio || defaultAspect,
-        output_format,
-        safety_filter_level,
+        resolution: resValue,
+        aspect_ratio: aspectValue,
+        output_format: fmtValue,
+        safety_filter_level: safetyValue,
         ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
       };
-
-  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
-  if (!input.resolution) input.resolution = resolution;
-  if (!input.output_format) input.output_format = output_format;
-  if (!input.safety_filter_level) input.safety_filter_level = safety_filter_level;
-  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
 
   const t0 = Date.now();
 
@@ -948,13 +1010,6 @@ async function runNanoBanana({ prompt, aspectRatio, imageInputs = [], input: for
     },
     provider: { prediction },
   };
-}
-
-async function runStillByTier({ tier, prompt, aspectRatio, imageInputs, forcedInput }) {
-  if (tier === "niche") {
-    return runNanoBanana({ prompt, aspectRatio, imageInputs, input: forcedInput });
-  }
-  return runSeedream({ prompt, aspectRatio, imageInputs, input: forcedInput });
 }
 
 // ---- Kling helpers ----
@@ -1127,7 +1182,11 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 // CREDITS (controller-owned)
 // ============================================================================
 const MMA_COSTS = {
-  still: 1,
+  // ✅ still tiers
+  still_main: Number(process.env.MMA_COST_STILL_MAIN || 1) || 1,
+  still_niche: Number(process.env.MMA_COST_STILL_NICHE || 2) || 2,
+
+  // unchanged
   video: 5,
   typeForMePer: 10,
   typeForMeCharge: 1,
@@ -1435,15 +1494,11 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
-  let tier = readStillTierFromInputs(working?.inputs || {}, "main");
+  const tier = resolveStillTierFromInputs(working?.inputs, null);
   working.inputs = { ...(working.inputs || {}), still_tier: tier };
 
-  await chargeGeneration({
-    passId,
-    generationId,
-    cost: stillCostForTier(tier),
-    reason: tier === "niche" ? "mma_still_niche" : "mma_still",
-  });
+  const stillCost = tier === "niche" ? MMA_COSTS.still_niche : MMA_COSTS.still_main;
+  await chargeGeneration({ passId, generationId, cost: stillCost, reason: tier === "niche" ? "mma_still_niche" : "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
   let chatter = null;
@@ -1568,7 +1623,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       intervalMs: 2600,
     });
 
-    const imageInputs = buildSeedreamImageInputs(working);
+    const imageInputs = buildStillImageInputs(working, { cfg, tier });
 
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
@@ -1585,21 +1640,34 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
 
     let seedRes;
     try {
-      seedRes = await runStillByTier({
-        tier,
-        prompt: usedPrompt,
-        aspectRatio,
-        imageInputs,
-      });
-
-      working.outputs = { ...(working.outputs || {}) };
-      working.outputs.still_provider = tier === "niche" ? "nanobanana" : "seedream";
-      working.outputs.still_prediction_id = seedRes.prediction_id || null;
-
-      if (tier === "niche") working.outputs.nanobanana_prediction_id = seedRes.prediction_id || null;
-      else working.outputs.seedream_prediction_id = seedRes.prediction_id || null;
-
-      await updateVars({ supabase, generationId, vars: working });
+      if (tier === "niche") {
+        seedRes = await runNanoBananaPro({
+          prompt: usedPrompt,
+          aspectRatio,
+          imageInputs,
+          resolution: "4K",
+        });
+        working.outputs = {
+          ...(working.outputs || {}),
+          still_prediction_id: seedRes.prediction_id || null,
+          nano_prediction_id: seedRes.prediction_id || null,
+        };
+        await updateVars({ supabase, generationId, vars: working });
+      } else {
+        seedRes = await runSeedream({
+          prompt: usedPrompt,
+          aspectRatio,
+          imageInputs,
+          size: cfg?.seadream?.size,
+          enhancePrompt: cfg?.seadream?.enhancePrompt,
+        });
+        working.outputs = {
+          ...(working.outputs || {}),
+          still_prediction_id: seedRes.prediction_id || null,
+          seedream_prediction_id: seedRes.prediction_id || null,
+        };
+        await updateVars({ supabase, generationId, vars: working });
+      }
     } finally {
       try {
         chatter?.stop?.();
@@ -1653,7 +1721,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       .eq("mg_record_type", "generation");
 
     try {
-      await refundOnFailure({ supabase, passId, generationId, cost: stillCostForTier(tier), err });
+      await refundOnFailure({ supabase, passId, generationId, cost: stillCost, err });
     } catch (e) {
       console.warn("[mma] refund failed (still create)", e?.message || e);
     }
@@ -1671,16 +1739,12 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
-
-  let tier = readStillTierFromInputs(working?.inputs || {}, "main");
+  const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
+  const tier = resolveStillTierFromInputs(working?.inputs, parentVars);
   working.inputs = { ...(working.inputs || {}), still_tier: tier };
 
-  await chargeGeneration({
-    passId,
-    generationId,
-    cost: stillCostForTier(tier),
-    reason: tier === "niche" ? "mma_still_niche" : "mma_still",
-  });
+  const stillCost = tier === "niche" ? MMA_COSTS.still_niche : MMA_COSTS.still_main;
+  await chargeGeneration({ passId, generationId, cost: stillCost, reason: tier === "niche" ? "mma_still_niche" : "mma_still" });
 
   const ctx = await getMmaCtxConfig(supabase);
   let chatter = null;
@@ -1766,35 +1830,42 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       process.env.MMA_SEADREAM_ASPECT_RATIO ||
       "match_input_image";
 
-    const forcedInput =
-      tier === "niche"
-        ? {
-            prompt: usedPrompt,
-            resolution: cfg?.nanobanana?.resolution || "4K",
-            aspect_ratio: aspectRatio,
-            output_format: cfg?.nanobanana?.outputFormat || "jpg",
-            safety_filter_level: cfg?.nanobanana?.safetyFilterLevel || "block_only_high",
-            image_input: [parentUrl],
-          }
-        : {
-            prompt: usedPrompt,
-            size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
-            aspect_ratio: aspectRatio,
-            enhance_prompt: !!cfg?.seadream?.enhancePrompt,
-            sequential_image_generation: "disabled",
-            max_images: 1,
-            image_input: [parentUrl],
-          };
+    const forcedInput = {
+      prompt: usedPrompt,
+      size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
+      aspect_ratio: aspectRatio,
+      enhance_prompt: !!cfg?.seadream?.enhancePrompt,
+      sequential_image_generation: "disabled",
+      max_images: 1,
+      image_input: [parentUrl],
+    };
 
     let seedRes;
     try {
-      seedRes = await runStillByTier({
-        tier,
-        prompt: usedPrompt,
-        aspectRatio,
-        imageInputs: [parentUrl],
-        forcedInput,
-      });
+      if (tier === "niche") {
+        seedRes = await runNanoBananaPro({
+          prompt: usedPrompt,
+          aspectRatio,
+          imageInputs: [parentUrl],
+          input: {
+            prompt: usedPrompt,
+            resolution: cfg?.nanoBananaPro?.resolution || "4K",
+            aspect_ratio: aspectRatio,
+            output_format: cfg?.nanoBananaPro?.outputFormat || "jpg",
+            safety_filter_level: cfg?.nanoBananaPro?.safetyFilterLevel || "block_only_high",
+            image_input: [parentUrl],
+          },
+        });
+      } else {
+        seedRes = await runSeedream({
+          prompt: usedPrompt,
+          aspectRatio,
+          imageInputs: [parentUrl],
+          size: cfg?.seadream?.size,
+          enhancePrompt: cfg?.seadream?.enhancePrompt,
+          input: forcedInput,
+        });
+      }
     } finally {
       try {
         chatter?.stop?.();
@@ -1848,7 +1919,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       .eq("mg_record_type", "generation");
 
     try {
-      await refundOnFailure({ supabase, passId, generationId, cost: stillCostForTier(tier), err });
+      await refundOnFailure({ supabase, passId, generationId, cost: stillCost, err });
     } catch (e) {
       console.warn("[mma] refund failed (still tweak)", e?.message || e);
     }
@@ -2356,11 +2427,9 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
     });
 
   const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
-  const tier =
-    readStillTierFromInputs(body?.inputs || {}, "") ||
-    readStillTierFromInputs(parentVars?.inputs || {}, "main");
-
-  await ensureEnoughCredits(passId, stillCostForTier(tier));
+  const tier = resolveStillTierFromInputs(body?.inputs, parentVars);
+  const need = tier === "niche" ? MMA_COSTS.still_niche : MMA_COSTS.still_main;
+  await ensureEnoughCredits(passId, need);
 
   const generationId = newUuid();
 
@@ -2381,6 +2450,9 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
   });
 
   vars.mg_pass_id = passId;
+
+  vars.inputs = { ...(vars.inputs || {}), still_tier: tier };
+  vars.meta = { ...(vars.meta || {}), still_tier: tier };
 
   const sessionId =
     safeStr(body?.sessionId || body?.session_id || body?.inputs?.sessionId || body?.inputs?.session_id, "") ||
@@ -2532,8 +2604,9 @@ export async function handleMmaCreate({ mode, body }) {
   } else if (mode === "video") {
     await ensureEnoughCredits(passId, MMA_COSTS.video);
   } else {
-    const tier = readStillTierFromInputs(body?.inputs || {}, "main");
-    await ensureEnoughCredits(passId, stillCostForTier(tier));
+    const tier = resolveStillTierFromInputs(body?.inputs, null);
+    const need = tier === "niche" ? MMA_COSTS.still_niche : MMA_COSTS.still_main;
+    await ensureEnoughCredits(passId, need);
   }
 
   const generationId = newUuid();
@@ -2553,6 +2626,12 @@ export async function handleMmaCreate({ mode, body }) {
     feedback: body?.feedback || {},
     prompts: body?.prompts || {},
   });
+
+  if (mode === "still") {
+    const tier = resolveStillTierFromInputs(body?.inputs, null);
+    vars.inputs = { ...(vars.inputs || {}), still_tier: tier };
+    vars.meta = { ...(vars.meta || {}), still_tier: tier };
+  }
 
   vars.mg_pass_id = passId;
 
@@ -2708,12 +2787,13 @@ export async function refreshFromReplicate({ generationId, passId }) {
   const predictionId =
     mode === "video"
       ? outputs.kling_prediction_id || outputs.klingPredictionId || ""
-      : outputs.still_prediction_id ||
-        outputs.seedream_prediction_id ||
-        outputs.seedreamPredictionId ||
-        outputs.nanobanana_prediction_id ||
-        outputs.nanobananaPredictionId ||
-        "";
+      : (outputs.still_prediction_id ||
+          outputs.nano_prediction_id ||
+          outputs.seedream_prediction_id ||
+          outputs.stillPredictionId ||
+          outputs.nanoPredictionId ||
+          outputs.seedreamPredictionId ||
+          "");
 
   if (!predictionId) {
     return { ok: false, error: "NO_PREDICTION_ID" };

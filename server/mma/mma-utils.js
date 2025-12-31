@@ -110,6 +110,16 @@ export function makeInitialVars({
   // --------
   const brief = safeString(inputs.brief || inputs.userBrief || inputs.prompt, "");
 
+  // ✅ Still tier (Main vs Niche)
+  const stillTier = safeString(
+    inputs.still_tier ||
+      inputs.stillTier ||
+      inputs.render_tier ||
+      inputs.renderTier ||
+      "",
+    ""
+  );
+
   // Motion brief can come in many forms
   const motionUserBrief = safeString(
     inputs.motion_user_brief ||
@@ -198,6 +208,7 @@ export function makeInitialVars({
     inputs: {
       // ✅ canonical fields your controller reads
       brief,
+      still_tier: stillTier || "main",
 
       motion_user_brief: motionUserBrief,
       selected_movement_style: selectedMovementStyle,

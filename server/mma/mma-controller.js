@@ -237,6 +237,25 @@ function safeArray(x) {
   return Array.isArray(x) ? x : [];
 }
 
+function readStillTierFromInputs(inputs, fallback = "main") {
+  const t = safeStr(
+    inputs?.still_tier ||
+      inputs?.stillTier ||
+      inputs?.render_tier ||
+      inputs?.renderTier ||
+      "",
+    ""
+  )
+    .trim()
+    .toLowerCase();
+
+  return t === "niche" ? "niche" : fallback;
+}
+
+function stillCostForTier(tier) {
+  return tier === "niche" ? 2 : 1; // ✅ niche costs 2 credits
+}
+
 function parseJsonMaybe(v) {
   if (!v) return null;
   if (typeof v === "object") return v;
@@ -850,6 +869,94 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
   };
 }
 
+async function runNanoBanana({ prompt, aspectRatio, imageInputs = [], input: forcedInput }) {
+  const replicate = getReplicate();
+  const cfg = getMmaConfig();
+
+  const version =
+    process.env.MMA_NANOBANANA_VERSION ||
+    process.env.MMA_NANOBANANA_MODEL_VERSION ||
+    cfg?.nanobanana?.model ||
+    "";
+
+  if (!version) throw new Error("MMA_NANOBANANA_VERSION_MISSING");
+
+  const defaultAspect =
+    cfg?.nanobanana?.aspectRatio ||
+    process.env.MMA_NANOBANANA_ASPECT_RATIO ||
+    "match_input_image";
+
+  const resolution =
+    cfg?.nanobanana?.resolution ||
+    process.env.MMA_NANOBANANA_RESOLUTION ||
+    "4K";
+
+  const output_format =
+    cfg?.nanobanana?.outputFormat ||
+    process.env.MMA_NANOBANANA_OUTPUT_FORMAT ||
+    "jpg";
+
+  const safety_filter_level =
+    cfg?.nanobanana?.safetyFilterLevel ||
+    process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL ||
+    "block_only_high";
+
+  const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 14);
+
+  const input = forcedInput
+    ? { ...forcedInput, prompt: forcedInput.prompt || prompt }
+    : {
+        prompt,
+        resolution,
+        aspect_ratio: aspectRatio || defaultAspect,
+        output_format,
+        safety_filter_level,
+        ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
+      };
+
+  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
+  if (!input.resolution) input.resolution = resolution;
+  if (!input.output_format) input.output_format = output_format;
+  if (!input.safety_filter_level) input.safety_filter_level = safety_filter_level;
+  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+
+  const t0 = Date.now();
+
+  const pred = await replicatePredictWithTimeout({
+    replicate,
+    version,
+    input,
+    timeoutMs: REPLICATE_MAX_MS,
+    pollMs: REPLICATE_POLL_MS,
+    callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
+  });
+
+  const prediction = pred.prediction || {};
+  const out = prediction.output;
+
+  return {
+    input,
+    out,
+    prediction_id: pred.predictionId,
+    prediction_status: prediction.status || null,
+    timed_out: !!pred.timedOut,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+    provider: { prediction },
+  };
+}
+
+async function runStillByTier({ tier, prompt, aspectRatio, imageInputs, forcedInput }) {
+  if (tier === "niche") {
+    return runNanoBanana({ prompt, aspectRatio, imageInputs, input: forcedInput });
+  }
+  return runSeedream({ prompt, aspectRatio, imageInputs, input: forcedInput });
+}
+
 // ---- Kling helpers ----
 function pickKlingStartImage(vars, parent) {
   const assets = vars?.assets || {};
@@ -1328,7 +1435,15 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
-  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_still" });
+  let tier = readStillTierFromInputs(working?.inputs || {}, "main");
+  working.inputs = { ...(working.inputs || {}), still_tier: tier };
+
+  await chargeGeneration({
+    passId,
+    generationId,
+    cost: stillCostForTier(tier),
+    reason: tier === "niche" ? "mma_still_niche" : "mma_still",
+  });
 
   const ctx = await getMmaCtxConfig(supabase);
   let chatter = null;
@@ -1470,15 +1585,20 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
 
     let seedRes;
     try {
-      seedRes = await runSeedream({
+      seedRes = await runStillByTier({
+        tier,
         prompt: usedPrompt,
         aspectRatio,
         imageInputs,
-        size: cfg?.seadream?.size,
-        enhancePrompt: cfg?.seadream?.enhancePrompt,
       });
-      // ✅ store prediction id for recovery later
-      working.outputs = { ...(working.outputs || {}), seedream_prediction_id: seedRes.prediction_id || null };
+
+      working.outputs = { ...(working.outputs || {}) };
+      working.outputs.still_provider = tier === "niche" ? "nanobanana" : "seedream";
+      working.outputs.still_prediction_id = seedRes.prediction_id || null;
+
+      if (tier === "niche") working.outputs.nanobanana_prediction_id = seedRes.prediction_id || null;
+      else working.outputs.seedream_prediction_id = seedRes.prediction_id || null;
+
       await updateVars({ supabase, generationId, vars: working });
     } finally {
       try {
@@ -1533,7 +1653,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       .eq("mg_record_type", "generation");
 
     try {
-      await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.still, err });
+      await refundOnFailure({ supabase, passId, generationId, cost: stillCostForTier(tier), err });
     } catch (e) {
       console.warn("[mma] refund failed (still create)", e?.message || e);
     }
@@ -1552,7 +1672,15 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
   let working = vars;
 
-  await chargeGeneration({ passId, generationId, cost: MMA_COSTS.still, reason: "mma_still" });
+  let tier = readStillTierFromInputs(working?.inputs || {}, "main");
+  working.inputs = { ...(working.inputs || {}), still_tier: tier };
+
+  await chargeGeneration({
+    passId,
+    generationId,
+    cost: stillCostForTier(tier),
+    reason: tier === "niche" ? "mma_still_niche" : "mma_still",
+  });
 
   const ctx = await getMmaCtxConfig(supabase);
   let chatter = null;
@@ -1638,25 +1766,34 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       process.env.MMA_SEADREAM_ASPECT_RATIO ||
       "match_input_image";
 
-    const forcedInput = {
-      prompt: usedPrompt,
-      size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
-      aspect_ratio: aspectRatio,
-      enhance_prompt: !!cfg?.seadream?.enhancePrompt,
-      sequential_image_generation: "disabled",
-      max_images: 1,
-      image_input: [parentUrl],
-    };
+    const forcedInput =
+      tier === "niche"
+        ? {
+            prompt: usedPrompt,
+            resolution: cfg?.nanobanana?.resolution || "4K",
+            aspect_ratio: aspectRatio,
+            output_format: cfg?.nanobanana?.outputFormat || "jpg",
+            safety_filter_level: cfg?.nanobanana?.safetyFilterLevel || "block_only_high",
+            image_input: [parentUrl],
+          }
+        : {
+            prompt: usedPrompt,
+            size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
+            aspect_ratio: aspectRatio,
+            enhance_prompt: !!cfg?.seadream?.enhancePrompt,
+            sequential_image_generation: "disabled",
+            max_images: 1,
+            image_input: [parentUrl],
+          };
 
     let seedRes;
     try {
-      seedRes = await runSeedream({
+      seedRes = await runStillByTier({
+        tier,
         prompt: usedPrompt,
         aspectRatio,
         imageInputs: [parentUrl],
-        size: cfg?.seadream?.size,
-        enhancePrompt: cfg?.seadream?.enhancePrompt,
-        input: forcedInput,
+        forcedInput,
       });
     } finally {
       try {
@@ -1711,7 +1848,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       .eq("mg_record_type", "generation");
 
     try {
-      await refundOnFailure({ supabase, passId, generationId, cost: MMA_COSTS.still, err });
+      await refundOnFailure({ supabase, passId, generationId, cost: stillCostForTier(tier), err });
     } catch (e) {
       console.warn("[mma] refund failed (still tweak)", e?.message || e);
     }
@@ -2218,7 +2355,12 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
       email: body?.email,
     });
 
-  await ensureEnoughCredits(passId, MMA_COSTS.still);
+  const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
+  const tier =
+    readStillTierFromInputs(body?.inputs || {}, "") ||
+    readStillTierFromInputs(parentVars?.inputs || {}, "main");
+
+  await ensureEnoughCredits(passId, stillCostForTier(tier));
 
   const generationId = newUuid();
 
@@ -2232,7 +2374,7 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
     mode: "still",
     assets: body?.assets || {},
     history: body?.history || {},
-    inputs: body?.inputs || {},
+    inputs: { ...(body?.inputs || {}), still_tier: tier },
     settings: body?.settings || {},
     feedback: body?.feedback || {},
     prompts: body?.prompts || {},
@@ -2387,8 +2529,11 @@ export async function handleMmaCreate({ mode, body }) {
 
   if (mode === "video" && suggestOnly && typeForMe) {
     await preflightTypeForMe({ supabase, passId });
+  } else if (mode === "video") {
+    await ensureEnoughCredits(passId, MMA_COSTS.video);
   } else {
-    await ensureEnoughCredits(passId, mode === "video" ? MMA_COSTS.video : MMA_COSTS.still);
+    const tier = readStillTierFromInputs(body?.inputs || {}, "main");
+    await ensureEnoughCredits(passId, stillCostForTier(tier));
   }
 
   const generationId = newUuid();
@@ -2563,7 +2708,12 @@ export async function refreshFromReplicate({ generationId, passId }) {
   const predictionId =
     mode === "video"
       ? outputs.kling_prediction_id || outputs.klingPredictionId || ""
-      : outputs.seedream_prediction_id || outputs.seedreamPredictionId || "";
+      : outputs.still_prediction_id ||
+        outputs.seedream_prediction_id ||
+        outputs.seedreamPredictionId ||
+        outputs.nanobanana_prediction_id ||
+        outputs.nanobananaPredictionId ||
+        "";
 
   if (!predictionId) {
     return { ok: false, error: "NO_PREDICTION_ID" };

@@ -1056,13 +1056,22 @@ async function runKling({
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
-  const version =
+    // pick model version from env/config (default v2.1)
+  let version =
     process.env.MMA_KLING_VERSION ||
     process.env.MMA_KLING_MODEL_VERSION ||
     cfg?.kling?.model ||
     "kwaivgi/kling-v2.1";
 
+  // ✅ FORCE v2.1 when an end frame is provided (2-image motion)
+  // Kling v2.6 schema does NOT support end_image, so we must use v2.1.
+  const hasEndFrame = !!asHttpUrl(endImage);
+  if (hasEndFrame) {
+    version = process.env.MMA_KLING_V21_MODEL || "kwaivgi/kling-v2.1";
+  }
+
   const is26 = /kling[-_/]?v2\.6/i.test(String(version));
+
 
   // v2.6: duration must be 5 or 10
   const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
@@ -2140,9 +2149,14 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       ""
     );
 
+    const ALLOW_PROMPT_OVERRIDE =
+    String(process.env.MMA_ALLOW_PROMPT_OVERRIDE || "false").toLowerCase() === "true";
+      
     const usePromptOverride =
+      ALLOW_PROMPT_OVERRIDE &&
       (working?.inputs?.use_prompt_override === true || working?.inputs?.usePromptOverride === true) &&
       !!promptOverride;
+
 
     working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
     if (endImage) working.inputs.end_image_url = endImage;

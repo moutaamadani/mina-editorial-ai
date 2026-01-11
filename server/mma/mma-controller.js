@@ -1227,7 +1227,7 @@ async function storeRemoteToR2Public(url, keyPrefix) {
 const MMA_COSTS = {
   still_main: 1,
   still_niche: 2,
-  video: 5,
+  video: 10,
   typeForMePer: 10,
   typeForMeCharge: 1,
 };

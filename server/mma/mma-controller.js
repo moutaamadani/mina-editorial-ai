@@ -370,13 +370,13 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     still_one_shot: [
-      "understand the user brief and give one line prompt describing the image (dont tell him use the reference for no describe how the image exactly gonna be at the end he will use the refernce on his own dont tell him that), if users didnt give you verb like remove or make or something it means he want to do modificatoin on the exisiting image start with create an image of .., dont describe the light ever, ..",
+      "understand the user brief and give a detailed prompt describing the image (dont tell him use the reference for .. no thats your role in inderstanding the user brief and images that he upload and descide how the end image should look and you start descibing it in depth material, texture, ), start with create an image of .., dont describe the light ever, ..",
       "",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"clean_prompt": string}',
       "",
       "SAFETY:",
-      "- if the brief tells you to make it 4k, remove or change something your prompt should be only that. ",
+      "- if the brief tells you to make it 4k, your prompt should be only that. ",
     ].join("\n"),
 
     still_tweak_one_shot: [

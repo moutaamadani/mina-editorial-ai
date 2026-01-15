@@ -946,7 +946,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
     process.env.MMA_SEADREAM_VERSION ||
     process.env.MMA_SEADREAM_MODEL_VERSION ||
     cfg?.seadream?.model ||
-    "bytedance/seedream-4";
+    "bytedance/seedream-4.5";
 
   const neg =
     process.env.NEGATIVE_PROMPT_SEADREAM ||
@@ -958,7 +958,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
 
   const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 10);
 
-  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K";
+  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "4K";
   const defaultAspect =
     cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
 
@@ -967,7 +967,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
   // ✅ If you set MMA_SEADREAM_VERSION=prunaai/z-image-turbo, use width/height with a numeric ratio
   const isZImageTurbo = /z-image-turbo/i.test(String(version));
 
-  const BASE = Number(process.env.MMA_SEADREAM_BASE_PX || 1024) || 1024;
+  const BASE = Number(process.env.MMA_SEADREAM_BASE_PX || 2048) || 2048;
 
   function parseAspectToNumber(s) {
     const x = String(s || "").trim().toLowerCase();

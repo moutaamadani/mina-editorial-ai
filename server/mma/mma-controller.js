@@ -927,7 +927,7 @@ const REPLICATE_MAX_MS = Number(process.env.MMA_REPLICATE_MAX_MS || 240000) || 2
 // ✅ Nano Banana can be slow. Give it its own timeout.
 // Set on Render if you want:
 // MMA_REPLICATE_MAX_MS_NANOBANANA=900000   (15 min)
-// MMA_REPLICATE_MAX_MS_NANOBANANA=720000   (12 min)
+// MMA_REPLICATE_MAX_MS_NANOBANANA=900000   (12 min)
 const REPLICATE_MAX_MS_NANOBANANA =
   Number(process.env.MMA_REPLICATE_MAX_MS_NANOBANANA || 900000) || 900000;
 

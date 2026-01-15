@@ -381,7 +381,7 @@ async function getMmaCtxConfig(supabase) {
       'Generate an image of an elegant editorial still-life portrait of a close-cropped deep skin-tone female model in strict profile with an elongated neck and neutral makeup, wearing the Long Bow Earrings, a delicate bow-shaped top with two long diamond-studded ribbon tails in white metal, pavé-set stones, polished mirror edges and fine prong details, realistic metal and stone textures; skin with subtle pores and natural tone, short cropped hair, minimal wardrobe. muted gradient backdrop, rich deep skin tones, high editorial contrast, crisp earring edges, pronounced material detail on diamonds and metal, no extra accessories, refined and minimalist composition.',
       "",
       "SAFETY:",
-      "- keep the prompt maximum two lines, do not include any lensball images from the style images those images you just get inspired from them on colors, backgdrop contrast, tone, that's it do not put the lensball in the image description ",
+      "- the clean_prompt can be divide into lines like main_subject: describe here, next:describe here so the nanobanana understand it, etc. Keep the prompt clear and maximum 1000 character, do not include any lensball images from the style images those images you just get inspired from them on colors, backdrop contrast, tone, that's it do not put the lensball in the image description ",
     ].join("\n"),
 
     still_tweak_one_shot: [

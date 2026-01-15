@@ -937,13 +937,10 @@ const REPLICATE_CALL_TIMEOUT_MS = Number(process.env.MMA_REPLICATE_CALL_TIMEOUT_
 const REPLICATE_CANCEL_ON_TIMEOUT =
   String(process.env.MMA_REPLICATE_CANCEL_ON_TIMEOUT || "false").toLowerCase() === "true";
 
+// REPLACE the whole runSeedream() function with this one
 async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhancePrompt, input: forcedInput }) {
   const replicate = getReplicate();
   const cfg = getMmaConfig();
-
-  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K";
-  const defaultAspect =
-    cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
 
   const version =
     process.env.MMA_SEADREAM_VERSION ||
@@ -961,6 +958,100 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
 
   const cleanedInputs = safeArray(imageInputs).map(asHttpUrl).filter(Boolean).slice(0, 10);
 
+  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K";
+  const defaultAspect =
+    cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
+
+  const arRaw = safeStr(aspectRatio, "") || safeStr(defaultAspect, "") || "match_input_image";
+
+  // ✅ If you set MMA_SEADREAM_VERSION=prunaai/z-image-turbo, use width/height with a numeric ratio
+  const isZImageTurbo = /z-image-turbo/i.test(String(version));
+
+  const BASE = Number(process.env.MMA_SEADREAM_BASE_PX || 1024) || 1024;
+
+  function parseAspectToNumber(s) {
+    const x = String(s || "").trim().toLowerCase();
+    // numeric already?
+    const asNum = Number.parseFloat(x);
+    if (Number.isFinite(asNum) && asNum > 0) return asNum;
+
+    // "16:9"
+    const m = x.match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+    if (m) {
+      const w = Number(m[1]);
+      const h = Number(m[2]);
+      if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) return w / h;
+    }
+
+    return null;
+  }
+
+  async function tryGetRemoteImageRatio(url) {
+    // best-effort: fetch a small chunk + parse PNG/JPEG headers
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 7000);
+
+      const res = await fetch(url, {
+        signal: ctrl.signal,
+        headers: { Range: "bytes=0-4095" },
+      }).catch(() => null);
+
+      clearTimeout(t);
+      if (!res || !res.ok) return null;
+
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 24) return null;
+
+      // PNG: signature + IHDR
+      const pngSig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      if (buf.slice(0, 8).equals(pngSig)) {
+        // width @ 16, height @ 20
+        const w = buf.readUInt32BE(16);
+        const h = buf.readUInt32BE(20);
+        if (w > 0 && h > 0) return w / h;
+      }
+
+      // JPEG: scan for SOF marker
+      if (buf[0] === 0xff && buf[1] === 0xd8) {
+        let i = 2;
+        while (i + 9 < buf.length) {
+          if (buf[i] !== 0xff) { i++; continue; }
+          const marker = buf[i + 1];
+          // SOF0/SOF2 etc
+          if (
+            marker === 0xc0 || marker === 0xc1 || marker === 0xc2 ||
+            marker === 0xc3 || marker === 0xc5 || marker === 0xc6 ||
+            marker === 0xc7 || marker === 0xc9 || marker === 0xca ||
+            marker === 0xcb || marker === 0xcd || marker === 0xce || marker === 0xcf
+          ) {
+            const h = buf.readUInt16BE(i + 5);
+            const w = buf.readUInt16BE(i + 7);
+            if (w > 0 && h > 0) return w / h;
+            return null;
+          }
+          const len = buf.readUInt16BE(i + 2);
+          if (!len || len < 2) break;
+          i += 2 + len;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolveRatioNumber() {
+    const lower = String(arRaw || "").toLowerCase();
+    if (lower.includes("match") && cleanedInputs.length) {
+      const r = await tryGetRemoteImageRatio(cleanedInputs[0]);
+      if (r) return r;
+      return 1; // fallback
+    }
+    return parseAspectToNumber(arRaw) || 1;
+  }
+
   const enhance_prompt =
     enhancePrompt !== undefined
       ? enhancePrompt
@@ -968,28 +1059,52 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
         ? !!cfg.seadream.enhancePrompt
         : true;
 
-  const input = forcedInput
-    ? { ...forcedInput, prompt: forcedInput.prompt || finalPrompt }
-    : {
-        prompt: finalPrompt,
-        size: sizeValue,
-        aspect_ratio: aspectRatio || defaultAspect,
-        enhance_prompt,
-        sequential_image_generation: "disabled",
-        max_images: 1,
-        ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
-      };
+  let input;
+  if (forcedInput) {
+    input = { ...forcedInput, prompt: forcedInput.prompt || finalPrompt };
+  } else if (isZImageTurbo) {
+    // ✅ numeric ratio -> width/height with base 1024
+    const ratio = await resolveRatioNumber();
 
-  if (!input.aspect_ratio) input.aspect_ratio = aspectRatio || defaultAspect;
-  if (!input.size) input.size = sizeValue;
-  if (input.enhance_prompt === undefined) input.enhance_prompt = enhance_prompt;
-  if (!input.sequential_image_generation) input.sequential_image_generation = "disabled";
-  if (!input.max_images) input.max_images = 1;
-  if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+    let width = BASE;
+    let height = BASE;
+
+    if (ratio >= 1) {
+      width = BASE;
+      height = Math.max(64, Math.round(BASE / ratio));
+    } else {
+      height = BASE;
+      width = Math.max(64, Math.round(BASE * ratio));
+    }
+
+    input = {
+      prompt: finalPrompt,
+      width,
+      height,
+      ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
+    };
+  } else {
+    // ✅ normal Seedream schema
+    input = {
+      prompt: finalPrompt,
+      size: sizeValue,
+      aspect_ratio: arRaw || defaultAspect,
+      enhance_prompt,
+      sequential_image_generation: "disabled",
+      max_images: 1,
+      ...(cleanedInputs.length ? { image_input: cleanedInputs } : {}),
+    };
+
+    if (!input.aspect_ratio) input.aspect_ratio = arRaw || defaultAspect;
+    if (!input.size) input.size = sizeValue;
+    if (input.enhance_prompt === undefined) input.enhance_prompt = enhance_prompt;
+    if (!input.sequential_image_generation) input.sequential_image_generation = "disabled";
+    if (!input.max_images) input.max_images = 1;
+    if (!input.image_input && cleanedInputs.length) input.image_input = cleanedInputs;
+  }
 
   const t0 = Date.now();
 
-  // ✅ Use predictions + poll (prevents “never stops”)
   const pred = await replicatePredictWithTimeout({
     replicate,
     version,
@@ -1005,7 +1120,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
 
   return {
     input,
-    out, // what pickFirstUrl reads
+    out,
     prediction_id: pred.predictionId,
     prediction_status: prediction.status || null,
     timed_out: !!pred.timedOut,
@@ -1017,6 +1132,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
     provider: { prediction },
   };
 }
+
 
 // ---- Kling helpers ----
 function pickKlingStartImage(vars, parent) {

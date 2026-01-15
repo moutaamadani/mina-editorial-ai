@@ -381,7 +381,7 @@ async function getMmaCtxConfig(supabase) {
       'Generate an image of an elegant editorial still-life portrait of a close-cropped deep skin-tone female model in strict profile with an elongated neck and neutral makeup, wearing the Long Bow Earrings, a delicate bow-shaped top with two long diamond-studded ribbon tails in white metal, pavé-set stones, polished mirror edges and fine prong details, realistic metal and stone textures; skin with subtle pores and natural tone, short cropped hair, minimal wardrobe. muted gradient backdrop, rich deep skin tones, high editorial contrast, crisp earring edges, pronounced material detail on diamonds and metal, no extra accessories, refined and minimalist composition.',
       "",
       "SAFETY:",
-      "- aim for prompt that read like a creative brief rather than a run-on sentence, “maximum clarity” is needed 2 lines are enough, do not include any lensball images from the style images those images you just get inspired from them on colors, backgdrop contrast, tone, that's it do not put the lensball in the image description ",
+      "- if user say replace or keep try to understand which image asthetic and composition he likes and try to just replace his new subjact in the inspration image tone, light, composition, you can add at the end keep same asthetic of the inspiration if you feel need it. Aim for prompt that read like a creative brief rather than a run-on sentence, “maximum clarity” is needed 2 lines are enough, do not include any lensball images from the style images those images you just get inspired from them on colors, backgdrop contrast, tone, that's it do not put the lensball in the image description ",
     ].join("\n"),
 
     still_tweak_one_shot: [

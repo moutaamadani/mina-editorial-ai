@@ -967,7 +967,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
   // ✅ If you set MMA_SEADREAM_VERSION=prunaai/z-image-turbo, use width/height with a numeric ratio
   const isZImageTurbo = /z-image-turbo/i.test(String(version));
 
-  const BASE = Number(process.env.MMA_SEADREAM_BASE_PX || 2048) || 2048;
+  const BASE = Number(process.env.MMA_SEADREAM_BASE_PX || 1024) || 1024;
 
   function parseAspectToNumber(s) {
     const x = String(s || "").trim().toLowerCase();

@@ -683,12 +683,25 @@ async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
 
 function pickFirstUrl(output) {
   const seen = new Set();
-  const isUrl = (s) => typeof s === "string" && /^https?:\/\//i.test(s);
+
+  const isUrl = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
 
   const walk = (v) => {
     if (!v) return "";
-    if (typeof v === "string") return isUrl(v) ? v : "";
 
+    // ✅ direct string URL
+    if (typeof v === "string") return isUrl(v) ? v.trim() : "";
+
+    // ✅ Replicate FileOutput (ReadableStream) can expose URL via url()
+    // (FileOutput objects have .url() per Replicate docs) :contentReference[oaicite:2]{index=2}
+    if (v && typeof v === "object" && typeof v.url === "function") {
+      try {
+        const u = v.url();
+        if (isUrl(u)) return u.trim();
+      } catch {}
+    }
+
+    // ✅ arrays
     if (Array.isArray(v)) {
       for (const item of v) {
         const u = walk(item);
@@ -697,6 +710,7 @@ function pickFirstUrl(output) {
       return "";
     }
 
+    // ✅ objects
     if (typeof v === "object") {
       if (seen.has(v)) return "";
       seen.add(v);
@@ -705,6 +719,8 @@ function pickFirstUrl(output) {
         "url",
         "output",
         "outputs",
+        "image",
+        "images",
         "video",
         "video_url",
         "videoUrl",

@@ -3226,8 +3226,28 @@ export function createMmaController() {
       .maybeSingle();
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = toUserStatus(data?.mg_mma_status || "queued");
+    const internal = String(data?.mg_mma_status || "queued");
+    const statusText = toUserStatus(internal);
 
+    // ✅ Register client first so sendStatus/sendDone hit THIS connection too
+    registerSseClient(req.params.generation_id, res, { scanLines, status: statusText });
+
+    // ✅ If it's already finished (done/error/suggested), immediately emit DONE then close
+    const TERMINAL = new Set(["done", "error", "suggested"]);
+    if (TERMINAL.has(internal)) {
+      try {
+        // sendStatus uses your existing SSE format
+        sendStatus(req.params.generation_id, statusText);
+        // sendDone is what your frontend should listen to to stop "Creating..."
+        sendDone(req.params.generation_id, statusText);
+      } catch {}
+      try {
+        res.end();
+      } catch {}
+      return;
+    }
+
+    // Normal keepalive for running generations only
     const keepAlive = setInterval(() => {
       try {
         res.write(`:keepalive\n\n`);
@@ -3235,7 +3255,6 @@ export function createMmaController() {
     }, 25000);
 
     res.on("close", () => clearInterval(keepAlive));
-    registerSseClient(req.params.generation_id, res, { scanLines, status });
   });
 
   router.get("/admin/mma/errors", async (_req, res) => {

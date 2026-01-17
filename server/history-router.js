@@ -30,6 +30,38 @@ function safeString(v, fallback = "") {
   return t ? t : fallback;
 }
 
+function tryParseJson(v) {
+  if (!v) return null;
+  if (typeof v === "object") return v;
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (!s) return null;
+  if (!(s.startsWith("{") || s.startsWith("["))) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+// IMPORTANT: send only what Profile needs (inputs + assets), remove outputs (provider stuff)
+function sanitizeMmaVarsForClient(rawVars) {
+  const vars = tryParseJson(rawVars) ?? rawVars ?? null;
+  if (!vars || typeof vars !== "object") return null;
+
+  return {
+    meta: vars.meta ?? null,
+    mode: vars.mode ?? null,
+    inputs: vars.inputs ?? null,
+    assets: vars.assets ?? null,
+    history: vars.history ?? null,
+    feedback: vars.feedback ?? null,
+    settings: vars.settings ?? null,
+    version: vars.version ?? null,
+    // intentionally NOT sending vars.outputs / vars.userMessages / etc
+  };
+}
+
 // Keep pass:* untouched.
 // If you receive a legacy anon-short id (uuid only), normalize it to pass:anon:<uuid>.
 function normalizePassId(raw) {
@@ -157,7 +189,7 @@ router.get("/history/pass/:passId", async (req, res) => {
     const { data, error } = await supabase
       .from("mega_generations")
       .select(
-        "mg_id, mg_record_type, mg_pass_id, mg_generation_id, mg_session_id, mg_platform, mg_title, mg_type, mg_prompt, mg_output_url, mg_created_at, mg_meta, mg_content_type, mg_mma_mode"
+        "mg_id, mg_record_type, mg_pass_id, mg_generation_id, mg_session_id, mg_platform, mg_title, mg_type, mg_prompt, mg_output_url, mg_created_at, mg_meta, mg_payload, mg_mma_vars, mg_content_type, mg_mma_mode"
       )
       .in("mg_pass_id", passIds)
       .in("mg_record_type", ["generation", "feedback", "session"])
@@ -193,6 +225,9 @@ router.get("/history/pass/:passId", async (req, res) => {
         outputUrl: String(r.mg_output_url || ""),
         createdAt: String(r.mg_created_at || nowIso()),
         meta: r.mg_meta ?? null,
+
+        // ✅ Profile needs this to show the real user brief:
+        mg_mma_vars: sanitizeMmaVarsForClient(r.mg_mma_vars),
       }));
 
     const feedbacks = rows

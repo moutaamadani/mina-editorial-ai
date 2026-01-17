@@ -1739,17 +1739,28 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       .slice(0, 4);
 
     const labeledImages = []
-      .concat(productUrl ? [{ role: "PRODUCT", url: productUrl }] : [])
-      .concat(logoUrl ? [{ role: "LOGO", url: logoUrl }] : [])
-      .concat(inspUrlsForGpt.map((u, i) => ({ role: `INSPIRATION_${i + 1}`, url: u })))
+      // Product pill -> Scene / Composition reference
+      .concat(productUrl ? [{ role: "SCENE / COMPOSITION / ASTHETIC / VIBE / STYLE", url: productUrl }] : [])
+
+      // Logo pill -> Logo / Label / Icon / Text reference
+      .concat(logoUrl ? [{ role: "LOGO / LABEL / ICON / TEXT / DESIGN", url: logoUrl }] : [])
+
+      // Inspiration pill -> Product / Element / Texture / Material references
+      .concat(
+        inspUrlsForGpt.map((u, i) => ({
+          role: `PRODUCT / ELEMENT / TEXTURE / MATERIAL ${i + 1}`,
+          url: u,
+        }))
+      )
       .slice(0, 10);
+
 
     const oneShotInput = {
       user_brief: safeStr(working?.inputs?.brief || working?.inputs?.userBrief, ""),
       style: safeStr(working?.inputs?.style, ""),
       preferences: preferences || {},
       hard_blocks: safeArray(preferences?.hard_blocks),
-      notes: "Write a clean still-image prompt using the labeled images as references.",
+      notes: "Write a clean image prompt using the labeled images as references.",
     };
 
     const t0 = Date.now();

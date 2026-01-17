@@ -388,7 +388,7 @@ async function getMmaCtxConfig(supabase) {
 
   "SAFETY AND CONSTRAINTS:",
   "Maximum one-line prompt. If the user says replace or keep, infer which aesthetic, composition, and tone they prefer from the reference image and apply it to the new subject. Start with 'Generate an image where you replace …'. The prompt should read like a clear creative brief, not a run-on sentence. Two lines maximum if absolutely necessary. Do not include lensball objects in the description."
-].join(\"\\n\")
+].join("\n")
 
 
     still_tweak_one_shot: [

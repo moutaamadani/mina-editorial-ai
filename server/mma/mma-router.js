@@ -15,7 +15,6 @@ import {
   listSteps,
   refreshFromReplicate,
   registerSseClient,
-  toUserStatus,
 } from "./mma-controller.js";
 import { getSupabaseAdmin } from "../../supabase.js";
 import { megaEnsureCustomer, resolvePassId as megaResolvePassId } from "../../mega-db.js";
@@ -181,7 +180,7 @@ router.get("/stream/:generation_id", async (req, res) => {
     }
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = toUserStatus(data?.mg_mma_status || "queued"); // ✅ friendly status text
+    const status = String(data?.mg_mma_status || "queued");
 
     const keepAlive = setInterval(() => {
       try {

@@ -320,8 +320,7 @@ function lastScanLine(vars, fallbackText = "") {
 }
 
 function emitStatus(generationId, internalStatus) {
-  // ✅ never leak internal status to UI
-  sendStatus(generationId, toUserStatus(internalStatus));
+  sendStatus(generationId, String(internalStatus || ""));
 }
 
 function emitLine(generationId, vars, fallbackText = "") {
@@ -1588,7 +1587,7 @@ function buildInsufficientCreditsDetails({ balance, needed, lane }) {
     balance: bal,
     needed: need,
     lane: requestedLane,
-    costs: { still_main: MMA_COSTS.still_main, still_niche: MMA_COSTS.still_niche, video: MMA_COSTS.video },
+    costs: { still_main: MMA_COSTS.still_main, still_niche: MMA_COSTS.still_niche, video: need },
     canSwitchToMain,
     actions,
   };
@@ -2146,7 +2145,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
-    sendDone(generationId, toUserStatus("done"));
+    sendDone(generationId, "done");
   } catch (err) {
     try {
       chatter?.stop?.();
@@ -2172,7 +2171,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     }
 
     emitStatus(generationId, "error");
-    sendDone(generationId, toUserStatus("error"));
+    sendDone(generationId, "error");
   }
 }
 
@@ -2365,7 +2364,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
-    sendDone(generationId, toUserStatus("done"));
+    sendDone(generationId, "done");
   } catch (err) {
     try {
       chatter?.stop?.();
@@ -2391,7 +2390,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     }
 
     emitStatus(generationId, "error");
-    sendDone(generationId, toUserStatus("error"));
+    sendDone(generationId, "error");
   }
 }
 
@@ -2413,6 +2412,11 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     inputs0.typeForMe === true ||
     inputs0.use_suggestion === true ||
     inputs0.useSuggestion === true;
+  const frame2 = resolveFrame2Reference(inputs0, working?.assets);
+
+  if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
+    throw makeHttpError(400, "MISSING_FRAME2_DURATION_SEC");
+  }
 
   if (!suggestOnly) {
     videoCost = videoCostFromInputs(inputs0, working?.assets);
@@ -2436,7 +2440,6 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO");
 
     const pricing = resolveVideoPricing(inputs0, working?.assets);
-    const frame2 = resolveFrame2Reference(inputs0, working?.assets);
 
     // ✅ only bypass GPT for fabric (prompt not used there)
     // motion-control can still benefit from GPT prompt
@@ -2566,7 +2569,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       }
 
       emitStatus(generationId, "suggested");
-      sendDone(generationId, toUserStatus("suggested"));
+      sendDone(generationId, "suggested");
       return;
     }
 
@@ -2721,7 +2724,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
-    sendDone(generationId, toUserStatus("done"));
+    sendDone(generationId, "done");
   } catch (err) {
     try {
       chatter?.stop?.();
@@ -2749,7 +2752,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     }
 
     emitStatus(generationId, "error");
-    sendDone(generationId, toUserStatus("error"));
+    sendDone(generationId, "error");
   }
 }
 
@@ -2767,7 +2770,13 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
   const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
   const mergedInputs0 = { ...(parentVars?.inputs || {}), ...(working?.inputs || {}) };
   const mergedAssets0 = { ...(parentVars?.assets || {}), ...(working?.assets || {}) };
+  const pricing = resolveVideoPricing(mergedInputs0, mergedAssets0);
+  const frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
   const videoCost = videoCostFromInputs(mergedInputs0, mergedAssets0);
+
+  if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
+    throw makeHttpError(400, "MISSING_FRAME2_DURATION_SEC");
+  }
 
   await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
 
@@ -2907,17 +2916,46 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     // ✅ 2 frames => force mute
     if (asHttpUrl(endImage)) generateAudio = false;
 
-    let klingRes;
+    let genRes;
+    let stepType = "kling_generate_tweak";
     try {
-      klingRes = await runKling({
-        prompt: finalMotionPrompt,
-        startImage,
-        endImage,
-        duration,
-        mode,
-        negativePrompt: neg,
-        generateAudio,
-      });
+      if (pricing.flow === "kling_motion_control") {
+        if (!frame2?.url) throw new Error("MISSING_FRAME2_VIDEO_URL");
+
+        genRes = await runKlingMotionControl({
+          prompt: finalMotionPrompt,
+          image: startImage,
+          video: frame2.url,
+          mode: safeStr(mergedInputs0?.mode || mergedInputs0?.kmc_mode, "") || "std",
+          keepOriginalSound: mergedInputs0?.keep_original_sound ?? mergedInputs0?.keepOriginalSound ?? true,
+          characterOrientation:
+            safeStr(mergedInputs0?.character_orientation || mergedInputs0?.characterOrientation, "") || "video",
+        });
+
+        stepType = "kling_motion_control_generate_tweak";
+      } else if (pricing.flow === "fabric_audio") {
+        if (!frame2?.url) throw new Error("MISSING_FRAME2_AUDIO_URL");
+
+        genRes = await runFabricAudio({
+          image: startImage,
+          audio: frame2.url,
+          resolution: safeStr(mergedInputs0?.resolution || mergedInputs0?.fabric_resolution, "") || "720p",
+        });
+
+        stepType = "fabric_generate_tweak";
+      } else {
+        genRes = await runKling({
+          prompt: finalMotionPrompt,
+          startImage,
+          endImage,
+          duration,
+          mode,
+          negativePrompt: neg,
+          generateAudio,
+        });
+
+        stepType = "kling_generate_tweak";
+      }
     } finally {
       try {
         chatter?.stop?.();
@@ -2925,14 +2963,14 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       chatter = null;
     }
 
-    const { input, out, timing } = klingRes;
+    const { input, out, timing } = genRes;
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "kling_generate_tweak",
+      stepType,
       payload: { input, output: out, timing, error: null },
     });
 
@@ -2952,7 +2990,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
-    sendDone(generationId, toUserStatus("done"));
+    sendDone(generationId, "done");
   } catch (err) {
     try {
       chatter?.stop?.();
@@ -2978,7 +3016,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     }
 
     emitStatus(generationId, "error");
-    sendDone(generationId, toUserStatus("error"));
+    sendDone(generationId, "error");
   }
 }
 
@@ -3357,7 +3395,13 @@ export async function refreshFromReplicate({ generationId, passId }) {
 
   const predictionId =
     mode === "video"
-      ? outputs.kling_prediction_id || outputs.klingPredictionId || ""
+      ? outputs.kling_motion_control_prediction_id ||
+        outputs.klingMotionControlPredictionId ||
+        outputs.fabric_prediction_id ||
+        outputs.fabricPredictionId ||
+        outputs.kling_prediction_id ||
+        outputs.klingPredictionId ||
+        ""
       : outputs.nanobanana_prediction_id ||
         outputs.nanobananaPredictionId ||
         outputs.seedream_prediction_id ||
@@ -3604,7 +3648,7 @@ export function createMmaController() {
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
     const internal = String(data?.mg_mma_status || "queued");
-    const statusText = toUserStatus(internal);
+    const statusText = internal;
 
     // ✅ Register client first so sendStatus/sendDone hit THIS connection too
     registerSseClient(req.params.generation_id, res, { scanLines, status: statusText });

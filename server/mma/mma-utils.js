@@ -95,6 +95,23 @@ export function makeInitialVars({
       assets.styleHeroUrl
   );
 
+  // ✅ Frame2 reference media (audio/video) — KEEP IT (controller needs it)
+  const frame2AudioUrl = asStrOrNull(
+    assets.frame2_audio_url ||
+      assets.frame2AudioUrl ||
+      assets.audio_url ||
+      assets.audioUrl ||
+      assets.audio
+  );
+
+  const frame2VideoUrl = asStrOrNull(
+    assets.frame2_video_url ||
+      assets.frame2VideoUrl ||
+      assets.video_url ||
+      assets.videoUrl ||
+      assets.video
+  );
+
   // Kling reference images (optional, besides start/end)
   const klingUrls = []
     .concat(asArray(assets.kling_images))
@@ -174,6 +191,15 @@ export function makeInitialVars({
       style_image_urls: inspirationUrls,
 
       style_hero_image_url: styleHeroUrl,
+
+      // ✅ keep ref media for video flows
+      audio: frame2AudioUrl,
+      audio_url: frame2AudioUrl,
+      frame2_audio_url: frame2AudioUrl,
+
+      video: frame2VideoUrl,
+      video_url: frame2VideoUrl,
+      frame2_video_url: frame2VideoUrl,
 
       // Kling helpers
       kling_image_urls: klingUrls,

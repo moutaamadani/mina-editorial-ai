@@ -233,6 +233,19 @@ function asHttpUrl(u) {
   return s.startsWith("http") ? s : "";
 }
 
+function resolveFrame2Reference(inputsLike, assetsLike) {
+  const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
+
+  const kind = safeStr(inputs.frame2_kind || inputs.frame2Kind || "", "").toLowerCase();
+  const url = asHttpUrl(inputs.frame2_url || inputs.frame2Url || "");
+  const dur = Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) || 0;
+
+  if (kind === "video" && url) return { kind: "ref_video", url, rawDurationSec: dur, maxSec: 30 };
+  if (kind === "audio" && url) return { kind: "ref_audio", url, rawDurationSec: dur, maxSec: 60 };
+
+  return { kind: null, url: "", rawDurationSec: 0, maxSec: 0 };
+}
+
 function safeArray(x) {
   return Array.isArray(x) ? x : [];
 }
@@ -1312,6 +1325,13 @@ function resolveVideoDurationSec(inputs) {
   return d >= 10 ? 10 : 5;
 }
 
+function resolveVideoPricing(inputsLike, assetsLike) {
+  const frame2 = resolveFrame2Reference(inputsLike, assetsLike);
+  if (frame2.kind === "ref_video") return { flow: "kling_motion_control" };
+  if (frame2.kind === "ref_audio") return { flow: "fabric_audio" };
+  return { flow: "kling" };
+}
+
 function videoCostFromInputs(inputs) {
   const sec = resolveVideoDurationSec(inputs);
   return sec === 10 ? 10 : 5;
@@ -2220,6 +2240,9 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     const endImage = pickKlingEndImage(working, parent);
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO");
 
+    const pricing = resolveVideoPricing(inputs0, working?.assets);
+    const shouldBypassGpt = pricing.flow === "kling_motion_control" || pricing.flow === "fabric_audio";
+
     const motionBrief =
       safeStr(working?.inputs?.motion_user_brief, "") ||
       safeStr(working?.inputs?.motionBrief, "") ||
@@ -2252,7 +2275,12 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
 
     let finalMotionPrompt = "";
 
-    if (usePromptOverride) {
+    if (shouldBypassGpt) {
+      finalMotionPrompt = safeStr(
+        inputs0.motion_user_brief || inputs0.brief || inputs0.prompt || "",
+        ""
+      );
+    } else if (usePromptOverride) {
       await writeStep({
         supabase,
         generationId,
@@ -2313,7 +2341,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
         safeStr(working?.prompts?.motion_prompt, "");
     }
 
-    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_PROMPT");
+    if (!finalMotionPrompt && !shouldBypassGpt) throw new Error("EMPTY_MOTION_PROMPT");
 
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
     await updateVars({ supabase, generationId, vars: working });

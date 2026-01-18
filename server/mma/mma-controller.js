@@ -2332,6 +2332,14 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       process.env.MMA_NEGATIVE_PROMPT_KLING ||
       "";
 
+    const generateAudioRaw =
+      working?.inputs?.generate_audio ??
+      working?.inputs?.generateAudio ??
+      working?.inputs?.audio_enabled ??
+      working?.inputs?.audioEnabled;
+
+    const generateAudio = generateAudioRaw === undefined ? true : !!generateAudioRaw;
+
     let klingRes;
     try {
       klingRes = await runKling({
@@ -2341,6 +2349,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
         duration,
         mode,
         negativePrompt: neg,
+        generateAudio,
       });
       // ✅ store prediction id for recovery later
       working.outputs = { ...(working.outputs || {}), kling_prediction_id: klingRes.prediction_id || null };

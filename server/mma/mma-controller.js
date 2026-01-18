@@ -235,10 +235,32 @@ function asHttpUrl(u) {
 
 function resolveFrame2Reference(inputsLike, assetsLike) {
   const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
+  const assets = assetsLike && typeof assetsLike === "object" ? assetsLike : {};
 
-  const kind = safeStr(inputs.frame2_kind || inputs.frame2Kind || "", "").toLowerCase();
-  const url = asHttpUrl(inputs.frame2_url || inputs.frame2Url || "");
-  const dur = Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) || 0;
+  // Prefer explicit inputs
+  const kindRaw = safeStr(inputs.frame2_kind || inputs.frame2Kind || "", "").toLowerCase();
+  const urlRaw = asHttpUrl(inputs.frame2_url || inputs.frame2Url || "");
+  const durRaw = Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) || 0;
+
+  // Fallback to assets (so frontend can send assets.video/assets.audio)
+  const assetVideo =
+    asHttpUrl(assets.video || assets.video_url || assets.videoUrl || assets.frame2_video_url || assets.frame2VideoUrl);
+  const assetAudio =
+    asHttpUrl(assets.audio || assets.audio_url || assets.audioUrl || assets.frame2_audio_url || assets.frame2AudioUrl);
+
+  const kind =
+    kindRaw ||
+    (assetVideo ? "video" : assetAudio ? "audio" : "");
+
+  const url =
+    urlRaw ||
+    (kind === "video" ? assetVideo : kind === "audio" ? assetAudio : "") ||
+    "";
+
+  const dur =
+    durRaw ||
+    Number(assets.frame2_duration_sec || assets.frame2DurationSec || 0) ||
+    0;
 
   if (kind === "video" && url) return { kind: "ref_video", url, rawDurationSec: dur, maxSec: 30 };
   if (kind === "audio" && url) return { kind: "ref_audio", url, rawDurationSec: dur, maxSec: 60 };
@@ -1073,6 +1095,7 @@ function pickKlingStartImage(vars, parent) {
     asHttpUrl(inputs.parent_output_url || inputs.parentOutputUrl) ||
     asHttpUrl(parent?.mg_output_url) ||
     asHttpUrl(assets.start_image_url || assets.startImageUrl) ||
+    asHttpUrl(assets.image || assets.image_url || assets.imageUrl) ||
     asHttpUrl(assets.product_image_url || assets.productImageUrl) ||
     ""
   );
@@ -1241,6 +1264,149 @@ async function runKling({
   };
 }
 
+// ============================================================================
+// NEW: Fabric (audio-driven) + Kling Motion Control (ref video-driven)
+// ============================================================================
+
+function normalizeKmcMode(v) {
+  const s = safeStr(v, "").toLowerCase();
+  if (s === "pro") return "pro";
+  if (s === "std" || s === "standard") return "std";
+  return "std";
+}
+function normalizeKmcOrientation(v) {
+  const s = safeStr(v, "").toLowerCase();
+  return s === "video" ? "video" : "image";
+}
+
+async function runFabricAudio({ image, audio, resolution, input: forcedInput }) {
+  const replicate = getReplicate();
+  const cfg = getMmaConfig();
+
+  const version =
+    process.env.MMA_FABRIC_VERSION ||
+    cfg?.fabric?.model ||
+    "veed/fabric-1.0";
+
+  const envRes = safeStr(process.env.MMA_FABRIC_RESOLUTION, "");
+  const cfgRes = safeStr(cfg?.fabric?.resolution, "");
+  const desired = safeStr(resolution, "") || cfgRes || envRes || "720p";
+  const finalRes = desired === "480p" ? "480p" : "720p";
+
+  const input = forcedInput
+    ? { ...forcedInput, image: forcedInput.image || image, audio: forcedInput.audio || audio }
+    : { image, audio, resolution: finalRes };
+
+  const REPLICATE_MAX_MS_FABRIC =
+    Number(process.env.MMA_REPLICATE_MAX_MS_FABRIC || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000;
+
+  const t0 = Date.now();
+
+  const pred = await replicatePredictWithTimeout({
+    replicate,
+    version,
+    input,
+    timeoutMs: REPLICATE_MAX_MS_FABRIC,
+    pollMs: REPLICATE_POLL_MS,
+    callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
+  });
+
+  const prediction = pred.prediction || {};
+  const out = prediction.output;
+
+  return {
+    input,
+    out,
+    prediction_id: pred.predictionId,
+    prediction_status: prediction.status || null,
+    timed_out: !!pred.timedOut,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+    provider: { prediction },
+  };
+}
+
+async function runKlingMotionControl({
+  prompt,
+  image,
+  video,
+  mode,
+  keepOriginalSound,
+  characterOrientation,
+  input: forcedInput,
+}) {
+  const replicate = getReplicate();
+  const cfg = getMmaConfig();
+
+  const version =
+    process.env.MMA_KLING_MOTION_CONTROL_VERSION ||
+    cfg?.kling_motion_control?.model ||
+    "kwaivgi/kling-v2.6-motion-control";
+
+  const finalMode = normalizeKmcMode(mode);
+  const finalOrientation = normalizeKmcOrientation(characterOrientation);
+
+  const keep =
+    keepOriginalSound !== undefined
+      ? !!keepOriginalSound
+      : (cfg?.kling_motion_control?.keepOriginalSound !== undefined ? !!cfg.kling_motion_control.keepOriginalSound : true);
+
+  const input = forcedInput
+    ? { ...forcedInput }
+    : {
+        prompt: safeStr(prompt, ""), // allowed to be ""
+        image,
+        video,
+        mode: finalMode,
+        keep_original_sound: keep,
+        character_orientation: finalOrientation,
+      };
+
+  // normalize required fields
+  if (!input.image) input.image = image;
+  if (!input.video) input.video = video;
+  if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
+  if (!input.mode) input.mode = finalMode;
+  if (input.keep_original_sound === undefined) input.keep_original_sound = keep;
+  if (!input.character_orientation) input.character_orientation = finalOrientation;
+
+  const REPLICATE_MAX_MS_KMC =
+    Number(process.env.MMA_REPLICATE_MAX_MS_KLING_MOTION_CONTROL || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000;
+
+  const t0 = Date.now();
+
+  const pred = await replicatePredictWithTimeout({
+    replicate,
+    version,
+    input,
+    timeoutMs: REPLICATE_MAX_MS_KMC,
+    pollMs: REPLICATE_POLL_MS,
+    callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
+  });
+
+  const prediction = pred.prediction || {};
+  const out = prediction.output;
+
+  return {
+    input,
+    out,
+    prediction_id: pred.predictionId,
+    prediction_status: prediction.status || null,
+    timed_out: !!pred.timedOut,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+    provider: { prediction },
+  };
+}
+
 
 // ============================================================================
 // R2 Public store
@@ -1320,6 +1486,16 @@ const MMA_COSTS = {
   typeForMeCharge: 1,
 };
 
+function _clamp(n, a, b) {
+  const x = Number(n || 0) || 0;
+  return Math.max(a, Math.min(b, x));
+}
+function _ceilTo5(n) {
+  const x = Number(n || 0) || 0;
+  return Math.ceil(x / 5) * 5;
+}
+
+// classic kling duration (still 5/10)
 function resolveVideoDurationSec(inputs) {
   const d = Number(inputs?.duration ?? inputs?.duration_seconds ?? inputs?.durationSeconds ?? 5) || 5;
   return d >= 10 ? 10 : 5;
@@ -1332,7 +1508,26 @@ function resolveVideoPricing(inputsLike, assetsLike) {
   return { flow: "kling" };
 }
 
-function videoCostFromInputs(inputs) {
+// ✅ cost:
+// - normal kling: 5 or 10
+// - ref video: ceil(dur/5)*5, cap 30
+// - ref audio: ceil(dur/5)*5, cap 60
+function videoCostFromInputs(inputsLike, assetsLike) {
+  const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
+  const frame2 = resolveFrame2Reference(inputs, assetsLike);
+
+  if (frame2.kind === "ref_video" || frame2.kind === "ref_audio") {
+    const maxSec = frame2.maxSec || (frame2.kind === "ref_audio" ? 60 : 30);
+
+    // Use provided frame2 duration first, else fallback to classic duration (5/10)
+    const fallback = resolveVideoDurationSec(inputs);
+    const raw = Number(frame2.rawDurationSec || 0) || Number(inputs.duration_sec || inputs.durationSec || 0) || fallback;
+
+    const clamped = _clamp(raw, 1, maxSec);
+    const billed = _clamp(_ceilTo5(clamped), 5, maxSec); // 5..30 or 5..60
+    return billed;
+  }
+
   const sec = resolveVideoDurationSec(inputs);
   return sec === 10 ? 10 : 5;
 }
@@ -2220,7 +2415,7 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     inputs0.useSuggestion === true;
 
   if (!suggestOnly) {
-    videoCost = videoCostFromInputs(inputs0);
+    videoCost = videoCostFromInputs(inputs0, working?.assets);
     await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
   }
 
@@ -2241,7 +2436,11 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO");
 
     const pricing = resolveVideoPricing(inputs0, working?.assets);
-    const shouldBypassGpt = pricing.flow === "kling_motion_control" || pricing.flow === "fabric_audio";
+    const frame2 = resolveFrame2Reference(inputs0, working?.assets);
+
+    // ✅ only bypass GPT for fabric (prompt not used there)
+    // motion-control can still benefit from GPT prompt
+    const shouldBypassGpt = pricing.flow === "fabric_audio";
 
     const motionBrief =
       safeStr(working?.inputs?.motion_user_brief, "") ||
@@ -2417,20 +2616,71 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     // ✅ 2 frames (end frame present) => ALWAYS force mute on backend too
     if (asHttpUrl(endImage)) generateAudio = false;
 
-    let klingRes;
+    let genRes;
+    let stepType = "kling_generate";
+
     try {
-      klingRes = await runKling({
-        prompt: finalMotionPrompt,
-        startImage,
-        endImage,
-        duration,
-        mode,
-        negativePrompt: neg,
-        generateAudio,
-      });
-      // ✅ store prediction id for recovery later
-      working.outputs = { ...(working.outputs || {}), kling_prediction_id: klingRes.prediction_id || null };
-      await updateVars({ supabase, generationId, vars: working });
+      if (pricing.flow === "kling_motion_control") {
+        if (!frame2?.url) throw new Error("MISSING_FRAME2_VIDEO_URL");
+
+        // sensible defaults for motion control
+        const kmcMode = safeStr(working?.inputs?.mode || working?.inputs?.kmc_mode, "") || "std";
+        const kmcOrientation =
+          safeStr(working?.inputs?.character_orientation || working?.inputs?.characterOrientation, "") || "video";
+        const keepOriginalSound =
+          working?.inputs?.keep_original_sound ?? working?.inputs?.keepOriginalSound ?? true;
+
+        working.meta = { ...(working.meta || {}), video_engine: "kling_motion_control" };
+        await updateVars({ supabase, generationId, vars: working });
+
+        genRes = await runKlingMotionControl({
+          prompt: finalMotionPrompt,
+          image: startImage,
+          video: frame2.url,
+          mode: kmcMode,
+          keepOriginalSound,
+          characterOrientation: kmcOrientation,
+        });
+
+        working.outputs = { ...(working.outputs || {}), kling_motion_control_prediction_id: genRes.prediction_id || null };
+        stepType = "kling_motion_control_generate";
+        await updateVars({ supabase, generationId, vars: working });
+      } else if (pricing.flow === "fabric_audio") {
+        if (!frame2?.url) throw new Error("MISSING_FRAME2_AUDIO_URL");
+
+        const resolution =
+          safeStr(working?.inputs?.resolution || working?.inputs?.fabric_resolution, "") || "720p";
+
+        working.meta = { ...(working.meta || {}), video_engine: "fabric_audio" };
+        await updateVars({ supabase, generationId, vars: working });
+
+        genRes = await runFabricAudio({
+          image: startImage,
+          audio: frame2.url,
+          resolution,
+        });
+
+        working.outputs = { ...(working.outputs || {}), fabric_prediction_id: genRes.prediction_id || null };
+        stepType = "fabric_generate";
+        await updateVars({ supabase, generationId, vars: working });
+      } else {
+        working.meta = { ...(working.meta || {}), video_engine: "kling" };
+        await updateVars({ supabase, generationId, vars: working });
+
+        genRes = await runKling({
+          prompt: finalMotionPrompt,
+          startImage,
+          endImage,
+          duration,
+          mode,
+          negativePrompt: neg,
+          generateAudio,
+        });
+
+        working.outputs = { ...(working.outputs || {}), kling_prediction_id: genRes.prediction_id || null };
+        stepType = "kling_generate";
+        await updateVars({ supabase, generationId, vars: working });
+      }
     } finally {
       try {
         chatter?.stop?.();
@@ -2438,19 +2688,19 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       chatter = null;
     }
 
-    const { input, out, timing } = klingRes;
+    const { input, out, timing } = genRes;
 
     await writeStep({
       supabase,
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: "kling_generate",
+      stepType,
       payload: { input, output: out, timing, error: null },
     });
 
     const remote = pickFirstUrl(out);
-    if (!remote) throw new Error("KLING_NO_URL");
+    if (!remote) throw new Error("VIDEO_NO_URL");
 
     let remoteUrl = remote;
     try {
@@ -2516,7 +2766,8 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
   // ✅ compute real cost 5 or 10 (use parent inputs as fallback)
   const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
   const mergedInputs0 = { ...(parentVars?.inputs || {}), ...(working?.inputs || {}) };
-  const videoCost = videoCostFromInputs(mergedInputs0);
+  const mergedAssets0 = { ...(parentVars?.assets || {}), ...(working?.assets || {}) };
+  const videoCost = videoCostFromInputs(mergedInputs0, mergedAssets0);
 
   await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
 
@@ -2830,7 +3081,12 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
       email: body?.email,
     });
 
-  await ensureEnoughCredits(passId, MMA_COSTS.video, { lane: "video" });
+  const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
+  const mergedInputs0 = { ...(parentVars?.inputs || {}), ...(body?.inputs || {}) };
+  const mergedAssets0 = { ...(parentVars?.assets || {}), ...(body?.assets || {}) };
+
+  const needed = videoCostFromInputs(mergedInputs0, mergedAssets0);
+  await ensureEnoughCredits(passId, needed, { lane: "video" });
 
   const generationId = newUuid();
 
@@ -2874,7 +3130,6 @@ export async function handleMmaVideoTweak({ parentGenerationId, body }) {
   vars.meta = { ...(vars.meta || {}), flow: "video_tweak", parent_generation_id: parentGenerationId };
   vars.inputs = { ...(vars.inputs || {}), parent_generation_id: parentGenerationId };
 
-  const parentVars = parent?.mg_mma_vars && typeof parent.mg_mma_vars === "object" ? parent.mg_mma_vars : {};
   const parentStart = asHttpUrl(parentVars?.inputs?.start_image_url || parentVars?.inputs?.startImageUrl);
   const parentEnd = asHttpUrl(parentVars?.inputs?.end_image_url || parentVars?.inputs?.endImageUrl);
 
@@ -2923,7 +3178,7 @@ export async function handleMmaCreate({ mode, body }) {
   if (mode === "video" && suggestOnly && typeForMe) {
     await preflightTypeForMe({ supabase, passId });
   } else if (mode === "video") {
-    const neededVideo = videoCostFromInputs(body?.inputs || {});
+    const neededVideo = videoCostFromInputs(body?.inputs || {}, body?.assets || {});
     await ensureEnoughCredits(passId, neededVideo, { lane: "video" });
   } else {
     const requestedLane = resolveStillLaneFromInputs(body?.inputs || {});

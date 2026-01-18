@@ -237,20 +237,49 @@ function resolveFrame2Reference(inputsLike, assetsLike) {
   const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
   const assets = assetsLike && typeof assetsLike === "object" ? assetsLike : {};
 
+  const guessKindFromUrl = (u) => {
+    const url = asHttpUrl(u);
+    if (!url) return "";
+    try {
+      const p = new URL(url).pathname.toLowerCase();
+      if (/\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(p)) return "audio";
+      if (/\.(mp4|mov|webm|mkv|m4v)$/i.test(p)) return "video";
+    } catch {}
+    return "";
+  };
+
   // Prefer explicit inputs
-  const kindRaw = safeStr(inputs.frame2_kind || inputs.frame2Kind || "", "").toLowerCase();
+  const kindRaw0 = safeStr(inputs.frame2_kind || inputs.frame2Kind || "", "").toLowerCase();
+  const kindRaw = kindRaw0.replace(/^ref_/, "");
   const urlRaw = asHttpUrl(inputs.frame2_url || inputs.frame2Url || "");
   const durRaw = Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) || 0;
 
-  // Fallback to assets (so frontend can send assets.video/assets.audio)
-  const assetVideo =
-    asHttpUrl(assets.video || assets.video_url || assets.videoUrl || assets.frame2_video_url || assets.frame2VideoUrl);
-  const assetAudio =
-    asHttpUrl(assets.audio || assets.audio_url || assets.audioUrl || assets.frame2_audio_url || assets.frame2AudioUrl);
+  // Fallback to assets
+  const assetVideo = asHttpUrl(
+    assets.video ||
+      assets.video_url ||
+      assets.videoUrl ||
+      assets.frame2_video_url ||
+      assets.frame2VideoUrl
+  );
 
-  const kind =
-    kindRaw ||
-    (assetVideo ? "video" : assetAudio ? "audio" : "");
+  const assetAudio = asHttpUrl(
+    assets.audio ||
+      assets.audio_url ||
+      assets.audioUrl ||
+      assets.frame2_audio_url ||
+      assets.frame2AudioUrl
+  );
+
+  // Normalize kind
+  let kind = kindRaw === "audio" || kindRaw === "video" ? kindRaw : "";
+
+  // If url implies a better kind, trust the file extension
+  const urlGuess = guessKindFromUrl(urlRaw);
+  if (!kind && urlGuess) kind = urlGuess;
+  if (kind && urlGuess && kind !== urlGuess) kind = urlGuess;
+
+  if (!kind) kind = assetVideo ? "video" : assetAudio ? "audio" : "";
 
   const url =
     urlRaw ||

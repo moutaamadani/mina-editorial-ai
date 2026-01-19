@@ -2472,11 +2472,12 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   const pricing = resolveVideoPricing(inputs0, working?.assets);
   const flow = pricing.flow; // "kling" | "kling_motion_control" | "fabric_audio"
   
-  ...
+  working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
+  if (endImage) working.inputs.end_image_url = endImage;
   
   let finalMotionPrompt = "";
   
-  // 1) optional override (keeps your existing behavior)
+  // 1) Optional manual override (same behavior as before)
   if (usePromptOverride) {
     await writeStep({
       supabase,
@@ -2486,11 +2487,11 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       stepType: "motion_prompt_override",
       payload: {
         source: "frontend",
-        prompt_override: promptOverride,
         flow,
         frame2_kind: frame2?.kind || null,
         frame2_url: frame2?.url || null,
         frame2_duration_sec: frame2?.rawDurationSec || null,
+        prompt_override: promptOverride,
         start_image_url: startImage,
         end_image_url: asHttpUrl(endImage) || null,
         motion_user_brief: motionBrief,
@@ -2502,23 +2503,21 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   
     finalMotionPrompt = promptOverride;
   } else {
-    // 2) always run GPT (even for fabric_audio + motion_control)
+    // 2) Always run GPT (even for fabric_audio + motion control)
     const oneShotInput = {
       flow,
-      start_image_url: startImage,
-      end_image_url: asHttpUrl(endImage) || null,
-  
-      // ✅ key: tell GPT what the “second input” is (audio/video) + duration
-      frame2_kind: frame2?.kind || null,              // "ref_audio" | "ref_video" | null
+      frame2_kind: frame2?.kind || null, // "ref_audio" | "ref_video" | null
       frame2_url: frame2?.url || null,
       frame2_duration_sec: frame2?.rawDurationSec || null,
   
+      start_image_url: startImage,
+      end_image_url: asHttpUrl(endImage) || null,
       motion_user_brief: motionBrief,
       selected_movement_style: movementStyle,
   
       notes:
-        "Write ONE clean motion prompt. If flow is fabric_audio: sync motion to beats/phrasing of the audio. " +
-        "If flow is kling_motion_control: assume the reference video drives motion; keep subject consistent and match timing. " +
+        "Write ONE clean motion prompt. If audio reference exists, sync motion to beats/phrases. " +
+        "If video reference exists, sync motion of the reference while keeping subject consistent. " +
         "Plain English. No emojis. No questions.",
     };
   
@@ -2555,22 +2554,22 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       safeStr(working?.prompts?.motion_prompt, "");
   }
   
-  // ✅ safety fallback: never hard-fail fabric just because prompt is empty
+  // If GPT returns empty, do a safe fallback so Fabric never fails because of prompt
   if (!finalMotionPrompt) {
     finalMotionPrompt =
       safeStr(motionBrief, "") ||
-      safeStr(inputs0.brief, "") ||
-      safeStr(inputs0.prompt, "");
+      safeStr(working?.inputs?.brief, "") ||
+      safeStr(working?.inputs?.prompt, "");
   }
   
-  // ✅ but for Kling + motion-control we do require *some* prompt
-  if (!finalMotionPrompt && (flow === "kling" || flow === "kling_motion_control")) {
+  // Only REQUIRE prompt for Kling and motion-control (Fabric doesn’t need it)
+  if (!finalMotionPrompt && flow !== "fabric_audio") {
     throw new Error("EMPTY_MOTION_PROMPT");
   }
+  
+  working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
+  await updateVars({ supabase, generationId, vars: working });
 
-
-    working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
-    await updateVars({ supabase, generationId, vars: working });
 
     if (suggestOnly) {
       await supabase
@@ -2875,8 +2874,17 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       },
     });
 
-    const finalMotionPrompt = safeStr(one.motion_prompt, "");
-    if (!finalMotionPrompt) throw new Error("EMPTY_MOTION_TWEAK_PROMPT_ONE_SHOT");
+    let finalMotionPrompt = safeStr(one.motion_prompt, "");
+
+    if (!finalMotionPrompt) {
+      // safe fallback (so Fabric tweak won’t fail just because GPT output is empty)
+      finalMotionPrompt = safeStr(feedbackMotion, "") || safeStr(prevMotionPrompt, "");
+    }
+    
+    if (!finalMotionPrompt && pricing.flow !== "fabric_audio") {
+      throw new Error("EMPTY_MOTION_TWEAK_PROMPT_ONE_SHOT");
+    }
+
 
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
     working.inputs = { ...(working.inputs || {}), start_image_url: startImage };

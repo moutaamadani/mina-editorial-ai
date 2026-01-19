@@ -1548,9 +1548,16 @@ function videoCostFromInputs(inputsLike, assetsLike) {
   if (frame2.kind === "ref_video" || frame2.kind === "ref_audio") {
     const maxSec = frame2.maxSec || (frame2.kind === "ref_audio" ? 60 : 30);
 
-    // Use provided frame2 duration first, else fallback to classic duration (5/10)
-    const fallback = resolveVideoDurationSec(inputs);
-    const raw = Number(frame2.rawDurationSec || 0) || Number(inputs.duration_sec || inputs.durationSec || 0) || fallback;
+    // Use real seconds if present (frame2_duration_sec OR duration), else fall back to 5/10.
+    const rawProvided =
+      Number(frame2.rawDurationSec || 0) ||
+      Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) ||
+      Number(inputs.duration || inputs.duration_seconds || inputs.durationSeconds || 0) ||
+      Number(inputs.duration_sec || inputs.durationSec || 0) ||
+      0;
+
+    const fallback = resolveVideoDurationSec(inputs); // 5/10 only if nothing else exists
+    const raw = rawProvided || fallback;
 
     const clamped = _clamp(raw, 1, maxSec);
     const billed = _clamp(_ceilTo5(clamped), 5, maxSec); // 5..30 or 5..60
@@ -2460,11 +2467,14 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
 
     let frame2 = resolveFrame2Reference(inputs0, working?.assets);
 
-    // ✅ NEVER get stuck "queued" if duration is missing
-    // fallback to your normal 5/10s logic
+    // ✅ If ref duration is missing, try to use real seconds from inputs.duration (NOT 5/10)
     if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
-      const fallback = resolveVideoDurationSec(inputs0);
-      inputs0.frame2_duration_sec = inputs0.frame2_duration_sec || inputs0.frame2DurationSec || fallback;
+      const dur =
+        Number(inputs0.frame2_duration_sec || inputs0.frame2DurationSec || 0) ||
+        Number(inputs0.duration || inputs0.duration_seconds || inputs0.durationSeconds || 0) ||
+        0;
+
+      if (dur > 0) inputs0.frame2_duration_sec = dur;
       frame2 = resolveFrame2Reference(inputs0, working?.assets);
     }
 
@@ -2852,11 +2862,14 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
   let frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
   const videoCost = videoCostFromInputs(mergedInputs0, mergedAssets0);
 
-  // ✅ NEVER get stuck "queued" if duration is missing
+  // ✅ If ref duration is missing, try to use real seconds from inputs.duration (NOT 5/10)
   if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
-    const fallback = resolveVideoDurationSec(mergedInputs0);
-    mergedInputs0.frame2_duration_sec =
-      mergedInputs0.frame2_duration_sec || mergedInputs0.frame2DurationSec || fallback;
+    const dur =
+      Number(mergedInputs0.frame2_duration_sec || mergedInputs0.frame2DurationSec || 0) ||
+      Number(mergedInputs0.duration || mergedInputs0.duration_seconds || mergedInputs0.durationSeconds || 0) ||
+      0;
+
+    if (dur > 0) mergedInputs0.frame2_duration_sec = dur;
     frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
   }
 

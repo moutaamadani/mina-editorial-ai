@@ -2429,6 +2429,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 // ============================================================================
 async function runVideoAnimatePipeline({ supabase, generationId, passId, parent, vars }) {
   const cfg = getMmaConfig();
+  
   if (!cfg.enabled) throw new Error("MMA_DISABLED");
 
   let working = vars;
@@ -2476,7 +2477,36 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   if (endImage) working.inputs.end_image_url = endImage;
   
   let finalMotionPrompt = "";
-  
+  const motionBrief =
+  safeStr(
+    inputs0.motion_user_brief ||
+      inputs0.motionUserBrief ||
+      inputs0.brief ||
+      inputs0.user_brief ||
+      inputs0.userBrief,
+    ""
+  );
+
+const movementStyle =
+  safeStr(
+    inputs0.selected_movement_style ||
+      inputs0.selectedMovementStyle ||
+      inputs0.movement_style ||
+      inputs0.movementStyle,
+    ""
+  );
+
+const promptOverride =
+  safeStr(
+    inputs0.motion_prompt_override ||
+      inputs0.motionPromptOverride ||
+      inputs0.prompt_override ||
+      inputs0.promptOverride,
+    ""
+  );
+
+const usePromptOverride = !!promptOverride;
+
   // 1) Optional manual override (same behavior as before)
   if (usePromptOverride) {
     await writeStep({
@@ -2736,7 +2766,12 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
       remoteUrl = remote;
     }
 
-    working.outputs = { ...(working.outputs || {}), kling_video_url: remoteUrl };
+    working.outputs = { ...(working.outputs || {}) };
+    working.outputs.kling_video_url = remoteUrl;
+    
+    if (pricing.flow === "fabric_audio") working.outputs.fabric_video_url = remoteUrl;
+    if (pricing.flow === "kling_motion_control") working.outputs.kling_motion_control_video_url = remoteUrl;
+
     working.mg_output_url = remoteUrl;
 
     working = pushUserMessageLine(working, pick(MMA_UI.quickLines.saved_video));

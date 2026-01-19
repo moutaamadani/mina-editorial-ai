@@ -475,6 +475,7 @@ async function getMmaCtxConfig(supabase) {
       "",
       "OVERIDE",
       'if user brief has madani in it overide and just give back the prompt as the user brief directly',
+      'if audio or video in the input just type sync image with video or audio',
       "",
       "SAFETY:",
       "- follow user idea",
@@ -2468,111 +2469,105 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
     const endImage = pickKlingEndImage(working, parent);
     if (!startImage) throw new Error("MISSING_START_IMAGE_FOR_VIDEO");
 
-    const pricing = resolveVideoPricing(inputs0, working?.assets);
-
-    // ✅ only bypass GPT for fabric (prompt not used there)
-    // motion-control can still benefit from GPT prompt
-    const shouldBypassGpt = pricing.flow === "fabric_audio";
-
-    const motionBrief =
-      safeStr(working?.inputs?.motion_user_brief, "") ||
-      safeStr(working?.inputs?.motionBrief, "") ||
-      safeStr(working?.inputs?.brief, "") ||
-      safeStr(working?.inputs?.prompt, "");
-
-    const movementStyle =
-      safeStr(working?.inputs?.selected_movement_style, "") ||
-      safeStr(working?.inputs?.movement_style, "") ||
-      safeStr(working?.inputs?.movementStyle, "");
-
-    const promptOverride = safeStr(
-      working?.inputs?.prompt_override ||
-        working?.inputs?.motion_prompt_override ||
-        working?.inputs?.motionPromptOverride,
-      ""
-    );
-
-    const ALLOW_PROMPT_OVERRIDE =
-    String(process.env.MMA_ALLOW_PROMPT_OVERRIDE || "false").toLowerCase() === "true";
-      
-    const usePromptOverride =
-      ALLOW_PROMPT_OVERRIDE &&
-      (working?.inputs?.use_prompt_override === true || working?.inputs?.usePromptOverride === true) &&
-      !!promptOverride;
-
-
-    working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
-    if (endImage) working.inputs.end_image_url = endImage;
-
-    let finalMotionPrompt = "";
-
-    if (shouldBypassGpt) {
-      finalMotionPrompt = safeStr(
-        inputs0.motion_user_brief || inputs0.brief || inputs0.prompt || "",
-        ""
-      );
-    } else if (usePromptOverride) {
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "motion_prompt_override",
-        payload: {
-          source: "frontend",
-          prompt_override: promptOverride,
-          start_image_url: startImage,
-          end_image_url: asHttpUrl(endImage) || null,
-          motion_user_brief: motionBrief,
-          selected_movement_style: movementStyle,
-          timing: { started_at: nowIso(), ended_at: nowIso(), duration_ms: 0 },
-          error: null,
-        },
-      });
-      finalMotionPrompt = promptOverride;
-    } else {
-      const oneShotInput = {
+  const pricing = resolveVideoPricing(inputs0, working?.assets);
+  const flow = pricing.flow; // "kling" | "kling_motion_control" | "fabric_audio"
+  
+  ...
+  
+  let finalMotionPrompt = "";
+  
+  // 1) optional override (keeps your existing behavior)
+  if (usePromptOverride) {
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "motion_prompt_override",
+      payload: {
+        source: "frontend",
+        prompt_override: promptOverride,
+        flow,
+        frame2_kind: frame2?.kind || null,
+        frame2_url: frame2?.url || null,
+        frame2_duration_sec: frame2?.rawDurationSec || null,
         start_image_url: startImage,
         end_image_url: asHttpUrl(endImage) || null,
         motion_user_brief: motionBrief,
         selected_movement_style: movementStyle,
-        notes: "Write a single clean motion prompt. Plain English. No emojis. No questions.",
-      };
+        timing: { started_at: nowIso(), ended_at: nowIso(), duration_ms: 0 },
+        error: null,
+      },
+    });
+  
+    finalMotionPrompt = promptOverride;
+  } else {
+    // 2) always run GPT (even for fabric_audio + motion_control)
+    const oneShotInput = {
+      flow,
+      start_image_url: startImage,
+      end_image_url: asHttpUrl(endImage) || null,
+  
+      // ✅ key: tell GPT what the “second input” is (audio/video) + duration
+      frame2_kind: frame2?.kind || null,              // "ref_audio" | "ref_video" | null
+      frame2_url: frame2?.url || null,
+      frame2_duration_sec: frame2?.rawDurationSec || null,
+  
+      motion_user_brief: motionBrief,
+      selected_movement_style: movementStyle,
+  
+      notes:
+        "Write ONE clean motion prompt. If flow is fabric_audio: sync motion to beats/phrasing of the audio. " +
+        "If flow is kling_motion_control: assume the reference video drives motion; keep subject consistent and match timing. " +
+        "Plain English. No emojis. No questions.",
+    };
+  
+    const labeledImages = []
+      .concat([{ role: "START_IMAGE", url: startImage }])
+      .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
+      .slice(0, 6);
+  
+    const t0 = Date.now();
+    const one = await gptMotionOneShotAnimate({ cfg, ctx, input: oneShotInput, labeledImages });
+  
+    await writeStep({
+      supabase,
+      generationId,
+      passId,
+      stepNo: stepNo++,
+      stepType: "gpt_motion_one_shot",
+      payload: {
+        ctx: ctx.motion_one_shot,
+        input: oneShotInput,
+        labeledImages,
+        request: one.request,
+        raw: one.raw,
+        output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
+        timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
+        error: null,
+      },
+    });
+  
+    finalMotionPrompt =
+      safeStr(one.motion_prompt, "") ||
+      safeStr(working?.inputs?.motion_prompt, "") ||
+      safeStr(working?.inputs?.prompt, "") ||
+      safeStr(working?.prompts?.motion_prompt, "");
+  }
+  
+  // ✅ safety fallback: never hard-fail fabric just because prompt is empty
+  if (!finalMotionPrompt) {
+    finalMotionPrompt =
+      safeStr(motionBrief, "") ||
+      safeStr(inputs0.brief, "") ||
+      safeStr(inputs0.prompt, "");
+  }
+  
+  // ✅ but for Kling + motion-control we do require *some* prompt
+  if (!finalMotionPrompt && (flow === "kling" || flow === "kling_motion_control")) {
+    throw new Error("EMPTY_MOTION_PROMPT");
+  }
 
-      const labeledImages = []
-        .concat([{ role: "START_IMAGE", url: startImage }])
-        .concat(endImage ? [{ role: "END_IMAGE", url: endImage }] : [])
-        .slice(0, 6);
-
-      const t0 = Date.now();
-      const one = await gptMotionOneShotAnimate({ cfg, ctx, input: oneShotInput, labeledImages });
-
-      await writeStep({
-        supabase,
-        generationId,
-        passId,
-        stepNo: stepNo++,
-        stepType: "gpt_motion_one_shot",
-        payload: {
-          ctx: ctx.motion_one_shot,
-          input: oneShotInput,
-          labeledImages,
-          request: one.request,
-          raw: one.raw,
-          output: { motion_prompt: one.motion_prompt, parsed_ok: one.parsed_ok },
-          timing: { started_at: new Date(t0).toISOString(), ended_at: nowIso(), duration_ms: Date.now() - t0 },
-          error: null,
-        },
-      });
-
-      finalMotionPrompt =
-        safeStr(one.motion_prompt, "") ||
-        safeStr(working?.inputs?.motion_prompt, "") ||
-        safeStr(working?.inputs?.prompt, "") ||
-        safeStr(working?.prompts?.motion_prompt, "");
-    }
-
-    if (!finalMotionPrompt && !shouldBypassGpt) throw new Error("EMPTY_MOTION_PROMPT");
 
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
     await updateVars({ supabase, generationId, vars: working });

@@ -18,6 +18,7 @@ import {
 } from "./mma-controller.js";
 import { getSupabaseAdmin } from "../../supabase.js";
 import { megaEnsureCustomer, resolvePassId as megaResolvePassId } from "../../mega-db.js";
+import { sendDone, sendStatus } from "./mma-sse.js";
 
 const router = express.Router();
 
@@ -172,7 +173,7 @@ router.get("/stream/:generation_id", async (req, res) => {
       .eq("mg_record_type", "generation")
       .maybeSingle();
 
-    if (error) {
+    if (error || !data) {
       try {
         res.write(`event: error\ndata: ${JSON.stringify({ error: "SSE_BOOTSTRAP_FAILED" })}\n\n`);
       } catch {}
@@ -180,7 +181,23 @@ router.get("/stream/:generation_id", async (req, res) => {
     }
 
     const scanLines = data?.mg_mma_vars?.userMessages?.scan_lines || [];
-    const status = String(data?.mg_mma_status || "queued");
+    const internal = String(data?.mg_mma_status || "queued");
+
+    // Register first so sendStatus/sendDone hit THIS connection too
+    registerSseClient(req.params.generation_id, res, { scanLines, status: internal });
+
+    // ✅ If already terminal, immediately emit DONE and close (prevents infinite "queued")
+    const TERMINAL = new Set(["done", "error", "suggested"]);
+    if (TERMINAL.has(internal)) {
+      try {
+        sendStatus(req.params.generation_id, internal);
+        sendDone(req.params.generation_id, internal);
+      } catch {}
+      try {
+        res.end();
+      } catch {}
+      return;
+    }
 
     const keepAlive = setInterval(() => {
       try {
@@ -189,8 +206,6 @@ router.get("/stream/:generation_id", async (req, res) => {
     }, 25000);
 
     res.on("close", () => clearInterval(keepAlive));
-
-    registerSseClient(req.params.generation_id, res, { scanLines, status });
   } catch (err) {
     console.error("[mma] stream error", err);
     try {
@@ -198,6 +213,7 @@ router.get("/stream/:generation_id", async (req, res) => {
     } catch {}
   }
 });
+
 
 router.get("/admin/errors", async (_req, res) => {
   try {

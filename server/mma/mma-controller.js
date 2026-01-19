@@ -2188,7 +2188,11 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     await supabase
       .from("mega_generations")
       .update({
-        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_error: {
+          code: "PIPELINE_ERROR",
+          message: err?.message || String(err || ""),
+          provider: err?.provider || null,
+        },
         mg_updated_at: nowIso(),
       })
       .eq("mg_generation_id", generationId)
@@ -2407,7 +2411,11 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     await supabase
       .from("mega_generations")
       .update({
-        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_error: {
+          code: "PIPELINE_ERROR",
+          message: err?.message || String(err || ""),
+          provider: err?.provider || null,
+        },
         mg_updated_at: nowIso(),
       })
       .eq("mg_generation_id", generationId)
@@ -2803,7 +2811,11 @@ const usePromptOverride = !!promptOverride;
     await supabase
       .from("mega_generations")
       .update({
-        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_error: {
+          code: "PIPELINE_ERROR",
+          message: err?.message || String(err || ""),
+          provider: err?.provider || null,
+        },
         mg_updated_at: nowIso(),
       })
       .eq("mg_generation_id", generationId)
@@ -3081,7 +3093,11 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     await supabase
       .from("mega_generations")
       .update({
-        mg_error: { code: "PIPELINE_ERROR", message: err?.message || String(err || "") },
+        mg_error: {
+          code: "PIPELINE_ERROR",
+          message: err?.message || String(err || ""),
+          provider: err?.provider || null,
+        },
         mg_updated_at: nowIso(),
       })
       .eq("mg_generation_id", generationId)

@@ -95,6 +95,22 @@ export async function replicatePredictWithTimeout({
   const done = status === "succeeded" || status === "failed" || status === "canceled";
   const timedOut = !done && elapsedMs >= hard;
 
+  // ✅ if provider actually failed/canceled, THROW with provider details
+  if (status === "failed" || status === "canceled") {
+    const err = new Error(status === "failed" ? "REPLICATE_FAILED" : "REPLICATE_CANCELED");
+    err.code = err.message;
+    err.provider = {
+      id: last?.id || predictionId || null,
+      status,
+      error: last?.error || null,
+      logs: last?.logs || null,
+      model: last?.model || null,
+      version: last?.version || null,
+      input: last?.input || null,
+    };
+    throw err;
+  }
+
   // optional cancel (default false — better for “recover later”)
   if (timedOut && cancelOnTimeout) {
     try {

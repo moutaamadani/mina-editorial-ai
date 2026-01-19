@@ -2436,27 +2436,35 @@ async function runVideoAnimatePipeline({ supabase, generationId, passId, parent,
   let videoCost = 5;
   const ctx = await getMmaCtxConfig(supabase);
 
-  const inputs0 = (working?.inputs && typeof working.inputs === "object") ? working.inputs : {};
-  const suggestOnly = inputs0.suggest_only === true || inputs0.suggestOnly === true;
-  const typeForMe =
-    inputs0.type_for_me === true ||
-    inputs0.typeForMe === true ||
-    inputs0.use_suggestion === true ||
-    inputs0.useSuggestion === true;
-  const frame2 = resolveFrame2Reference(inputs0, working?.assets);
-
-  if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
-    throw makeHttpError(400, "MISSING_FRAME2_DURATION_SEC");
-  }
-
-  if (!suggestOnly) {
-    videoCost = videoCostFromInputs(inputs0, working?.assets);
-    await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
-  }
-
+    // ✅ keep suggestOnly visible in catch/refund
+  let suggestOnly = false;
   let chatter = null;
 
   try {
+    const inputs0 = (working?.inputs && typeof working.inputs === "object") ? working.inputs : {};
+    suggestOnly = inputs0.suggest_only === true || inputs0.suggestOnly === true;
+
+    const typeForMe =
+      inputs0.type_for_me === true ||
+      inputs0.typeForMe === true ||
+      inputs0.use_suggestion === true ||
+      inputs0.useSuggestion === true;
+
+    let frame2 = resolveFrame2Reference(inputs0, working?.assets);
+
+    // ✅ NEVER get stuck "queued" if duration is missing
+    // fallback to your normal 5/10s logic
+    if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
+      const fallback = resolveVideoDurationSec(inputs0);
+      inputs0.frame2_duration_sec = inputs0.frame2_duration_sec || inputs0.frame2DurationSec || fallback;
+      frame2 = resolveFrame2Reference(inputs0, working?.assets);
+    }
+
+    if (!suggestOnly) {
+      videoCost = videoCostFromInputs(inputs0, working?.assets);
+      await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
+    }
+
     await updateStatus({ supabase, generationId, status: "prompting" });
     emitStatus(generationId, "prompting");
 
@@ -2829,18 +2837,21 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
   const mergedInputs0 = { ...(parentVars?.inputs || {}), ...(working?.inputs || {}) };
   const mergedAssets0 = { ...(parentVars?.assets || {}), ...(working?.assets || {}) };
   const pricing = resolveVideoPricing(mergedInputs0, mergedAssets0);
-  const frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
+  let frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
   const videoCost = videoCostFromInputs(mergedInputs0, mergedAssets0);
 
+  // ✅ NEVER get stuck "queued" if duration is missing
   if ((frame2.kind === "ref_video" || frame2.kind === "ref_audio") && !frame2.rawDurationSec) {
-    throw makeHttpError(400, "MISSING_FRAME2_DURATION_SEC");
+    const fallback = resolveVideoDurationSec(mergedInputs0);
+    mergedInputs0.frame2_duration_sec =
+      mergedInputs0.frame2_duration_sec || mergedInputs0.frame2DurationSec || fallback;
+    frame2 = resolveFrame2Reference(mergedInputs0, mergedAssets0);
   }
-
-  await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
 
   let chatter = null;
 
   try {
+    await chargeGeneration({ passId, generationId, cost: videoCost, reason: "mma_video", lane: "video" });
     await updateStatus({ supabase, generationId, status: "prompting" });
     emitStatus(generationId, "prompting");
 

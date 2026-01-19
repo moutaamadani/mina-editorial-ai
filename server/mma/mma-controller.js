@@ -2688,12 +2688,17 @@ const usePromptOverride = !!promptOverride;
       working?.inputs?.audio_enabled ??
       working?.inputs?.audioEnabled ??
       working?.inputs?.with_audio ??
-      working?.inputs?.withAudio ??
+      working?.inputs?.withAudio;
+
+    const muteRaw =
       working?.inputs?.mute ??
       working?.inputs?.muted;
 
-    // ✅ default OFF if frontend doesn't send it
-    let generateAudio = generateAudioRaw === undefined ? false : !!generateAudioRaw;
+    // ✅ default ON unless explicitly disabled
+    let generateAudio =
+      generateAudioRaw !== undefined ? !!generateAudioRaw :
+      muteRaw !== undefined ? !Boolean(muteRaw) :
+      true;
 
     // ✅ 2 frames (end frame present) => ALWAYS force mute on backend too
     if (asHttpUrl(endImage)) generateAudio = false;
@@ -3009,12 +3014,17 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       mergedInputsAudio?.audio_enabled ??
       mergedInputsAudio?.audioEnabled ??
       mergedInputsAudio?.with_audio ??
-      mergedInputsAudio?.withAudio ??
+      mergedInputsAudio?.withAudio;
+
+    const muteRaw =
       mergedInputsAudio?.mute ??
       mergedInputsAudio?.muted;
 
-    // ✅ default OFF
-    let generateAudio = generateAudioRaw === undefined ? false : !!generateAudioRaw;
+    // ✅ default ON unless explicitly disabled
+    let generateAudio =
+      generateAudioRaw !== undefined ? !!generateAudioRaw :
+      muteRaw !== undefined ? !Boolean(muteRaw) :
+      true;
 
     // ✅ 2 frames => force mute
     if (asHttpUrl(endImage)) generateAudio = false;

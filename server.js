@@ -19,7 +19,6 @@ import { requireAdmin } from "./auth.js";
 import mmaRouter from "./server/mma/mma-router.js";
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 import historyRouter from "./server/history-router.js";
-import { startMmaInlineWorker } from "./server/mma/mma-inline-worker.js";
 
 import {
   resolvePassId as megaResolvePassId,
@@ -921,6 +920,5 @@ app.use(errorMiddleware);
 app.listen(PORT, () => {
   console.log(`Mina MMA API (MMA+MEGA) listening on port ${PORT}`);
 
-  // ✅ consume queued generations in the same service
-  startMmaInlineWorker({ intervalMs: 2500, maxBatch: 1 });
+
 });

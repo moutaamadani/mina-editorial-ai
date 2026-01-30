@@ -851,7 +851,7 @@ function buildSeedreamImageInputs(vars) {
   )
     .map(asHttpUrl)
     .filter(Boolean)
-    .slice(0, 4);
+    .slice(0, 8);
 
   return []
     .concat(product ? [product] : [])
@@ -2026,7 +2026,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
         if (heroKeySet.size && heroKeySet.has(k)) return false;
         return true;
       })
-      .slice(0, 4);
+      .slice(0, 8);
 
     const labeledImages = []
       // Product pill -> Scene / Composition reference

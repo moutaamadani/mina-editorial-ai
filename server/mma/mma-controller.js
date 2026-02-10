@@ -885,7 +885,13 @@ function resolveStillLane(vars) {
 }
 
 function nanoBananaEnabled() {
-  return !!safeStr(process.env.MMA_NANOBANANA_VERSION, "");
+  const nanoVersion = safeStr(process.env.MMA_NANOBANANA_VERSION, "");
+  if (nanoVersion) return true;
+
+  // Backward-compatibility: some deployments set MMA_SEADREAM_VERSION to nano-banana.
+  // Treat that as enabling the nano lane as well.
+  const legacyStillVersion = safeStr(process.env.MMA_SEADREAM_VERSION, "").toLowerCase();
+  return legacyStillVersion.startsWith("google/nano-banana");
 }
 
 function buildNanoBananaImageInputs(vars) {
@@ -934,6 +940,7 @@ async function runNanoBanana({
 
   const version =
     safeStr(process.env.MMA_NANOBANANA_VERSION, "") ||
+    safeStr(process.env.MMA_SEADREAM_VERSION, "") ||
     safeStr(cfg?.nanobanana?.model, "") ||
     "google/nano-banana-pro";
 

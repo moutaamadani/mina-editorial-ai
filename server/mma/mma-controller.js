@@ -884,14 +884,16 @@ function resolveStillLane(vars) {
   return raw === "niche" ? "niche" : "main";
 }
 
-function nanoBananaEnabled() {
-  const nanoVersion = safeStr(process.env.MMA_NANOBANANA_VERSION, "");
-  if (nanoVersion) return true;
+function nanoBananaUseGemini() {
+  return String(process.env.MMA_NANOBANANA_USE_GEMINI || "").trim() === "1";
+}
 
-  // Backward-compatibility: some deployments set MMA_SEADREAM_VERSION to nano-banana.
-  // Treat that as enabling the nano lane as well.
-  const legacyStillVersion = safeStr(process.env.MMA_SEADREAM_VERSION, "").toLowerCase();
-  return legacyStillVersion.startsWith("google/nano-banana");
+function nanoBananaEnabled() {
+  // If Gemini direct is enabled, we only require GEMINI_API_KEY
+  if (nanoBananaUseGemini()) return !!process.env.GEMINI_API_KEY;
+
+  // Otherwise we require the Replicate nano banana version (your current behavior)
+  return !!process.env.MMA_NANOBANANA_VERSION;
 }
 
 function buildNanoBananaImageInputs(vars) {
@@ -926,7 +928,7 @@ function buildNanoBananaImageInputs(vars) {
     .slice(0, 14);
 }
 
-async function runNanoBanana({
+async function runNanoBananaReplicate({
   prompt,
   aspectRatio,
   imageInputs = [],
@@ -1022,6 +1024,194 @@ async function runNanoBanana({
     },
     provider: { prediction },
   };
+}
+
+function _guessMimeFromUrl(url) {
+  const u = String(url || "").toLowerCase();
+  if (u.includes(".jpg") || u.includes(".jpeg")) return "image/jpeg";
+  if (u.includes(".webp")) return "image/webp";
+  return "image/png";
+}
+
+function _normalizeAspectRatio(ar) {
+  if (!ar) return undefined;
+  const s = String(ar).trim();
+  // If it already looks like "16:9" keep it
+  if (/^\d+\s*:\s*\d+$/.test(s)) return s.replace(/\s+/g, "");
+  // Common fallbacks
+  if (s === "square") return "1:1";
+  if (s === "portrait") return "4:5";
+  if (s === "landscape") return "16:9";
+  return undefined;
+}
+
+let _r2GeminiClientPromise = null;
+async function _getR2GeminiClient() {
+  if (_r2GeminiClientPromise) return _r2GeminiClientPromise;
+
+  _r2GeminiClientPromise = (async () => {
+    const { S3Client } = await import("@aws-sdk/client-s3");
+
+    const endpoint =
+      process.env.R2_ENDPOINT ||
+      (process.env.R2_ACCOUNT_ID
+        ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
+        : null);
+
+    const accessKeyId = process.env.R2_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
+
+    if (!endpoint) throw new Error("R2_ENDPOINT (or R2_ACCOUNT_ID) is missing");
+    if (!accessKeyId || !secretAccessKey) throw new Error("R2 access keys are missing");
+
+    return new S3Client({
+      region: "auto",
+      endpoint,
+      credentials: { accessKeyId, secretAccessKey },
+    });
+  })();
+
+  return _r2GeminiClientPromise;
+}
+
+async function _putBytesToR2Public({ bytes, contentType, keyPrefix }) {
+  const { PutObjectCommand } = await import("@aws-sdk/client-s3");
+
+  const bucket =
+    process.env.R2_BUCKET ||
+    process.env.R2_BUCKET_NAME ||
+    process.env.R2_PUBLIC_BUCKET;
+
+  const base = process.env.R2_PUBLIC_BASE_URL;
+
+  if (!bucket) throw new Error("R2_BUCKET (or R2_BUCKET_NAME) is missing");
+  if (!base) throw new Error("R2_PUBLIC_BASE_URL is missing");
+
+  const client = await _getR2GeminiClient();
+
+  const ext =
+    contentType === "image/jpeg" ? "jpg" :
+    contentType === "image/webp" ? "webp" :
+    "png";
+
+  const key = `${String(keyPrefix || "mma/nanobanana/gemini").replace(/\/$/,"")}/${Date.now()}_${Math.random()
+    .toString(16)
+    .slice(2)}.${ext}`;
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: bytes,
+      ContentType: contentType || "application/octet-stream",
+      ACL: "public-read",
+    })
+  );
+
+  return `${base.replace(/\/$/,"")}/${key}`;
+}
+
+async function runNanoBananaGemini(opts) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY is missing (set it in env)");
+
+  const model =
+    process.env.MMA_NANOBANANA_GEMINI_MODEL ||
+    "gemini-3-pro-image-preview"; // Nano Banana Pro :contentReference[oaicite:2]{index=2}
+
+  const prompt = opts?.prompt || opts?.text || opts?.textPrompt || "";
+  const aspectRatio = _normalizeAspectRatio(
+    opts?.aspectRatio || opts?.aspect || opts?.stillAspect
+  );
+
+  const imageInputs = Array.isArray(opts?.imageInputs)
+    ? opts.imageInputs
+    : Array.isArray(opts?.inputs)
+      ? opts.inputs
+      : [];
+
+  // Build Gemini parts: (optional images) + text
+  const parts = [];
+
+  // IMPORTANT: downloading images and sending inline base64
+  // (keep it small — too many images can make the request heavy)
+  const maxImgs = 6;
+  for (const url of imageInputs.slice(0, maxImgs)) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to fetch image input: ${res.status}`);
+    const mime = (res.headers.get("content-type") || _guessMimeFromUrl(url)).split(";")[0];
+    const buf = Buffer.from(await res.arrayBuffer());
+    parts.push({
+      inline_data: {
+        mime_type: mime,
+        data: buf.toString("base64"),
+      },
+    });
+  }
+
+  parts.push({ text: prompt });
+
+  const body = {
+    contents: [{ parts }],
+    generationConfig: {
+      responseModalities: ["Image"], // official REST example :contentReference[oaicite:3]{index=3}
+      imageConfig: {},
+    },
+  };
+
+  if (aspectRatio) body.generationConfig.imageConfig.aspectRatio = aspectRatio;
+
+  // Only used by the Pro preview model (optional)
+  if (model === "gemini-3-pro-image-preview") {
+    const sz = process.env.MMA_NANOBANANA_GEMINI_IMAGE_SIZE || "2K";
+    if (sz) body.generationConfig.imageConfig.imageSize = sz;
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 120000);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: ctrl.signal,
+  }).finally(() => clearTimeout(to));
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(`Gemini failed (${resp.status}): ${JSON.stringify(json).slice(0, 1200)}`);
+  }
+
+  const outParts = json?.candidates?.[0]?.content?.parts || [];
+  const imgPart = outParts.find((p) => (p?.inlineData?.data || p?.inline_data?.data));
+  if (!imgPart) throw new Error(`Gemini response had no image. Got: ${JSON.stringify(json).slice(0, 1200)}`);
+
+  const blob = imgPart.inlineData || imgPart.inline_data;
+  const mime = blob.mimeType || blob.mime_type || "image/png";
+  const bytes = Buffer.from(blob.data, "base64");
+
+  const publicUrl = await _putBytesToR2Public({
+    bytes,
+    contentType: mime,
+    keyPrefix: "mma/nanobanana/gemini",
+  });
+
+  return {
+    url: publicUrl,
+    provider: "gemini",
+    model,
+  };
+}
+
+// Wrapper: keeps your existing calls unchanged
+async function runNanoBanana(opts) {
+  if (nanoBananaUseGemini()) return runNanoBananaGemini(opts);
+  return runNanoBananaReplicate(opts);
 }
 
 // ---- HARD TIMEOUT settings (4 minutes default) ----

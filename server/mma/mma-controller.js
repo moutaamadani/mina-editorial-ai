@@ -1132,7 +1132,7 @@ async function runNanoBananaGemini(opts) {
       : [];
 
   const maxImgs =
-    Number(process.env.MMA_NANOBANANA_GEMINI_MAX_IMAGES || 6) || 6;
+    Number(process.env.MMA_NANOBANANA_GEMINI_MAX_IMAGES || 14) || 14;
 
   // Build Gemini parts: (optional images) + text
   const parts = [];
@@ -1164,7 +1164,7 @@ async function runNanoBananaGemini(opts) {
 
   // Only used by the Pro preview model (optional)
   if (model === "gemini-3-pro-image-preview") {
-    const sz = process.env.MMA_NANOBANANA_GEMINI_IMAGE_SIZE || "2K";
+    const sz = process.env.MMA_NANOBANANA_GEMINI_IMAGE_SIZE || "4K";
     if (sz) body.generationConfig.imageConfig.imageSize = sz;
   }
 
@@ -1172,7 +1172,7 @@ async function runNanoBananaGemini(opts) {
 
   const ctrl = new AbortController();
   const timeoutMs =
-    Number(process.env.MMA_NANOBANANA_GEMINI_TIMEOUT_MS || 240000) || 240000;
+    Number(process.env.MMA_NANOBANANA_GEMINI_TIMEOUT_MS || 1200000) || 1200000;
   const to = setTimeout(() => ctrl.abort(), timeoutMs);
 
   const resp = await fetch(url, {
@@ -1201,7 +1201,7 @@ async function runNanoBananaGemini(opts) {
   // ✅ THIS is your real problem:
   if (finishReason && String(finishReason).toUpperCase().includes("IMAGE_SAFETY")) {
     const e = new Error(
-      `IMAGE_SAFETY: ${finishMessage || "Blocked by Gemini safety filters. Try rephrasing the prompt."}`
+      `IMAGE_SAFETY: ${finishMessage || "Blocked by safety filters. Try rephrasing."}`
     );
     e.code = "IMAGE_SAFETY";
     e.provider = { gemini: { finishReason, finishMessage } };

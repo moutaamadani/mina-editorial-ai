@@ -1094,7 +1094,7 @@ async function _putBytesToR2Public({ bytes, contentType, keyPrefix }) {
     contentType === "image/webp" ? "webp" :
     "png";
 
-  const key = `${String(keyPrefix || "mma/nanobanana/gemini").replace(/\/$/,"")}/${Date.now()}_${Math.random()
+  const key = `${String(keyPrefix || "mma/generated").replace(/\/$/,"")}/${Date.now()}_${Math.random()
     .toString(16)
     .slice(2)}.${ext}`;
 
@@ -1225,7 +1225,7 @@ async function runNanoBananaGemini(opts) {
   const publicUrl = await _putBytesToR2Public({
     bytes,
     contentType: mime,
-    keyPrefix: "mma/nanobanana/gemini",
+    keyPrefix: "mma/still",
   });
 
   const outputFormat =

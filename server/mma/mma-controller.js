@@ -3231,6 +3231,14 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
     prompts: body?.prompts || {},
   });
 
+  const parentAspectRatio = safeStr(
+    parent?.mg_mma_vars?.inputs?.aspect_ratio || parent?.mg_mma_vars?.inputs?.aspectRatio,
+    ""
+  );
+  if (!safeStr(vars?.inputs?.aspect_ratio, "") && parentAspectRatio) {
+    vars.inputs = { ...(vars.inputs || {}), aspect_ratio: parentAspectRatio };
+  }
+
   const appliedResolution = resolveAppliedStillResolution(body?.inputs || {});
   vars.inputs = { ...(vars.inputs || {}), ...stillResolutionMeta(appliedResolution) };
   vars.meta = { ...(vars.meta || {}), ...stillResolutionMeta(appliedResolution) };

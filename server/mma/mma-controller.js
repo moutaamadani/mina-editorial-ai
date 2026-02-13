@@ -1155,7 +1155,7 @@ async function runNanoBananaGemini(opts) {
   const body = {
     contents: [{ parts }],
     generationConfig: {
-      responseModalities: ["Image"], // official REST example :contentReference[oaicite:3]{index=3}
+      responseModalities: ["IMAGE"], // official REST example :contentReference[oaicite:3]{index=3}
       imageConfig: {},
     },
   };

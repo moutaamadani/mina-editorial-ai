@@ -1104,7 +1104,6 @@ async function _putBytesToR2Public({ bytes, contentType, keyPrefix }) {
       Key: key,
       Body: bytes,
       ContentType: contentType || "application/octet-stream",
-      ACL: "public-read",
     })
   );
 
@@ -1117,7 +1116,9 @@ async function runNanoBananaGemini(opts) {
 
   const model =
     process.env.MMA_NANOBANANA_GEMINI_MODEL ||
-    "gemini-3-pro-image-preview"; // Nano Banana Pro :contentReference[oaicite:2]{index=2}
+    "gemini-3-pro-image-preview";
+
+  const t0 = Date.now();
 
   const prompt = opts?.prompt || opts?.text || opts?.textPrompt || "";
   const aspectRatio = _normalizeAspectRatio(
@@ -1130,12 +1131,12 @@ async function runNanoBananaGemini(opts) {
       ? opts.inputs
       : [];
 
+  const maxImgs =
+    Number(process.env.MMA_NANOBANANA_GEMINI_MAX_IMAGES || 6) || 6;
+
   // Build Gemini parts: (optional images) + text
   const parts = [];
 
-  // IMPORTANT: downloading images and sending inline base64
-  // (keep it small — too many images can make the request heavy)
-  const maxImgs = 6;
   for (const url of imageInputs.slice(0, maxImgs)) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Failed to fetch image input: ${res.status}`);
@@ -1170,7 +1171,9 @@ async function runNanoBananaGemini(opts) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), 120000);
+  const timeoutMs =
+    Number(process.env.MMA_NANOBANANA_GEMINI_TIMEOUT_MS || 240000) || 240000;
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
 
   const resp = await fetch(url, {
     method: "POST",
@@ -1189,7 +1192,9 @@ async function runNanoBananaGemini(opts) {
 
   const outParts = json?.candidates?.[0]?.content?.parts || [];
   const imgPart = outParts.find((p) => (p?.inlineData?.data || p?.inline_data?.data));
-  if (!imgPart) throw new Error(`Gemini response had no image. Got: ${JSON.stringify(json).slice(0, 1200)}`);
+  if (!imgPart) {
+    throw new Error(`Gemini response had no image. Got: ${JSON.stringify(json).slice(0, 1200)}`);
+  }
 
   const blob = imgPart.inlineData || imgPart.inline_data;
   const mime = blob.mimeType || blob.mime_type || "image/png";
@@ -1201,10 +1206,33 @@ async function runNanoBananaGemini(opts) {
     keyPrefix: "mma/nanobanana/gemini",
   });
 
+  const outputFormat =
+    mime === "image/jpeg" ? "jpg" :
+    mime === "image/webp" ? "webp" :
+    "png";
+
   return {
-    url: publicUrl,
-    provider: "gemini",
-    model,
+    input: {
+      prompt,
+      resolution: safeStr(opts?.resolution, "") || safeStr(opts?.size, "") || "2K",
+      aspect_ratio: aspectRatio || undefined,
+      output_format: outputFormat,
+      image_input: imageInputs.slice(0, maxImgs).map(asHttpUrl).filter(Boolean),
+      provider: "gemini",
+      model,
+    },
+    out: publicUrl,
+    prediction_id: null,
+    prediction_status: "succeeded",
+    timed_out: false,
+    timing: {
+      started_at: new Date(t0).toISOString(),
+      ended_at: nowIso(),
+      duration_ms: Date.now() - t0,
+    },
+    provider: {
+      gemini: { model },
+    },
   };
 }
 

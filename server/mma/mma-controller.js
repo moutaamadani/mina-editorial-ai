@@ -1186,14 +1186,36 @@ async function runNanoBananaGemini(opts) {
   }).finally(() => clearTimeout(to));
 
   const json = await resp.json().catch(() => ({}));
+
   if (!resp.ok) {
-    throw new Error(`Gemini failed (${resp.status}): ${JSON.stringify(json).slice(0, 1200)}`);
+    const e = new Error(`GEMINI_HTTP_${resp.status}: ${JSON.stringify(json).slice(0, 1200)}`);
+    e.code = `GEMINI_HTTP_${resp.status}`;
+    e.provider = { gemini: json };
+    throw e;
   }
 
-  const outParts = json?.candidates?.[0]?.content?.parts || [];
+  const cand0 = json?.candidates?.[0] || {};
+  const finishReason = safeStr(cand0?.finishReason || cand0?.finish_reason, "");
+  const finishMessage = safeStr(cand0?.finishMessage || cand0?.finish_message, "");
+
+  // ✅ THIS is your real problem:
+  if (finishReason && String(finishReason).toUpperCase().includes("IMAGE_SAFETY")) {
+    const e = new Error(
+      `IMAGE_SAFETY: ${finishMessage || "Blocked by Gemini safety filters. Try rephrasing the prompt."}`
+    );
+    e.code = "IMAGE_SAFETY";
+    e.provider = { gemini: { finishReason, finishMessage } };
+    throw e;
+  }
+
+  const outParts = cand0?.content?.parts || [];
   const imgPart = outParts.find((p) => (p?.inlineData?.data || p?.inline_data?.data));
+
   if (!imgPart) {
-    throw new Error(`Gemini response had no image. Got: ${JSON.stringify(json).slice(0, 1200)}`);
+    const e = new Error(`GEMINI_NO_IMAGE_PART: ${JSON.stringify(json).slice(0, 1200)}`);
+    e.code = "GEMINI_NO_IMAGE_PART";
+    e.provider = { gemini: json };
+    throw e;
   }
 
   const blob = imgPart.inlineData || imgPart.inline_data;

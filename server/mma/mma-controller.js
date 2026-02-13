@@ -953,9 +953,9 @@ async function runNanoBananaReplicate({
 
   const defaultResolution =
     safeStr(
-      String(resolution ?? cfg?.nanobanana?.resolution ?? process.env.MMA_NANOBANANA_RESOLUTION ?? "2K"),
-      "2K"
-    ) || "2K";
+      String(resolution ?? cfg?.nanobanana?.resolution ?? process.env.MMA_NANOBANANA_RESOLUTION ?? "4K"),
+      "4K"
+    ) || "4K";
 
   const defaultFmt =
     safeStr(
@@ -1236,7 +1236,7 @@ async function runNanoBananaGemini(opts) {
   return {
     input: {
       prompt,
-      resolution: safeStr(opts?.resolution, "") || safeStr(opts?.size, "") || "2K",
+      resolution: safeStr(opts?.resolution, "") || safeStr(opts?.size, "") || "4K",
       aspect_ratio: aspectRatio || undefined,
       output_format: outputFormat,
       image_input: imageInputs.slice(0, maxImgs).map(asHttpUrl).filter(Boolean),
@@ -1284,7 +1284,7 @@ async function runSeedream({ prompt, aspectRatio, imageInputs = [], size, enhanc
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
-  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K";
+  const sizeValue = size || cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "4K";
   const defaultAspect =
     cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO || "match_input_image";
 

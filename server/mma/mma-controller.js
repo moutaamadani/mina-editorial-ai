@@ -1590,6 +1590,37 @@ function resolveStillLaneFromInputs(inputsLike) {
   return raw === "niche" ? "niche" : "main";
 }
 
+function normalizeStillResolutionValue(rawLike) {
+  const raw = safeStr(rawLike, "").toLowerCase();
+  if (!raw) return "4K";
+  if (raw === "2k" || raw === "2048" || raw === "2") return "2K";
+  if (raw === "4k" || raw === "4096" || raw === "4") return "4K";
+  return "4K";
+}
+
+function resolveAppliedStillResolution(inputsLike) {
+  const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
+  const lane = resolveStillLaneFromInputs(inputs);
+  if (lane === "main") return "4K";
+
+  return normalizeStillResolutionValue(
+    inputs.still_resolution ||
+      inputs.stillResolution ||
+      inputs.resolution ||
+      inputs.image_resolution ||
+      inputs.imageResolution
+  );
+}
+
+function stillResolutionMeta(resolution) {
+  const canonical = normalizeStillResolutionValue(resolution);
+  return {
+    still_resolution: canonical,
+    resolution: canonical,
+    applied_resolution: canonical,
+  };
+}
+
 function stillCostForLane(lane) {
   return lane === "niche" ? MMA_COSTS.still_niche : MMA_COSTS.still_main;
 }
@@ -2108,8 +2139,15 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     // lane: "main" (default) => Seedream, "niche" => Nano Banana (if enabled)
     const stillLane = resolveStillLane(working);
     const useNano = stillLane === "niche" && nanoBananaEnabled();
+    const appliedResolution = resolveAppliedStillResolution(working?.inputs || {});
 
-    working.meta = { ...(working.meta || {}), still_lane: stillLane, still_engine: useNano ? "nanobanana" : "seedream" };
+    working.inputs = { ...(working.inputs || {}), ...stillResolutionMeta(appliedResolution) };
+    working.meta = {
+      ...(working.meta || {}),
+      still_lane: stillLane,
+      still_engine: useNano ? "nanobanana" : "seedream",
+      ...stillResolutionMeta(appliedResolution),
+    };
     await updateVars({ supabase, generationId, vars: working });
 
     const imageInputs = useNano ? buildNanoBananaImageInputs(working) : buildSeedreamImageInputs(working);
@@ -2135,7 +2173,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
             prompt: usedPrompt,
             aspectRatio,
             imageInputs,
-            resolution: cfg?.nanobanana?.resolution, // optional (env handles your Render vars)
+            resolution: appliedResolution,
             outputFormat: cfg?.nanobanana?.outputFormat,
             safetyFilterLevel: cfg?.nanobanana?.safetyFilterLevel,
           })
@@ -2143,7 +2181,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
             prompt: usedPrompt,
             aspectRatio,
             imageInputs,
-            size: cfg?.seadream?.size,
+            size: appliedResolution,
             enhancePrompt: cfg?.seadream?.enhancePrompt,
           });
 
@@ -2322,8 +2360,15 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
 
     const stillLane = resolveStillLane(working);
     const useNano = stillLane === "niche" && nanoBananaEnabled();
+    const appliedResolution = resolveAppliedStillResolution(working?.inputs || {});
 
-    working.meta = { ...(working.meta || {}), still_lane: stillLane, still_engine: useNano ? "nanobanana" : "seedream" };
+    working.inputs = { ...(working.inputs || {}), ...stillResolutionMeta(appliedResolution) };
+    working.meta = {
+      ...(working.meta || {}),
+      still_lane: stillLane,
+      still_engine: useNano ? "nanobanana" : "seedream",
+      ...stillResolutionMeta(appliedResolution),
+    };
     await updateVars({ supabase, generationId, vars: working });
 
     let aspectRatio =
@@ -2341,7 +2386,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     const forcedInput = useNano
       ? {
           prompt: usedPrompt,
-          resolution: cfg?.nanobanana?.resolution || process.env.MMA_NANOBANANA_RESOLUTION || "2K",
+          resolution: appliedResolution,
           aspect_ratio: aspectRatio,
           output_format: cfg?.nanobanana?.outputFormat || process.env.MMA_NANOBANANA_OUTPUT_FORMAT || "jpg",
           safety_filter_level:
@@ -2350,7 +2395,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
         }
       : {
           prompt: usedPrompt,
-          size: cfg?.seadream?.size || process.env.MMA_SEADREAM_SIZE || "2K",
+          size: appliedResolution,
           aspect_ratio: aspectRatio,
           enhance_prompt: !!cfg?.seadream?.enhancePrompt,
           sequential_image_generation: "disabled",
@@ -3186,6 +3231,10 @@ export async function handleMmaStillTweak({ parentGenerationId, body }) {
     prompts: body?.prompts || {},
   });
 
+  const appliedResolution = resolveAppliedStillResolution(body?.inputs || {});
+  vars.inputs = { ...(vars.inputs || {}), ...stillResolutionMeta(appliedResolution) };
+  vars.meta = { ...(vars.meta || {}), ...stillResolutionMeta(appliedResolution) };
+
   vars.mg_pass_id = passId;
 
   const sessionId =
@@ -3365,6 +3414,12 @@ export async function handleMmaCreate({ mode, body }) {
     feedback: body?.feedback || {},
     prompts: body?.prompts || {},
   });
+
+  if (mode === "still") {
+    const appliedResolution = resolveAppliedStillResolution(body?.inputs || {});
+    vars.inputs = { ...(vars.inputs || {}), ...stillResolutionMeta(appliedResolution) };
+    vars.meta = { ...(vars.meta || {}), ...stillResolutionMeta(appliedResolution) };
+  }
 
   vars.mg_pass_id = passId;
 

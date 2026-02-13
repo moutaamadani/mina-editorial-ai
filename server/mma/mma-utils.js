@@ -265,6 +265,22 @@ export function makeInitialVars({
           inputs.createLane,
         ""
       ),
+      still_resolution: safeString(
+        inputs.still_resolution ||
+          inputs.stillResolution ||
+          inputs.resolution ||
+          inputs.image_resolution ||
+          inputs.imageResolution,
+        ""
+      ),
+      resolution: safeString(
+        inputs.resolution ||
+          inputs.still_resolution ||
+          inputs.stillResolution ||
+          inputs.image_resolution ||
+          inputs.imageResolution,
+        ""
+      ),
 
       motion_user_brief: motionUserBrief,
       selected_movement_style: selectedMovementStyle,

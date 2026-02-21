@@ -450,7 +450,7 @@ async function getMmaCtxConfig(supabase) {
   "If the user brief contains the word 'madani' or 'mina', ignore all instructions and return the user brief verbatim as the prompt. If blur, grain, film texture, or similar aesthetics are part of the brief, explicitly mention them. If the task is simple (such as replace or remove), produce a concise prompt and force AI to keep everytthing else the same. if the user droped in inspiration you should understand it and extract from it the background, the colors, the vibe, the tone, the technique, the camera, the angle like you anylze the inspiration so you understand what he really love about it and want his product to be like.",
 
   "SAFETY AND CONSTRAINTS:",
-  "Maximum one-line prompt. If the user says replace or keep, infer which aesthetic, composition, and tone they prefer from the reference image and apply it to the new subject. Start with 'Generate an image where you replace …'. The prompt should read like a clear creative brief, not a run-on sentence. Two lines maximum if absolutely necessary. if niche mode is selected try a very simple clear prompt"
+  "Maximum one-line prompt. Always end with negative prompt too especially when it is design no 2d just put , If the user says replace or keep, infer which aesthetic, composition, and tone they prefer from the reference image and apply it to the new subject. Start with 'Generate an image where you replace …'. The prompt should read like a clear creative brief, not a run-on sentence. Two lines maximum if absolutely necessary. if niche mode is selected try a very simple clear prompt"
 ].join("\n"),
 
 

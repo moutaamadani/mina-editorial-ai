@@ -1389,42 +1389,46 @@ function pickKlingEndImage(vars, parent) {
 }
 
 // ============================================================================
-// Kling runner (supports both v2.1 and v2.6 schema)
+// Kling runner (v3-video + legacy fallback)
+// - If MMA_KLING_VERSION is set to kwaivgi/kling-v3-video, we use v3 schema.
+// - v3 supports 1080p "pro", duration 3–15s, optional end_image, and generate_audio.
+// - NOTE TO DEV: v3 also supports multi_prompt (JSON array of shots). We leave it empty for now.
+//   Once GPT sends structured JSON prompts for video, we will populate multi_prompt.
 // ============================================================================
 async function runKling({
   prompt,
   startImage,
-  endImage, // v2.6 does NOT support end_image (kept for backward compat)
+  endImage,
   duration,
-  mode, // v2.6 does NOT support mode (kept for backward compat)
+  mode,
   negativePrompt,
-  generateAudio, // v2.6 field
-  aspectRatio,   // v2.6 field (used when no start_image)
+  generateAudio,
+  aspectRatio,
   input: forcedInput,
 }) {
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
-    // pick model version from env/config (default v2.1)
+  // pick model version from env/config
   let version =
     process.env.MMA_KLING_VERSION ||
     process.env.MMA_KLING_MODEL_VERSION ||
     cfg?.kling?.model ||
     "kwaivgi/kling-v2.1";
 
-  // ✅ FORCE v2.1 when an end frame is provided (2-image motion)
-  // Kling v2.6 schema does NOT support end_image, so we must use v2.1.
   const hasEndFrame = !!asHttpUrl(endImage);
-  if (hasEndFrame) {
+
+  // Detect v3
+  const isV3 = /kling[-_/]?v3/i.test(String(version)) || String(version).includes("kling-v3-video");
+
+  // Legacy v2.6 detection
+  let is26 = !isV3 && /kling[-_/]?v2\.6/i.test(String(version));
+
+  // ✅ Only do the old “force v2.1 when end frame exists” rule for v2.6 (because v2.6 doesn't support end_image)
+  if (is26 && hasEndFrame) {
     version = process.env.MMA_KLING_V21_MODEL || "kwaivgi/kling-v2.1";
+    is26 = false;
   }
-
-  const is26 = /kling[-_/]?v2\.6/i.test(String(version));
-
-
-  // v2.6: duration must be 5 or 10
-  const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
-  const duration26 = rawDuration >= 10 ? 10 : 5;
 
   const envNeg =
     process.env.NEGATIVE_PROMPT_KLING ||
@@ -1438,11 +1442,59 @@ async function runKling({
   const REPLICATE_MAX_MS_KLING =
     Number(process.env.MMA_REPLICATE_MAX_MS_KLING || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000;
 
+  const normalizeV3Mode = (v) => {
+    const s = safeStr(v, "").toLowerCase();
+    if (s === "pro" || s === "1080p") return "pro";
+    if (s === "standard" || s === "std" || s === "720p") return "standard";
+    return "pro"; // ✅ your default: high quality
+  };
+
+  const clampInt = (n, a, b) => {
+    const x = Math.round(Number(n || 0) || 0);
+    return Math.max(a, Math.min(b, x));
+  };
+
   let input;
+
   if (forcedInput) {
     input = { ...forcedInput };
+  } else if (isV3) {
+    // ✅ v3 schema: mode, duration (3..15), start_image, optional end_image, generate_audio, negative_prompt
+    const hasStart = !!asHttpUrl(startImage);
+    const ar =
+      safeStr(aspectRatio, "") ||
+      safeStr(cfg?.kling?.aspectRatio, "") ||
+      safeStr(process.env.MMA_KLING_ASPECT_RATIO, "") ||
+      "16:9";
+
+    const rawDuration =
+      Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
+
+    const durV3 = clampInt(rawDuration, 3, 15);
+
+    input = {
+      prompt: safeStr(prompt, ""),
+      duration: durV3,
+      mode: normalizeV3Mode(
+        safeStr(mode, "") ||
+          safeStr(cfg?.kling?.mode, "") ||
+          safeStr(process.env.MMA_KLING_MODE, "") ||
+          "pro"
+      ),
+      ...(hasStart ? { start_image: startImage } : { aspect_ratio: ar }),
+      ...(asHttpUrl(endImage) ? { end_image: asHttpUrl(endImage) } : {}),
+      generate_audio: generateAudio !== undefined ? !!generateAudio : true,
+      ...(safeStr(finalNeg, "") ? { negative_prompt: safeStr(finalNeg, "") } : {}),
+
+      // NOTE TO DEV (future):
+      // multi_prompt: JSON.stringify([{prompt:"...",duration:5}, ...])
+      // We will set this once GPT outputs structured JSON prompts for multi-shot video.
+    };
   } else if (is26) {
-    // ✅ v2.6 schema (no mode, no end_image, optional aspect_ratio, generate_audio)
+    // ✅ v2.6 schema (legacy)
+    const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
+    const duration26 = rawDuration >= 10 ? 10 : 5;
+
     const hasStart = !!asHttpUrl(startImage);
     const ar =
       safeStr(aspectRatio, "") ||
@@ -1451,38 +1503,36 @@ async function runKling({
       "16:9";
 
     input = {
-      prompt,
+      prompt: safeStr(prompt, ""),
       duration: duration26,
       ...(hasStart ? { start_image: startImage } : { aspect_ratio: ar }),
       generate_audio: generateAudio !== undefined ? !!generateAudio : true,
       negative_prompt: safeStr(finalNeg, ""),
     };
   } else {
-    // ✅ legacy v2.1-style schema (mode + optional end_image)
-    const defaultDuration = rawDuration;
-    const hasEnd = !!asHttpUrl(endImage);
+    // ✅ v2.1 schema (legacy)
+    const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
+
     const finalMode =
       safeStr(mode, "") ||
-      (hasEnd ? "pro" : "") ||
-      cfg?.kling?.mode ||
-      process.env.MMA_KLING_MODE ||
+      safeStr(cfg?.kling?.mode, "") ||
+      safeStr(process.env.MMA_KLING_MODE, "") ||
       "standard";
 
     input = {
       mode: finalMode,
-      prompt,
-      duration: defaultDuration,
+      prompt: safeStr(prompt, ""),
+      duration: rawDuration,
       start_image: startImage,
-      ...(hasEnd ? { end_image: asHttpUrl(endImage) } : {}),
-      ...(finalNeg ? { negative_prompt: finalNeg } : {}),
+      ...(asHttpUrl(endImage) ? { end_image: asHttpUrl(endImage) } : {}),
+      ...(safeStr(finalNeg, "") ? { negative_prompt: safeStr(finalNeg, "") } : {}),
     };
 
-    // try to control audio on v2.1 too (if supported by the model schema)
     if (generateAudio !== undefined) input.generate_audio = !!generateAudio;
   }
 
-  // normalize common fields
-  if (!input.prompt) input.prompt = prompt;
+  // normalize required fields
+  if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
 
   const t0 = Date.now();
 
@@ -1498,9 +1548,10 @@ async function runKling({
       cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
     });
   } catch (err) {
+    // legacy fallback: some old schemas reject generate_audio
     const msg = String(err?.message || err || "").toLowerCase();
     const looksLikeBadField =
-      !is26 && msg.includes("input") && (msg.includes("generate_audio") || msg.includes("unexpected"));
+      !isV3 && !is26 && msg.includes("input") && (msg.includes("generate_audio") || msg.includes("unexpected"));
 
     if (looksLikeBadField) {
       const retryInput = { ...input };
@@ -1516,7 +1567,7 @@ async function runKling({
         cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
       });
 
-      input = retryInput; // keep saved input accurate
+      input = retryInput;
     } else {
       throw err;
     }

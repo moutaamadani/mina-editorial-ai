@@ -1664,15 +1664,22 @@ async function runKlingMotionControl({
   mode,
   keepOriginalSound,
   characterOrientation,
+  duration, // ✅ NEW (optional)
   input: forcedInput,
 }) {
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
+  // ✅ NEW: allow swapping motion model without changing behavior
   const version =
+    process.env.MMA_KLING_MOTION_VERSION || // <- your new env var
     process.env.MMA_KLING_MOTION_CONTROL_VERSION ||
     cfg?.kling_motion_control?.model ||
     "kwaivgi/kling-v2.6-motion-control";
+
+  const isOmni =
+    /kling[-_/]?v3[-_/]?omni/i.test(String(version)) ||
+    String(version).includes("kling-v3-omni-video");
 
   const finalMode = normalizeKmcMode(mode);
   const finalOrientation = normalizeKmcOrientation(characterOrientation);
@@ -1680,29 +1687,61 @@ async function runKlingMotionControl({
   const keep =
     keepOriginalSound !== undefined
       ? !!keepOriginalSound
-      : (cfg?.kling_motion_control?.keepOriginalSound !== undefined ? !!cfg.kling_motion_control.keepOriginalSound : true);
+      : (cfg?.kling_motion_control?.keepOriginalSound !== undefined
+          ? !!cfg.kling_motion_control.keepOriginalSound
+          : true);
 
-  const input = forcedInput
-    ? { ...forcedInput }
-    : {
-        prompt: safeStr(prompt, ""), // allowed to be ""
-        image,
-        video,
-        mode: finalMode,
-        keep_original_sound: keep,
-        character_orientation: finalOrientation,
-      };
+  let input;
 
-  // normalize required fields
-  if (!input.image) input.image = image;
-  if (!input.video) input.video = video;
-  if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
-  if (!input.mode) input.mode = finalMode;
-  if (input.keep_original_sound === undefined) input.keep_original_sound = keep;
-  if (!input.character_orientation) input.character_orientation = finalOrientation;
+  if (forcedInput) {
+    input = { ...forcedInput };
+  } else if (isOmni) {
+    // ✅ Omni schema (keeps same external behavior)
+    // NOTE: Omni supports reference_video for style/motion reference ("feature") or video editing ("base").
+    // We default to "feature" to mimic motion-control behavior.
+    // Also: audio generation can't be used together with reference_video. :contentReference[oaicite:1]{index=1}
+
+    const rawDuration = Number(duration || 5) || 5;
+    const dur = Math.max(3, Math.min(15, Math.round(rawDuration))); // Omni supports 3..15s :contentReference[oaicite:2]{index=2}
+
+    const omniMode =
+      String(mode || "").toLowerCase() === "standard" || String(mode || "").toLowerCase() === "std"
+        ? "standard"
+        : "pro"; // ✅ default high quality
+
+    input = {
+      prompt: safeStr(prompt, ""),
+      mode: omniMode,
+      duration: dur,
+
+      start_image: image,
+      reference_video: video,
+      video_reference_type: safeStr(process.env.MMA_KLING_OMNI_VIDEO_REFERENCE_TYPE, "") || "feature",
+      keep_original_sound: keep,
+    };
+  } else {
+    // ✅ OLD behavior (unchanged): v2.6 motion-control schema
+    input = {
+      prompt: safeStr(prompt, ""), // allowed to be ""
+      image,
+      video,
+      mode: finalMode,
+      keep_original_sound: keep,
+      character_orientation: finalOrientation,
+    };
+
+    // normalize required fields
+    if (!input.image) input.image = image;
+    if (!input.video) input.video = video;
+    if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
+    if (!input.mode) input.mode = finalMode;
+    if (input.keep_original_sound === undefined) input.keep_original_sound = keep;
+    if (!input.character_orientation) input.character_orientation = finalOrientation;
+  }
 
   const REPLICATE_MAX_MS_KMC =
-    Number(process.env.MMA_REPLICATE_MAX_MS_KLING_MOTION_CONTROL || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000;
+    Number(process.env.MMA_REPLICATE_MAX_MS_KLING_MOTION_CONTROL || process.env.MMA_REPLICATE_MAX_MS || 900000) ||
+    900000;
 
   const t0 = Date.now();
 
@@ -3070,6 +3109,7 @@ const usePromptOverride = !!promptOverride;
           mode: kmcMode,
           keepOriginalSound,
           characterOrientation: kmcOrientation,
+          duration: frame2?.rawDurationSec || duration, // ✅ NEW
         });
 
         working.outputs = { ...(working.outputs || {}), kling_motion_control_prediction_id: genRes.prediction_id || null };
@@ -3386,6 +3426,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
           keepOriginalSound: mergedInputs0?.keep_original_sound ?? mergedInputs0?.keepOriginalSound ?? true,
           characterOrientation:
             safeStr(mergedInputs0?.character_orientation || mergedInputs0?.characterOrientation, "") || "video",
+          duration: frame2?.rawDurationSec || duration, // ✅ NEW
         });
 
         stepType = "kling_motion_control_generate_tweak";

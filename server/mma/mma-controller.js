@@ -1856,11 +1856,6 @@ function _clamp(n, a, b) {
   const x = Number(n || 0) || 0;
   return Math.max(a, Math.min(b, x));
 }
-function _ceilTo5(n) {
-  const x = Number(n || 0) || 0;
-  return Math.ceil(x / 5) * 5;
-}
-
 // classic kling duration (still 5/10)
 function resolveVideoDurationSec(inputs) {
   const d = Number(inputs?.duration ?? inputs?.duration_seconds ?? inputs?.durationSeconds ?? 5) || 5;
@@ -1874,10 +1869,11 @@ function resolveVideoPricing(inputsLike, assetsLike) {
   return { flow: "kling" };
 }
 
-// ✅ cost:
-// - normal kling: 5 or 10
-// - ref video: ceil(dur/5)*5, cap 30
-// - ref audio: ceil(dur/5)*5, cap 60
+// ✅ cost rule:
+// - always 2 matchas per second (1s = 2 matchas)
+// - normal kling: 5s => 10, 10s => 20
+// - ref video: duration clamped to max 30s, then *2
+// - ref audio: duration clamped to max 60s, then *2
 function videoCostFromInputs(inputsLike, assetsLike) {
   const inputs = inputsLike && typeof inputsLike === "object" ? inputsLike : {};
   const frame2 = resolveFrame2Reference(inputs, assetsLike);
@@ -1896,13 +1892,12 @@ function videoCostFromInputs(inputsLike, assetsLike) {
     const fallback = resolveVideoDurationSec(inputs); // 5/10 only if nothing else exists
     const raw = rawProvided || fallback;
 
-    const clamped = _clamp(raw, 1, maxSec);
-    const billed = _clamp(_ceilTo5(clamped), 5, maxSec); // 5..30 or 5..60
-    return billed;
+    const billedSeconds = _clamp(raw, 1, maxSec);
+    return billedSeconds * 2;
   }
 
   const sec = resolveVideoDurationSec(inputs);
-  return sec === 10 ? 10 : 5;
+  return sec * 2;
 }
 
 function resolveStillLaneFromInputs(inputsLike) {

@@ -1408,6 +1408,167 @@ function pickKlingEndImage(vars, parent) {
 // - NOTE TO DEV: v3 also supports multi_prompt (JSON array of shots). We leave it empty for now.
 //   Once GPT sends structured JSON prompts for video, we will populate multi_prompt.
 // ============================================================================
+function getKlingHttpConfig() {
+  const baseUrl = safeStr(process.env.KLING_BASE_URL, "https://api-singapore.klingai.com").replace(/\/+$/, "");
+  const accessKey = safeStr(process.env.KLING_ACCESS_KEY, "");
+  const secretKey = safeStr(process.env.KLING_SECRET_KEY, "");
+
+  if (!accessKey || !secretKey) {
+    throw new Error("KLING_KEYS_MISSING");
+  }
+
+  return { baseUrl, accessKey, secretKey };
+}
+
+function normalizeKlingSourceMode(v) {
+  const s = safeStr(v, "").toLowerCase();
+  if (["pro", "professional", "1080p"].includes(s)) return "pro";
+  if (["std", "standard", "720p"].includes(s)) return "std";
+  return "pro";
+}
+
+function extractKlingTaskId(payload) {
+  return safeStr(payload?.data?.task_id, "");
+}
+
+function extractKlingTaskStatus(payload) {
+  return safeStr(payload?.data?.task_status, "");
+}
+
+function extractKlingTaskStatusMsg(payload) {
+  return safeStr(payload?.data?.task_status_msg, "") || safeStr(payload?.message, "");
+}
+
+function extractKlingVideoUrl(payload) {
+  return safeStr(payload?.data?.task_result?.videos?.[0]?.url, "");
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) {
+  const { baseUrl, accessKey, secretKey } = getKlingHttpConfig();
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Math.max(1000, Number(timeoutMs || REPLICATE_CALL_TIMEOUT_MS) || 15000));
+
+  try {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Api-Key": accessKey,
+        "X-Api-Secret": secretKey,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+
+    const rawText = await res.text();
+    let json = null;
+    try {
+      json = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      json = null;
+    }
+
+    if (!res.ok) {
+      const err = new Error(`KLING_HTTP_${res.status}: ${rawText || "Request failed"}`);
+      err.code = `KLING_HTTP_${res.status}`;
+      err.provider = {
+        kling: {
+          method,
+          path,
+          status: res.status,
+          body: json || rawText || null,
+        },
+      };
+      throw err;
+    }
+
+    if (json && typeof json === "object" && Object.prototype.hasOwnProperty.call(json, "code")) {
+      if (Number(json.code) !== 0) {
+        const err = new Error(`KLING_API_ERROR: ${safeStr(json.message, "Unknown Kling API error")}`);
+        err.code = "KLING_API_ERROR";
+        err.provider = {
+          kling: {
+            method,
+            path,
+            status: res.status,
+            body: json,
+          },
+        };
+        throw err;
+      }
+    }
+
+    return json;
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const e = new Error(`KLING_TIMEOUT: ${method} ${path}`);
+      e.code = "KLING_TIMEOUT";
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function submitAndPollKlingTask({
+  createPath,
+  queryPathFromTaskId,
+  body,
+  timeoutMs,
+  pollMs,
+}) {
+  const created = await klingRequestJson(createPath, {
+    method: "POST",
+    body,
+    timeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+  });
+
+  const taskId = extractKlingTaskId(created);
+  if (!taskId) {
+    const err = new Error("KLING_TASK_ID_MISSING");
+    err.code = "KLING_TASK_ID_MISSING";
+    err.provider = { kling: { createPath, createResponse: created } };
+    throw err;
+  }
+
+  let final = created;
+  const startedAt = Date.now();
+  const maxMs = Math.max(5000, Number(timeoutMs || 900000) || 900000);
+  const waitMs = Math.max(1000, Number(pollMs || 2500) || 2500);
+
+  while (true) {
+    const status = extractKlingTaskStatus(final);
+
+    if (status === "succeed") {
+      return { created, final, taskId, timedOut: false };
+    }
+
+    if (status === "failed") {
+      const err = new Error(`KLING_TASK_FAILED: ${extractKlingTaskStatusMsg(final) || "Task failed"}`);
+      err.code = "KLING_TASK_FAILED";
+      err.provider = { kling: { createResponse: created, finalResponse: final, taskId } };
+      throw err;
+    }
+
+    if (Date.now() - startedAt >= maxMs) {
+      return { created, final, taskId, timedOut: true };
+    }
+
+    await sleepMs(waitMs);
+
+    final = await klingRequestJson(queryPathFromTaskId(taskId), {
+      method: "GET",
+      timeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    });
+  }
+}
+
 async function runKling({
   prompt,
   startImage,
@@ -1419,194 +1580,105 @@ async function runKling({
   aspectRatio,
   input: forcedInput,
 }) {
-  const replicate = getReplicate();
   const cfg = getMmaConfig();
 
-  // pick model version from env/config
-  let version =
-    process.env.MMA_KLING_VERSION ||
-    process.env.MMA_KLING_MODEL_VERSION ||
-    cfg?.kling?.model ||
-    "kwaivgi/kling-v2.1";
+  const modelName =
+    safeStr(process.env.MMA_KLING_MODEL_NAME, "") ||
+    safeStr(cfg?.kling?.model_name, "") ||
+    "kling-v3";
 
-  const hasEndFrame = !!asHttpUrl(endImage);
+  const hasStart = !!asHttpUrl(startImage);
+  const hasEnd = !!asHttpUrl(endImage);
 
-  // Detect v3
-  const isV3 = /kling[-_/]?v3/i.test(String(version)) || String(version).includes("kling-v3-video");
+  const rawDuration =
+    Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
 
-  // Legacy v2.6 detection
-  let is26 = !isV3 && /kling[-_/]?v2\.6/i.test(String(version));
+  const finalDuration = Math.max(3, Math.min(15, Math.round(rawDuration)));
+  const finalMode = normalizeKlingSourceMode(
+    safeStr(mode, "") ||
+      safeStr(cfg?.kling?.mode, "") ||
+      safeStr(process.env.MMA_KLING_MODE, "") ||
+      "pro"
+  );
 
-  // ✅ Only do the old “force v2.1 when end frame exists” rule for v2.6 (because v2.6 doesn't support end_image)
-  if (is26 && hasEndFrame) {
-    version = process.env.MMA_KLING_V21_MODEL || "kwaivgi/kling-v2.1";
-    is26 = false;
-  }
+  const finalNeg =
+    negativePrompt !== undefined
+      ? safeStr(negativePrompt, "")
+      : safeStr(
+          process.env.NEGATIVE_PROMPT_KLING || process.env.MMA_NEGATIVE_PROMPT_KLING || cfg?.kling?.negativePrompt,
+          ""
+        );
 
-  const envNeg =
-    process.env.NEGATIVE_PROMPT_KLING ||
-    process.env.MMA_NEGATIVE_PROMPT_KLING ||
-    cfg?.kling?.negativePrompt ||
-    "";
+  const finalPrompt = safeStr(prompt, "");
+  if (!finalPrompt) throw new Error("MISSING_KLING_PROMPT");
 
-  const finalNeg = negativePrompt !== undefined ? negativePrompt : envNeg;
+  const sound = generateAudio ? "on" : "off";
 
-  // Kling-specific timeout (defaults to global)
-  const REPLICATE_MAX_MS_KLING =
-    Number(process.env.MMA_REPLICATE_MAX_MS_KLING || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000;
-
-  const normalizeV3Mode = (v) => {
-    const s = safeStr(v, "").toLowerCase();
-    if (s === "pro" || s === "1080p") return "pro";
-    if (s === "standard" || s === "std" || s === "720p") return "standard";
-    return "pro"; // ✅ your default: high quality
-  };
-
-  const clampInt = (n, a, b) => {
-    const x = Math.round(Number(n || 0) || 0);
-    return Math.max(a, Math.min(b, x));
-  };
-
+  let createPath = "/v1/videos/text2video";
+  let queryPathFromTaskId = (taskId) => `/v1/videos/text2video/${encodeURIComponent(taskId)}`;
   let input;
 
   if (forcedInput) {
     input = { ...forcedInput };
-  } else if (isV3) {
-    // ✅ v3 schema: mode, duration (3..15), start_image, optional end_image, generate_audio, negative_prompt
-    const hasStart = !!asHttpUrl(startImage);
-    const ar =
-      safeStr(aspectRatio, "") ||
-      safeStr(cfg?.kling?.aspectRatio, "") ||
-      safeStr(process.env.MMA_KLING_ASPECT_RATIO, "") ||
-      "16:9";
-
-    const rawDuration =
-      Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
-
-    const durV3 = clampInt(rawDuration, 3, 15);
+  } else if (hasStart) {
+    createPath = "/v1/videos/image2video";
+    queryPathFromTaskId = (taskId) => `/v1/videos/image2video/${encodeURIComponent(taskId)}`;
 
     input = {
-      prompt: safeStr(prompt, ""),
-      duration: durV3,
-      mode: normalizeV3Mode(
-        safeStr(mode, "") ||
-          safeStr(cfg?.kling?.mode, "") ||
-          safeStr(process.env.MMA_KLING_MODE, "") ||
-          "pro"
-      ),
-      ...(hasStart ? { start_image: startImage } : { aspect_ratio: ar }),
-      ...(asHttpUrl(endImage) ? { end_image: asHttpUrl(endImage) } : {}),
-      generate_audio: generateAudio !== undefined ? !!generateAudio : true,
-      ...(safeStr(finalNeg, "") ? { negative_prompt: safeStr(finalNeg, "") } : {}),
-
-      // NOTE TO DEV (future):
-      // multi_prompt: JSON.stringify([{prompt:"...",duration:5}, ...])
-      // We will set this once GPT outputs structured JSON prompts for multi-shot video.
-    };
-  } else if (is26) {
-    // ✅ v2.6 schema (legacy)
-    const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
-    const duration26 = rawDuration >= 10 ? 10 : 5;
-
-    const hasStart = !!asHttpUrl(startImage);
-    const ar =
-      safeStr(aspectRatio, "") ||
-      safeStr(cfg?.kling?.aspectRatio, "") ||
-      safeStr(process.env.MMA_KLING_ASPECT_RATIO, "") ||
-      "16:9";
-
-    input = {
-      prompt: safeStr(prompt, ""),
-      duration: duration26,
-      ...(hasStart ? { start_image: startImage } : { aspect_ratio: ar }),
-      generate_audio: generateAudio !== undefined ? !!generateAudio : true,
-      negative_prompt: safeStr(finalNeg, ""),
+      model_name: modelName,
+      image: asHttpUrl(startImage),
+      prompt: finalPrompt,
+      duration: String(finalDuration),
+      mode: finalMode,
+      sound,
+      ...(hasEnd ? { image_tail: asHttpUrl(endImage) } : {}),
+      ...(finalNeg ? { negative_prompt: finalNeg } : {}),
     };
   } else {
-    // ✅ v2.1 schema (legacy)
-    const rawDuration = Number(duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
-
-    const finalMode =
-      safeStr(mode, "") ||
-      safeStr(cfg?.kling?.mode, "") ||
-      safeStr(process.env.MMA_KLING_MODE, "") ||
-      "standard";
-
     input = {
+      model_name: modelName,
+      prompt: finalPrompt,
+      duration: String(finalDuration),
       mode: finalMode,
-      prompt: safeStr(prompt, ""),
-      duration: rawDuration,
-      start_image: startImage,
-      ...(asHttpUrl(endImage) ? { end_image: asHttpUrl(endImage) } : {}),
-      ...(safeStr(finalNeg, "") ? { negative_prompt: safeStr(finalNeg, "") } : {}),
+      sound,
+      aspect_ratio: safeStr(aspectRatio, "") || "16:9",
+      ...(finalNeg ? { negative_prompt: finalNeg } : {}),
     };
-
-    if (generateAudio !== undefined) input.generate_audio = !!generateAudio;
   }
-
-  // normalize required fields
-  if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
 
   const t0 = Date.now();
 
-  let pred;
-  try {
-    pred = await replicatePredictWithTimeout({
-      replicate,
-      version,
-      input,
-      timeoutMs: REPLICATE_MAX_MS_KLING,
-      pollMs: REPLICATE_POLL_MS,
-      callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
-      cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
-    });
-  } catch (err) {
-    // legacy fallback: some old schemas reject generate_audio
-    const msg = String(err?.message || err || "").toLowerCase();
-    const looksLikeBadField =
-      !isV3 && !is26 && msg.includes("input") && (msg.includes("generate_audio") || msg.includes("unexpected"));
+  const polled = await submitAndPollKlingTask({
+    createPath,
+    queryPathFromTaskId,
+    body: input,
+    timeoutMs: Number(process.env.MMA_REPLICATE_MAX_MS_KLING || process.env.MMA_REPLICATE_MAX_MS || 900000) || 900000,
+    pollMs: REPLICATE_POLL_MS,
+  });
 
-    if (looksLikeBadField) {
-      const retryInput = { ...input };
-      delete retryInput.generate_audio;
-
-      pred = await replicatePredictWithTimeout({
-        replicate,
-        version,
-        input: retryInput,
-        timeoutMs: REPLICATE_MAX_MS_KLING,
-        pollMs: REPLICATE_POLL_MS,
-        callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
-        cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
-      });
-
-      input = retryInput;
-    } else {
-      throw err;
-    }
-  }
-
-  const prediction = pred.prediction || {};
-  const out = prediction.output;
+  const finalStatus = extractKlingTaskStatus(polled.final);
 
   return {
     input,
-    out,
-    prediction_id: pred.predictionId,
-    prediction_status: prediction.status || null,
-    timed_out: !!pred.timedOut,
+    out: polled.final?.data?.task_result || polled.final?.data || null,
+    prediction_id: polled.taskId, // kept for compatibility with existing vars/output keys
+    prediction_status: finalStatus || null,
+    timed_out: !!polled.timedOut,
     timing: {
       started_at: new Date(t0).toISOString(),
       ended_at: nowIso(),
       duration_ms: Date.now() - t0,
     },
-    provider: { prediction },
+    provider: {
+      kling: {
+        createPath,
+        task_id: polled.taskId,
+        createResponse: polled.created,
+        finalResponse: polled.final,
+      },
+    },
   };
 }
-
-// ============================================================================
-// NEW: Fabric (audio-driven) + Kling Motion Control (ref video-driven)
-// ============================================================================
 
 function normalizeKmcMode(v) {
   const s = safeStr(v, "").toLowerCase();
@@ -1677,112 +1749,89 @@ async function runKlingMotionControl({
   mode,
   keepOriginalSound,
   characterOrientation,
-  duration, // ✅ NEW (optional)
+  duration,
   input: forcedInput,
 }) {
-  const replicate = getReplicate();
   const cfg = getMmaConfig();
 
-  // ✅ NEW: allow swapping motion model without changing behavior
-  const version =
-    process.env.MMA_KLING_MOTION_VERSION || // <- your new env var
-    process.env.MMA_KLING_MOTION_CONTROL_VERSION ||
-    cfg?.kling_motion_control?.model ||
-    "kwaivgi/kling-v2.6-motion-control";
+  const modelName =
+    safeStr(process.env.MMA_KLING_OMNI_MODEL_NAME, "") ||
+    safeStr(cfg?.kling_motion_control?.model_name, "") ||
+    "kling-v3-omni";
 
-  const isOmni =
-    /kling[-_/]?v3[-_/]?omni/i.test(String(version)) ||
-    String(version).includes("kling-v3-omni-video");
+  const firstFrame = asHttpUrl(image);
+  const refVideo = asHttpUrl(video);
 
-  const finalMode = normalizeKmcMode(mode);
-  const finalOrientation = normalizeKmcOrientation(characterOrientation);
+  if (!firstFrame) throw new Error("MISSING_KLING_MOTION_START_IMAGE");
+  if (!refVideo) throw new Error("MISSING_KLING_MOTION_REFERENCE_VIDEO");
 
-  const keep =
-    keepOriginalSound !== undefined
-      ? !!keepOriginalSound
-      : (cfg?.kling_motion_control?.keepOriginalSound !== undefined
-          ? !!cfg.kling_motion_control.keepOriginalSound
-          : true);
+  // Official Omni reference video lane is 3s–10s in the spec you pasted,
+  // so clamp here to stay inside source limits.
+  const rawDuration = Number(duration || 5) || 5;
+  const finalDuration = Math.max(3, Math.min(10, Math.round(rawDuration)));
 
-  let input;
+  const finalMode = normalizeKlingSourceMode(mode);
+  const keep = keepOriginalSound !== undefined ? !!keepOriginalSound : true;
 
-  if (forcedInput) {
-    input = { ...forcedInput };
-  } else if (isOmni) {
-    // ✅ Omni schema (keeps same external behavior)
-    // NOTE: Omni supports reference_video for style/motion reference ("feature") or video editing ("base").
-    // We default to "feature" to mimic motion-control behavior.
-    // Also: audio generation can't be used together with reference_video. :contentReference[oaicite:1]{index=1}
+  const safePrompt =
+    safeStr(prompt, "") || "Keep the subject consistent and transfer the reference motion naturally.";
 
-    const rawDuration = Number(duration || 5) || 5;
-    const dur = Math.max(3, Math.min(15, Math.round(rawDuration))); // Omni supports 3..15s :contentReference[oaicite:2]{index=2}
-
-    const omniMode =
-      String(mode || "").toLowerCase() === "standard" || String(mode || "").toLowerCase() === "std"
-        ? "standard"
-        : "pro"; // ✅ default high quality
-
-    input = {
-      prompt: safeStr(prompt, ""),
-      mode: omniMode,
-      duration: dur,
-
-      start_image: image,
-      reference_video: video,
-      video_reference_type: safeStr(process.env.MMA_KLING_OMNI_VIDEO_REFERENCE_TYPE, "") || "feature",
-      keep_original_sound: keep,
-    };
-  } else {
-    // ✅ OLD behavior (unchanged): v2.6 motion-control schema
-    input = {
-      prompt: safeStr(prompt, ""), // allowed to be ""
-      image,
-      video,
-      mode: finalMode,
-      keep_original_sound: keep,
-      character_orientation: finalOrientation,
-    };
-
-    // normalize required fields
-    if (!input.image) input.image = image;
-    if (!input.video) input.video = video;
-    if (input.prompt === undefined) input.prompt = safeStr(prompt, "");
-    if (!input.mode) input.mode = finalMode;
-    if (input.keep_original_sound === undefined) input.keep_original_sound = keep;
-    if (!input.character_orientation) input.character_orientation = finalOrientation;
-  }
-
-  const REPLICATE_MAX_MS_KMC =
-    Number(process.env.MMA_REPLICATE_MAX_MS_KLING_MOTION_CONTROL || process.env.MMA_REPLICATE_MAX_MS || 900000) ||
-    900000;
+  const input = forcedInput
+    ? { ...forcedInput }
+    : {
+        model_name: modelName,
+        prompt: safePrompt,
+        image_list: [
+          {
+            image_url: firstFrame,
+            type: "first_frame",
+          },
+        ],
+        video_list: [
+          {
+            video_url: refVideo,
+            refer_type: "feature",
+            keep_original_sound: keep ? "yes" : "no",
+          },
+        ],
+        sound: "off", // source spec says sound must be off when reference video is present
+        mode: finalMode,
+        duration: String(finalDuration),
+      };
 
   const t0 = Date.now();
 
-  const pred = await replicatePredictWithTimeout({
-    replicate,
-    version,
-    input,
-    timeoutMs: REPLICATE_MAX_MS_KMC,
+  const polled = await submitAndPollKlingTask({
+    createPath: "/v1/videos/omni-video",
+    queryPathFromTaskId: (taskId) => `/v1/videos/omni-video/${encodeURIComponent(taskId)}`,
+    body: input,
+    timeoutMs:
+      Number(process.env.MMA_REPLICATE_MAX_MS_KLING_MOTION_CONTROL || process.env.MMA_REPLICATE_MAX_MS || 900000) ||
+      900000,
     pollMs: REPLICATE_POLL_MS,
-    callTimeoutMs: REPLICATE_CALL_TIMEOUT_MS,
-    cancelOnTimeout: REPLICATE_CANCEL_ON_TIMEOUT,
   });
 
-  const prediction = pred.prediction || {};
-  const out = prediction.output;
+  const finalStatus = extractKlingTaskStatus(polled.final);
 
   return {
     input,
-    out,
-    prediction_id: pred.predictionId,
-    prediction_status: prediction.status || null,
-    timed_out: !!pred.timedOut,
+    out: polled.final?.data?.task_result || polled.final?.data || null,
+    prediction_id: polled.taskId, // kept for compatibility
+    prediction_status: finalStatus || null,
+    timed_out: !!polled.timedOut,
     timing: {
       started_at: new Date(t0).toISOString(),
       ended_at: nowIso(),
       duration_ms: Date.now() - t0,
     },
-    provider: { prediction },
+    provider: {
+      kling: {
+        createPath: "/v1/videos/omni-video",
+        task_id: polled.taskId,
+        createResponse: polled.created,
+        finalResponse: polled.final,
+      },
+    },
   };
 }
 
@@ -3920,7 +3969,6 @@ export async function refreshFromReplicate({ generationId, passId }) {
   if (error) throw error;
   if (!data) return { ok: false, error: "NOT_FOUND" };
 
-  // security: only same passId can refresh
   if (passId && data.mg_pass_id && String(passId) !== String(data.mg_pass_id)) {
     return { ok: false, error: "FORBIDDEN" };
   }
@@ -3933,20 +3981,79 @@ export async function refreshFromReplicate({ generationId, passId }) {
   const mode = String(data.mg_mma_mode || "");
   const outputs = vars.outputs && typeof vars.outputs === "object" ? vars.outputs : {};
 
+  // ---------------------------------------------------------------------------
+  // VIDEO = direct Kling now
+  // ---------------------------------------------------------------------------
+  if (mode === "video") {
+    const omniTaskId =
+      outputs.kling_motion_control_prediction_id ||
+      outputs.klingMotionControlPredictionId ||
+      "";
+
+    const image2videoTaskId =
+      outputs.kling_prediction_id ||
+      outputs.klingPredictionId ||
+      "";
+
+    const taskId = safeStr(omniTaskId || image2videoTaskId, "");
+    if (!taskId) {
+      return { ok: false, error: "NO_TASK_ID" };
+    }
+
+    const queryPath = omniTaskId
+      ? `/v1/videos/omni-video/${encodeURIComponent(taskId)}`
+      : `/v1/videos/image2video/${encodeURIComponent(taskId)}`;
+
+    const final = await klingRequestJson(queryPath, {
+      method: "GET",
+      timeoutMs: REPLICATE_CALL_TIMEOUT_MS,
+    });
+
+    const providerStatus = extractKlingTaskStatus(final);
+    const url = extractKlingVideoUrl(final);
+
+    if (!url) {
+      return {
+        ok: true,
+        refreshed: false,
+        provider_status: providerStatus,
+      };
+    }
+
+    const remoteUrl = await storeRemoteToR2Public(url, `mma/video/${generationId}`);
+
+    const nextVars = { ...vars, mg_output_url: remoteUrl };
+    nextVars.outputs = { ...(nextVars.outputs || {}), kling_video_url: remoteUrl };
+
+    await supabase
+      .from("mega_generations")
+      .update({
+        mg_output_url: remoteUrl,
+        mg_status: "done",
+        mg_mma_status: "done",
+        mg_mma_vars: nextVars,
+        mg_updated_at: nowIso(),
+      })
+      .eq("mg_generation_id", generationId)
+      .eq("mg_record_type", "generation");
+
+    return {
+      ok: true,
+      refreshed: true,
+      provider_status: providerStatus,
+      url: remoteUrl,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // STILL = unchanged Replicate refresh
+  // ---------------------------------------------------------------------------
   const predictionId =
-    mode === "video"
-      ? outputs.kling_motion_control_prediction_id ||
-        outputs.klingMotionControlPredictionId ||
-        outputs.fabric_prediction_id ||
-        outputs.fabricPredictionId ||
-        outputs.kling_prediction_id ||
-        outputs.klingPredictionId ||
-        ""
-      : outputs.nanobanana_prediction_id ||
-        outputs.nanobananaPredictionId ||
-        outputs.seedream_prediction_id ||
-        outputs.seedreamPredictionId ||
-        "";
+    outputs.nanobanana_prediction_id ||
+    outputs.nanobananaPredictionId ||
+    outputs.seedream_prediction_id ||
+    outputs.seedreamPredictionId ||
+    "";
 
   if (!predictionId) {
     return { ok: false, error: "NO_PREDICTION_ID" };
@@ -3961,24 +4068,15 @@ export async function refreshFromReplicate({ generationId, passId }) {
     return { ok: true, refreshed: false, provider_status: providerStatus };
   }
 
-  // store permanent + finalize
-  const remoteUrl = await storeRemoteToR2Public(
-    url,
-    mode === "video" ? `mma/video/${generationId}` : `mma/still/${generationId}`
-  );
+  const remoteUrl = await storeRemoteToR2Public(url, `mma/still/${generationId}`);
 
-  // update vars + final row
   const nextVars = { ...vars, mg_output_url: remoteUrl };
   nextVars.outputs = { ...(nextVars.outputs || {}) };
-  if (mode === "video") {
-    nextVars.outputs.kling_video_url = remoteUrl;
+
+  if (outputs.nanobanana_prediction_id || outputs.nanobananaPredictionId) {
+    nextVars.outputs.nanobanana_image_url = remoteUrl;
   } else {
-    // prefer storing under the engine that was used
-    if (outputs.nanobanana_prediction_id || outputs.nanobananaPredictionId) {
-      nextVars.outputs.nanobanana_image_url = remoteUrl;
-    } else {
-      nextVars.outputs.seedream_image_url = remoteUrl;
-    }
+    nextVars.outputs.seedream_image_url = remoteUrl;
   }
 
   await supabase

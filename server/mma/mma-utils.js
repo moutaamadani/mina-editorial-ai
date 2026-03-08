@@ -318,6 +318,11 @@ export function makeInitialVars({
       duration: inputs.duration ?? null,
       mode: safeString(inputs.mode || inputs.kling_mode, ""),
       negative_prompt: safeString(inputs.negative_prompt || inputs.negativePrompt, ""),
+
+      // audio / mute controls – pass through so the controller can respect the UI toggle
+      generate_audio: inputs.generate_audio ?? inputs.generateAudio ?? undefined,
+      mute: inputs.mute ?? inputs.muted ?? undefined,
+      keep_original_sound: inputs.keep_original_sound ?? inputs.keepOriginalSound ?? undefined,
     },
 
     prompts: {

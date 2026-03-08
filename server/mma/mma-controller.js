@@ -3437,7 +3437,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
           image: startImage,
           video: frame2.url,
           mode: safeStr(mergedInputs0?.mode || mergedInputs0?.kmc_mode, "") || "std",
-          keepOriginalSound: mergedInputs0?.keep_original_sound ?? mergedInputs0?.keepOriginalSound ?? true,
+          keepOriginalSound: mergedInputs0?.keep_original_sound ?? mergedInputs0?.keepOriginalSound ?? generateAudio,
           characterOrientation:
             safeStr(mergedInputs0?.character_orientation || mergedInputs0?.characterOrientation, "") || "video",
           duration: frame2?.rawDurationSec || duration, // ✅ NEW

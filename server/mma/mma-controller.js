@@ -3,7 +3,6 @@ import express from "express";
 import OpenAI from "openai";
 import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import crypto from "crypto";
 
 import {
   resolvePassId as megaResolvePassId, // ✅ so createMmaController routes don't mismatch passId
@@ -1412,7 +1411,7 @@ function pickKlingEndImage(vars, parent) {
 function getKlingHttpConfig() {
   const baseUrl = safeStr(
     process.env.KLING_BASE_URL,
-    "https://api-beijing.klingai.com"
+    "https://api-singapore.klingai.com"
   ).replace(/\/+$/, "");
 
   const accessKey = safeStr(process.env.KLING_ACCESS_KEY, "");
@@ -1423,6 +1422,43 @@ function getKlingHttpConfig() {
   }
 
   return { baseUrl, accessKey, secretKey };
+}
+
+function base64UrlEncode(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function buildKlingJwt(accessKey, secretKey) {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = {
+    alg: "HS256",
+    typ: "JWT",
+  };
+
+  const payload = {
+    iss: accessKey,
+    exp: now + 1800,
+    nbf: now - 5,
+  };
+
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+
+  const crypto = require("crypto");
+  const signature = crypto
+    .createHmac("sha256", secretKey)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+
+  return `${encodedHeader}.${encodedPayload}.${signature}`;
 }
 
 function normalizeKlingSourceMode(v) {
@@ -1452,57 +1488,8 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function base64UrlEncode(buf) {
-  return buf
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function generateKlingJwt(accessKey, secretKey, expiresInSec = 1800) {
-  const now = Math.floor(Date.now() / 1000);
-
-  const header = { alg: "HS256", typ: "JWT" };
-  const payload = {
-    iss: accessKey,
-    exp: now + expiresInSec,
-    nbf: now - 5,
-    iat: now,
-  };
-
-  const headerB64 = base64UrlEncode(Buffer.from(JSON.stringify(header)));
-  const payloadB64 = base64UrlEncode(Buffer.from(JSON.stringify(payload)));
-
-  const signature = crypto
-    .createHmac("sha256", secretKey)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest();
-
-  return `${headerB64}.${payloadB64}.${base64UrlEncode(signature)}`;
-}
-
-let _cachedKlingToken = null;
-let _cachedKlingTokenExp = 0;
-
-function getKlingBearerToken() {
-  const { accessKey, secretKey } = getKlingHttpConfig();
-  const now = Math.floor(Date.now() / 1000);
-
-  if (_cachedKlingToken && _cachedKlingTokenExp > now + 300) {
-    return _cachedKlingToken;
-  }
-
-  const expiresInSec = 1800;
-  _cachedKlingToken = generateKlingJwt(accessKey, secretKey, expiresInSec);
-  _cachedKlingTokenExp = now + expiresInSec;
-
-  return _cachedKlingToken;
-}
-
 async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) {
-  const { baseUrl } = getKlingHttpConfig();
-  const token = getKlingBearerToken();
+  const { baseUrl, accessKey, secretKey } = getKlingHttpConfig();
 
   const ctrl = new AbortController();
   const timer = setTimeout(
@@ -1515,7 +1502,7 @@ async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) 
       method,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${buildKlingJwt(accessKey, secretKey)}`,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ctrl.signal,

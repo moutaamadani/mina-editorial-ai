@@ -3082,18 +3082,25 @@ const usePromptOverride = !!promptOverride;
 
     const muteRaw =
       working?.inputs?.mute ??
-      working?.inputs?.muted;
+      working?.inputs?.muted ??
+      working?.inputs?.audio_muted ??
+      working?.inputs?.audioMuted;
 
     const generateAudioParsed = parseOptionalBool(generateAudioRaw);
     const muteParsed = parseOptionalBool(muteRaw);
 
-    // ✅ default ON unless explicitly disabled
-    let generateAudio =
-      generateAudioParsed !== undefined ? generateAudioParsed :
-      muteParsed !== undefined ? !muteParsed :
-      true;
+    // HARD RULE: mute wins
+    let generateAudio = true;
 
-    // ✅ 2 frames (end frame present) => ALWAYS force mute on backend too
+    if (muteParsed === true) {
+      generateAudio = false;
+    } else if (generateAudioParsed !== undefined) {
+      generateAudio = generateAudioParsed;
+    } else if (muteParsed === false) {
+      generateAudio = true;
+    }
+
+    // 2-frame video stays muted
     if (asHttpUrl(endImage)) generateAudio = false;
 
     let genRes;

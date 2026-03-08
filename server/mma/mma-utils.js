@@ -340,7 +340,13 @@ export function makeInitialVars({
 
       platform: safeString(inputs.platform || inputs.platformKey, ""),
       aspect_ratio: safeString(inputs.aspect_ratio || inputs.aspectRatio, ""),
-      duration: inputs.duration ?? null,
+      duration:
+        inputs.motion_duration_sec ??
+        inputs.motionDurationSec ??
+        inputs.duration ??
+        inputs.duration_seconds ??
+        inputs.durationSeconds ??
+        null,
       mode: safeString(inputs.mode || inputs.kling_mode, ""),
       negative_prompt: safeString(inputs.negative_prompt || inputs.negativePrompt, ""),
     },

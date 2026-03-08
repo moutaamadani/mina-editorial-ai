@@ -28,6 +28,12 @@ import {
 import { addSseClient, sendDone, sendScanLine, sendStatus } from "./mma-sse.js";
 import { getMmaConfig } from "./mma-config.js";
 import { replicatePredictWithTimeout } from "./replicate-poll.js";
+import {
+  klingDirectEnabled,
+  refreshKlingTask,
+  runKlingDirect,
+  runKlingMotionControlDirect,
+} from "./kling-direct.js";
 
 // ============================================================================
 // USER-FACING TEXT (EDIT THESE)
@@ -1419,6 +1425,20 @@ async function runKling({
   aspectRatio,
   input: forcedInput,
 }) {
+  if (klingDirectEnabled()) {
+    return runKlingDirect({
+      prompt,
+      startImage,
+      endImage,
+      duration,
+      mode,
+      negativePrompt,
+      generateAudio,
+      aspectRatio,
+      input: forcedInput,
+    });
+  }
+
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
@@ -1680,6 +1700,20 @@ async function runKlingMotionControl({
   duration, // ✅ NEW (optional)
   input: forcedInput,
 }) {
+  if (klingDirectEnabled()) {
+    return runKlingMotionControlDirect({
+      prompt,
+      image,
+      video,
+      mode,
+      keepOriginalSound,
+      characterOrientation,
+      duration,
+      referType: safeStr(process.env.MMA_KLING_OMNI_VIDEO_REFERENCE_TYPE, "feature"),
+      input: forcedInput,
+    });
+  }
+
   const replicate = getReplicate();
   const cfg = getMmaConfig();
 
@@ -3130,7 +3164,7 @@ const usePromptOverride = !!promptOverride;
           duration: frame2?.rawDurationSec || duration, // ✅ NEW
         });
 
-        working.outputs = { ...(working.outputs || {}), kling_motion_control_prediction_id: genRes.prediction_id || null };
+        working.outputs = { ...(working.outputs || {}), kling_motion_control_prediction_id: genRes.prediction_id || null, kling_motion_control_task_id: genRes.task_id || genRes.prediction_id || null };
         stepType = "kling_motion_control_generate";
         await updateVars({ supabase, generationId, vars: working });
       } else if (pricing.flow === "fabric_audio") {
@@ -3165,7 +3199,7 @@ const usePromptOverride = !!promptOverride;
           generateAudio,
         });
 
-        working.outputs = { ...(working.outputs || {}), kling_prediction_id: genRes.prediction_id || null };
+        working.outputs = { ...(working.outputs || {}), kling_prediction_id: genRes.prediction_id || null, kling_task_id: genRes.task_id || genRes.prediction_id || null };
         stepType = "kling_generate";
         await updateVars({ supabase, generationId, vars: working });
       }
@@ -3450,6 +3484,9 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
           duration: frame2?.rawDurationSec || duration, // ✅ NEW
         });
 
+        working.outputs = { ...(working.outputs || {}), kling_motion_control_prediction_id: genRes.prediction_id || null, kling_motion_control_task_id: genRes.task_id || genRes.prediction_id || null };
+        await updateVars({ supabase, generationId, vars: working });
+
         stepType = "kling_motion_control_generate_tweak";
       } else if (pricing.flow === "fabric_audio") {
         if (!frame2?.url) throw new Error("MISSING_FRAME2_AUDIO_URL");
@@ -3471,6 +3508,9 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
           negativePrompt: neg,
           generateAudio,
         });
+
+        working.outputs = { ...(working.outputs || {}), kling_prediction_id: genRes.prediction_id || null, kling_task_id: genRes.task_id || genRes.prediction_id || null };
+        await updateVars({ supabase, generationId, vars: working });
 
         stepType = "kling_generate_tweak";
       }
@@ -3932,6 +3972,44 @@ export async function refreshFromReplicate({ generationId, passId }) {
   const vars = data.mg_mma_vars && typeof data.mg_mma_vars === "object" ? data.mg_mma_vars : {};
   const mode = String(data.mg_mma_mode || "");
   const outputs = vars.outputs && typeof vars.outputs === "object" ? vars.outputs : {};
+
+  const klingTaskId =
+    mode === "video"
+      ? outputs.kling_motion_control_task_id ||
+        outputs.klingMotionControlTaskId ||
+        outputs.kling_task_id ||
+        outputs.klingTaskId ||
+        ""
+      : "";
+
+  if (klingTaskId && klingDirectEnabled()) {
+    const result = await refreshKlingTask(klingTaskId, mode === "video" ? "video" : "image");
+    if (!result.ok) return { ok: false, error: "KLING_TASK_NOT_FOUND" };
+    if (!result.url) return { ok: true, refreshed: false, provider_status: result.status };
+
+    const remoteUrl = await storeRemoteToR2Public(
+      result.url,
+      mode === "video" ? `mma/video/${generationId}` : `mma/still/${generationId}`
+    );
+
+    const nextVars = { ...vars, mg_output_url: remoteUrl };
+    nextVars.outputs = { ...(nextVars.outputs || {}) };
+    if (mode === "video") nextVars.outputs.kling_video_url = remoteUrl;
+
+    await supabase
+      .from("mega_generations")
+      .update({
+        mg_output_url: remoteUrl,
+        mg_status: "done",
+        mg_mma_status: "done",
+        mg_mma_vars: nextVars,
+        mg_updated_at: nowIso(),
+      })
+      .eq("mg_generation_id", generationId)
+      .eq("mg_record_type", "generation");
+
+    return { ok: true, refreshed: true, provider_status: "succeed", url: remoteUrl };
+  }
 
   const predictionId =
     mode === "video"

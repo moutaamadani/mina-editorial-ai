@@ -3,6 +3,7 @@ import express from "express";
 import OpenAI from "openai";
 import Replicate from "replicate";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import crypto from "crypto";
 
 import {
   resolvePassId as megaResolvePassId, // ✅ so createMmaController routes don't mismatch passId
@@ -1409,7 +1410,11 @@ function pickKlingEndImage(vars, parent) {
 //   Once GPT sends structured JSON prompts for video, we will populate multi_prompt.
 // ============================================================================
 function getKlingHttpConfig() {
-  const baseUrl = safeStr(process.env.KLING_BASE_URL, "https://api-singapore.klingai.com").replace(/\/+$/, "");
+  const baseUrl = safeStr(
+    process.env.KLING_BASE_URL,
+    "https://api-beijing.klingai.com"
+  ).replace(/\/+$/, "");
+
   const accessKey = safeStr(process.env.KLING_ACCESS_KEY, "");
   const secretKey = safeStr(process.env.KLING_SECRET_KEY, "");
 
@@ -1447,19 +1452,70 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function base64UrlEncode(buf) {
+  return buf
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function generateKlingJwt(accessKey, secretKey, expiresInSec = 1800) {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "HS256", typ: "JWT" };
+  const payload = {
+    iss: accessKey,
+    exp: now + expiresInSec,
+    nbf: now - 5,
+    iat: now,
+  };
+
+  const headerB64 = base64UrlEncode(Buffer.from(JSON.stringify(header)));
+  const payloadB64 = base64UrlEncode(Buffer.from(JSON.stringify(payload)));
+
+  const signature = crypto
+    .createHmac("sha256", secretKey)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest();
+
+  return `${headerB64}.${payloadB64}.${base64UrlEncode(signature)}`;
+}
+
+let _cachedKlingToken = null;
+let _cachedKlingTokenExp = 0;
+
+function getKlingBearerToken() {
+  const { accessKey, secretKey } = getKlingHttpConfig();
+  const now = Math.floor(Date.now() / 1000);
+
+  if (_cachedKlingToken && _cachedKlingTokenExp > now + 300) {
+    return _cachedKlingToken;
+  }
+
+  const expiresInSec = 1800;
+  _cachedKlingToken = generateKlingJwt(accessKey, secretKey, expiresInSec);
+  _cachedKlingTokenExp = now + expiresInSec;
+
+  return _cachedKlingToken;
+}
+
 async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) {
-  const { baseUrl, accessKey, secretKey } = getKlingHttpConfig();
+  const { baseUrl } = getKlingHttpConfig();
+  const token = getKlingBearerToken();
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), Math.max(1000, Number(timeoutMs || REPLICATE_CALL_TIMEOUT_MS) || 15000));
+  const timer = setTimeout(
+    () => ctrl.abort(),
+    Math.max(1000, Number(timeoutMs || REPLICATE_CALL_TIMEOUT_MS) || 15000)
+  );
 
   try {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
       headers: {
         "Content-Type": "application/json",
-        "X-Api-Key": accessKey,
-        "X-Api-Secret": secretKey,
+        Authorization: `Bearer ${token}`,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ctrl.signal,
@@ -1467,6 +1523,7 @@ async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) 
 
     const rawText = await res.text();
     let json = null;
+
     try {
       json = rawText ? JSON.parse(rawText) : null;
     } catch {
@@ -1487,20 +1544,23 @@ async function klingRequestJson(path, { method = "GET", body, timeoutMs } = {}) 
       throw err;
     }
 
-    if (json && typeof json === "object" && Object.prototype.hasOwnProperty.call(json, "code")) {
-      if (Number(json.code) !== 0) {
-        const err = new Error(`KLING_API_ERROR: ${safeStr(json.message, "Unknown Kling API error")}`);
-        err.code = "KLING_API_ERROR";
-        err.provider = {
-          kling: {
-            method,
-            path,
-            status: res.status,
-            body: json,
-          },
-        };
-        throw err;
-      }
+    if (
+      json &&
+      typeof json === "object" &&
+      Object.prototype.hasOwnProperty.call(json, "code") &&
+      Number(json.code) !== 0
+    ) {
+      const err = new Error(`KLING_API_ERROR: ${safeStr(json.message, "Unknown Kling API error")}`);
+      err.code = "KLING_API_ERROR";
+      err.provider = {
+        kling: {
+          method,
+          path,
+          status: res.status,
+          body: json,
+        },
+      };
+      throw err;
     }
 
     return json;

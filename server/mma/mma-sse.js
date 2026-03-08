@@ -3,19 +3,8 @@
 // Part 4.1: Manages per-generation subscribers and forwards pipeline events.
 
 // -----------------------------------------------------------------------------
-// Editable variables (UI-safe mapping + event names)
+// Event names
 // -----------------------------------------------------------------------------
-const UI_STATUS_MAP = {
-  queued: "working",
-  scanning: "working",
-  prompting: "working",
-  generating: "working",
-  postscan: "working",
-  suggested: "ready",
-  done: "done",
-  error: "error",
-};
-
 const EVENT_SCAN_LINE = "scan_line";
 const EVENT_STATUS = "status";
 const EVENT_DONE = "done";
@@ -27,11 +16,6 @@ const EVENT_DONE = "done";
  * streams: Map<generationId, { clients:Set<res>, nextLineIndex:number }>
  */
 const streams = new Map();
-
-function toUserStatus(internalStatus) {
-  const s = String(internalStatus || "queued");
-  return UI_STATUS_MAP[s] || "working";
-}
 
 function safeWrite(res, chunk) {
   try {
@@ -94,8 +78,8 @@ export function addSseClient(generationId, res, { scanLines = [], status = "queu
     writeEvent(res, EVENT_SCAN_LINE, payload);
   }
 
-  // Send initial status (UI-safe)
-  writeEvent(res, EVENT_STATUS, { status: toUserStatus(status) });
+  // Send initial status (pass-through)
+  writeEvent(res, EVENT_STATUS, { status: String(status || "") });
 
   res.on("close", () => {
     const s = streams.get(generationId);
@@ -125,11 +109,9 @@ export function sendScanLine(generationId, line) {
 }
 
 export function sendStatus(generationId, status) {
-  // UI-safe mapping here is CRITICAL (pipeline emits internal statuses)
-  sendSseEvent(generationId, EVENT_STATUS, { status: toUserStatus(status) });
+  sendSseEvent(generationId, EVENT_STATUS, { status: String(status || "") });
 }
 
 export function sendDone(generationId, status = "done") {
-  // Also UI-safe
-  sendSseEvent(generationId, EVENT_DONE, { status: toUserStatus(status) });
+  sendSseEvent(generationId, EVENT_DONE, { status: String(status || "") });
 }

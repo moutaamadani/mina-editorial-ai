@@ -95,6 +95,50 @@ export function makeInitialVars({
       assets.styleHeroUrl
   );
 
+  // ✅ Frame2 reference media (audio/video) — KEEP IT (controller needs it)
+  const frame2AudioUrl = asStrOrNull(
+    assets.frame2_audio_url ||
+      assets.frame2AudioUrl ||
+      assets.audio_url ||
+      assets.audioUrl ||
+      assets.audio
+  );
+
+  const frame2VideoUrl = asStrOrNull(
+    assets.frame2_video_url ||
+      assets.frame2VideoUrl ||
+      assets.video_url ||
+      assets.videoUrl ||
+      assets.video
+  );
+
+  // ✅ Frame2 canonical inputs (audio/video reference for motion)
+  const frame2Kind = safeString(
+    inputs.frame2_kind ||
+      inputs.frame2Kind ||
+      (frame2AudioUrl ? "audio" : frame2VideoUrl ? "video" : ""),
+    ""
+  );
+
+  const frame2Url =
+    asStrOrNull(inputs.frame2_url || inputs.frame2Url) ||
+    (frame2Kind.toLowerCase().includes("audio") ? frame2AudioUrl : frame2VideoUrl) ||
+    frame2AudioUrl ||
+    frame2VideoUrl ||
+    null;
+
+  const frame2DurationSecRaw =
+    inputs.frame2_duration_sec ||
+    inputs.frame2DurationSec ||
+    assets.frame2_duration_sec ||
+    assets.frame2DurationSec ||
+    null;
+
+  const frame2DurationSec =
+    frame2DurationSecRaw != null && frame2DurationSecRaw !== ""
+      ? Number(frame2DurationSecRaw)
+      : null;
+
   // Kling reference images (optional, besides start/end)
   const klingUrls = []
     .concat(asArray(assets.kling_images))
@@ -175,10 +219,21 @@ export function makeInitialVars({
 
       style_hero_image_url: styleHeroUrl,
 
+      // ✅ keep ref media for video flows
+      audio: frame2AudioUrl,
+      audio_url: frame2AudioUrl,
+      frame2_audio_url: frame2AudioUrl,
+
+      video: frame2VideoUrl,
+      video_url: frame2VideoUrl,
+      frame2_video_url: frame2VideoUrl,
+
       // Kling helpers
       kling_image_urls: klingUrls,
       start_image_url: startUrl,
       end_image_url: endUrl,
+
+      frame2_duration_sec: frame2DurationSec,
     },
 
     scans: {
@@ -210,6 +265,22 @@ export function makeInitialVars({
           inputs.createLane,
         ""
       ),
+      still_resolution: safeString(
+        inputs.still_resolution ||
+          inputs.stillResolution ||
+          inputs.resolution ||
+          inputs.image_resolution ||
+          inputs.imageResolution,
+        ""
+      ),
+      resolution: safeString(
+        inputs.resolution ||
+          inputs.still_resolution ||
+          inputs.stillResolution ||
+          inputs.image_resolution ||
+          inputs.imageResolution,
+        ""
+      ),
 
       motion_user_brief: motionUserBrief,
       selected_movement_style: selectedMovementStyle,
@@ -231,6 +302,11 @@ export function makeInitialVars({
           "",
         ""
       ),
+
+      // ✅ frame2 reference media for Fabric / KMC
+      frame2_kind: frame2Kind,
+      frame2_url: frame2Url,
+      frame2_duration_sec: frame2DurationSec,
 
       // keep old fields too
       userBrief: safeString(inputs.userBrief, ""),

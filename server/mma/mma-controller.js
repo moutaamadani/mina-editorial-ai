@@ -1965,10 +1965,21 @@ function _clamp(n, a, b) {
   const x = Number(n || 0) || 0;
   return Math.max(a, Math.min(b, x));
 }
-// classic kling duration (still 5/10)
+// classic kling duration selector (supports 5/10/15)
 function resolveVideoDurationSec(inputs) {
-  const d = Number(inputs?.duration ?? inputs?.duration_seconds ?? inputs?.durationSeconds ?? 5) || 5;
-  return d >= 10 ? 10 : 5;
+  const d =
+    Number(
+      inputs?.motion_duration_sec ??
+        inputs?.motionDurationSec ??
+        inputs?.duration ??
+        inputs?.duration_seconds ??
+        inputs?.durationSeconds ??
+        5
+    ) || 5;
+
+  if (d >= 15) return 15;
+  if (d >= 10) return 10;
+  return 5;
 }
 
 function resolveVideoPricing(inputsLike, assetsLike) {
@@ -1994,6 +2005,7 @@ function videoCostFromInputs(inputsLike, assetsLike) {
     const rawProvided =
       Number(frame2.rawDurationSec || 0) ||
       Number(inputs.frame2_duration_sec || inputs.frame2DurationSec || 0) ||
+      Number(inputs.motion_duration_sec || inputs.motionDurationSec || 0) ||
       Number(inputs.duration || inputs.duration_seconds || inputs.durationSeconds || 0) ||
       Number(inputs.duration_sec || inputs.durationSec || 0) ||
       0;

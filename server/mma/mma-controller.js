@@ -3092,7 +3092,7 @@ const usePromptOverride = !!promptOverride;
         const kmcOrientation =
           safeStr(working?.inputs?.character_orientation || working?.inputs?.characterOrientation, "") || "video";
         const keepOriginalSound =
-          working?.inputs?.keep_original_sound ?? working?.inputs?.keepOriginalSound ?? true;
+          working?.inputs?.keep_original_sound ?? working?.inputs?.keepOriginalSound ?? generateAudio;
 
         working.meta = { ...(working.meta || {}), video_engine: "kling_motion_control" };
         await updateVars({ supabase, generationId, vars: working });

@@ -909,6 +909,23 @@ function nanoBananaEnabled() {
   // Otherwise we require the Replicate nano banana version (your current behavior)
   return !!process.env.MMA_NANOBANANA_VERSION;
 }
+function mainGeminiModel() {
+  return safeStr(process.env.MMA_MAIN_GEMINI_MODEL, "");
+}
+
+function mainUsesGemini() {
+  return !!mainGeminiModel() && !!process.env.GEMINI_API_KEY;
+}
+
+function resolveStillEngine(vars) {
+  const lane = resolveStillLane(vars);
+
+  if (lane === "niche" && nanoBananaEnabled()) return "nanobanana";
+  if (lane === "main" && mainUsesGemini()) return "nanobanana2";
+
+  return "seedream";
+}
+
 
 function buildNanoBananaImageInputs(vars) {
   // nano-banana supports up to 14 reference images :contentReference[oaicite:6]{index=6}
@@ -1124,11 +1141,12 @@ async function _putBytesToR2Public({ bytes, contentType, keyPrefix }) {
   return `${base.replace(/\/$/,"")}/${key}`;
 }
 
-async function runNanoBananaGemini(opts) {
+async function runNanoBananaGemini(opts = {}) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is missing (set it in env)");
 
   const model =
+    safeStr(opts?.model, "") ||
     process.env.MMA_NANOBANANA_GEMINI_MODEL ||
     "gemini-3-pro-image-preview";
 
@@ -1146,9 +1164,8 @@ async function runNanoBananaGemini(opts) {
       : [];
 
   const maxImgs =
-    Number(process.env.MMA_NANOBANANA_GEMINI_MAX_IMAGES || 14) || 14;
+    Number(opts?.maxImages ?? process.env.MMA_NANOBANANA_GEMINI_MAX_IMAGES ?? 14) || 14;
 
-  // Build Gemini parts: (optional images) + text
   const parts = [];
 
   for (const url of imageInputs.slice(0, maxImgs)) {
@@ -1166,20 +1183,55 @@ async function runNanoBananaGemini(opts) {
 
   parts.push({ text: prompt });
 
+  const imageSize =
+    safeStr(opts?.imageSize || opts?.resolution || opts?.size, "") ||
+    safeStr(process.env.MMA_NANOBANANA_GEMINI_IMAGE_SIZE, "");
+
+  const thinkingLevelRaw = safeStr(opts?.thinkingLevel, "").toLowerCase();
+  const thinkingLevel =
+    thinkingLevelRaw === "high" ? "High" :
+    thinkingLevelRaw === "minimal" ? "Minimal" :
+    thinkingLevelRaw === "low" ? "Low" :
+    thinkingLevelRaw === "medium" ? "Medium" :
+    "";
+
+  const includeThoughts = parseOptionalBool(opts?.includeThoughts);
+
+  const responseModalities =
+    Array.isArray(opts?.responseModalities) && opts.responseModalities.length
+      ? opts.responseModalities
+      : ["IMAGE"];
+
   const body = {
     contents: [{ parts }],
     generationConfig: {
-      responseModalities: ["IMAGE"], // official REST example :contentReference[oaicite:3]{index=3}
+      responseModalities,
       imageConfig: {},
     },
   };
 
   if (aspectRatio) body.generationConfig.imageConfig.aspectRatio = aspectRatio;
+  if (imageSize) body.generationConfig.imageConfig.imageSize = imageSize;
 
-  // Only used by the Pro preview model (optional)
-  if (model === "gemini-3-pro-image-preview") {
-    const sz = process.env.MMA_NANOBANANA_GEMINI_IMAGE_SIZE || "4K";
-    if (sz) body.generationConfig.imageConfig.imageSize = sz;
+  if (thinkingLevel || includeThoughts !== undefined) {
+    body.generationConfig.thinkingConfig = {};
+    if (thinkingLevel) body.generationConfig.thinkingConfig.thinkingLevel = thinkingLevel;
+    if (includeThoughts !== undefined) {
+      body.generationConfig.thinkingConfig.includeThoughts = includeThoughts;
+    }
+  }
+
+  const useGoogleSearch = parseOptionalBool(opts?.useGoogleSearch);
+  const useImageSearch = parseOptionalBool(opts?.useImageSearch);
+
+  if (useGoogleSearch || useImageSearch) {
+    body.tools = [
+      {
+        google_search: useImageSearch
+          ? { searchTypes: { webSearch: {}, imageSearch: {} } }
+          : {},
+      },
+    ];
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
@@ -1212,7 +1264,6 @@ async function runNanoBananaGemini(opts) {
   const finishReason = safeStr(cand0?.finishReason || cand0?.finish_reason, "");
   const finishMessage = safeStr(cand0?.finishMessage || cand0?.finish_message, "");
 
-  // ✅ THIS is your real problem:
   if (finishReason && String(finishReason).toUpperCase().includes("IMAGE_SAFETY")) {
     const e = new Error(
       `IMAGE_SAFETY: ${finishMessage || "Blocked by safety filters. Try rephrasing."}`
@@ -1250,12 +1301,17 @@ async function runNanoBananaGemini(opts) {
   return {
     input: {
       prompt,
-      resolution: safeStr(opts?.resolution, "") || safeStr(opts?.size, "") || "4K",
+      resolution: safeStr(opts?.resolution, "") || safeStr(opts?.size, "") || imageSize || "4K",
       aspect_ratio: aspectRatio || undefined,
       output_format: outputFormat,
       image_input: imageInputs.slice(0, maxImgs).map(asHttpUrl).filter(Boolean),
       provider: "gemini",
       model,
+      response_modalities: responseModalities,
+      thinking_level: thinkingLevel || undefined,
+      include_thoughts: includeThoughts,
+      google_search: !!useGoogleSearch,
+      image_search: !!useImageSearch,
     },
     out: publicUrl,
     prediction_id: null,
@@ -2582,59 +2638,81 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       intervalMs: 2600,
     });
 
-    // lane: "main" (default) => Seedream, "niche" => Nano Banana (if enabled)
+    // lane routing:
+    // - niche => existing Nano Banana behavior
+    // - main  => Gemini 3.1 Flash Image if MMA_MAIN_GEMINI_MODEL is set
+    // - else  => Seedream
     const stillLane = resolveStillLane(working);
-    const useNano = stillLane === "niche" && nanoBananaEnabled();
+    const stillEngine = resolveStillEngine(working); // seedream | nanobanana | nanobanana2
     const appliedResolution = resolveAppliedStillResolution(working?.inputs || {});
 
     working.inputs = { ...(working.inputs || {}), ...stillResolutionMeta(appliedResolution) };
     working.meta = {
       ...(working.meta || {}),
       still_lane: stillLane,
-      still_engine: useNano ? "nanobanana" : "seedream",
+      still_engine: stillEngine,
       ...stillResolutionMeta(appliedResolution),
     };
     await updateVars({ supabase, generationId, vars: working });
 
-    const imageInputs = useNano ? buildNanoBananaImageInputs(working) : buildSeedreamImageInputs(working);
+    const useNanoLike = stillEngine === "nanobanana" || stillEngine === "nanobanana2";
+    const imageInputs = useNanoLike
+      ? buildNanoBananaImageInputs(working)
+      : buildSeedreamImageInputs(working);
 
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
-      (useNano
+      (useNanoLike
         ? process.env.MMA_NANOBANANA_ASPECT_RATIO || cfg?.nanobanana?.aspectRatio
         : cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO) ||
       "match_input_image";
 
-    // If user chose match_input_image but no inputs exist, force a safe fallback aspect ratio
     if (!imageInputs.length && String(aspectRatio).toLowerCase().includes("match")) {
-      aspectRatio = useNano
+      aspectRatio = useNanoLike
         ? process.env.MMA_NANOBANANA_FALLBACK_ASPECT_RATIO || cfg?.nanobanana?.fallbackAspectRatio || "1:1"
         : cfg?.seadream?.fallbackAspectRatio || process.env.MMA_SEADREAM_FALLBACK_ASPECT_RATIO || "1:1";
     }
 
     let genRes;
     try {
-      genRes = useNano
-        ? await runNanoBanana({
-            prompt: usedPrompt,
-            aspectRatio,
-            imageInputs,
-            resolution: appliedResolution,
-            outputFormat: cfg?.nanobanana?.outputFormat,
-            safetyFilterLevel: cfg?.nanobanana?.safetyFilterLevel,
-          })
-        : await runSeedream({
-            prompt: usedPrompt,
-            aspectRatio,
-            imageInputs,
-            size: appliedResolution,
-            enhancePrompt: cfg?.seadream?.enhancePrompt,
-          });
+      genRes =
+        stillEngine === "nanobanana2"
+          ? await runNanoBananaGemini({
+              prompt: usedPrompt,
+              aspectRatio,
+              imageInputs,
+              resolution: appliedResolution,
+              imageSize: process.env.MMA_MAIN_GEMINI_IMAGE_SIZE || appliedResolution,
+              model: process.env.MMA_MAIN_GEMINI_MODEL || "gemini-3.1-flash-image-preview",
+              thinkingLevel: process.env.MMA_MAIN_GEMINI_THINKING_LEVEL || "High",
+              includeThoughts: parseOptionalBool(process.env.MMA_MAIN_GEMINI_INCLUDE_THOUGHTS),
+              useGoogleSearch: parseOptionalBool(process.env.MMA_MAIN_GEMINI_USE_GOOGLE_SEARCH),
+              useImageSearch: parseOptionalBool(process.env.MMA_MAIN_GEMINI_USE_IMAGE_SEARCH),
+              responseModalities: ["IMAGE"],
+            })
+          : stillEngine === "nanobanana"
+            ? await runNanoBanana({
+                prompt: usedPrompt,
+                aspectRatio,
+                imageInputs,
+                resolution: appliedResolution,
+                outputFormat: cfg?.nanobanana?.outputFormat,
+                safetyFilterLevel: cfg?.nanobanana?.safetyFilterLevel,
+              })
+            : await runSeedream({
+                prompt: usedPrompt,
+                aspectRatio,
+                imageInputs,
+                size: appliedResolution,
+                enhancePrompt: cfg?.seadream?.enhancePrompt,
+              });
 
-      // ✅ store prediction id for recovery later
       working.outputs = { ...(working.outputs || {}) };
-      if (useNano) working.outputs.nanobanana_prediction_id = genRes.prediction_id || null;
-      else working.outputs.seedream_prediction_id = genRes.prediction_id || null;
+      if (stillEngine === "nanobanana") {
+        working.outputs.nanobanana_prediction_id = genRes.prediction_id || null;
+      } else if (stillEngine === "seedream") {
+        working.outputs.seedream_prediction_id = genRes.prediction_id || null;
+      }
 
       await updateVars({ supabase, generationId, vars: working });
     } finally {
@@ -2651,17 +2729,36 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: useNano ? "nanobanana_generate" : "seedream_generate",
+      stepType:
+        stillEngine === "nanobanana2"
+          ? "nanobanana2_generate"
+          : stillEngine === "nanobanana"
+            ? "nanobanana_generate"
+            : "seedream_generate",
       payload: { input, output: out, timing, error: null },
     });
 
     const url = pickFirstUrl(out);
-    if (!url) throw new Error(useNano ? "NANOBANANA_NO_URL" : "SEADREAM_NO_URL");
+    if (!url) {
+      throw new Error(
+        stillEngine === "nanobanana2"
+          ? "NANOBANANA2_NO_URL"
+          : stillEngine === "nanobanana"
+            ? "NANOBANANA_NO_URL"
+            : "SEADREAM_NO_URL"
+      );
+    }
 
     const remoteUrl = await storeRemoteToR2Public(url, `mma/still/${generationId}`);
     working.outputs = { ...(working.outputs || {}) };
-    if (useNano) working.outputs.nanobanana_image_url = remoteUrl;
-    else working.outputs.seedream_image_url = remoteUrl;
+    if (stillEngine === "nanobanana2") {
+      working.outputs.nanobanana2_image_url = remoteUrl;
+      working.outputs.nanobanana_image_url = remoteUrl; // compatibility
+    } else if (stillEngine === "nanobanana") {
+      working.outputs.nanobanana_image_url = remoteUrl;
+    } else {
+      working.outputs.seedream_image_url = remoteUrl;
+    }
 
     working.mg_output_url = remoteUrl;
 
@@ -2805,67 +2902,92 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     });
 
     const stillLane = resolveStillLane(working);
-    const useNano = stillLane === "niche" && nanoBananaEnabled();
+    const stillEngine = resolveStillEngine(working); // seedream | nanobanana | nanobanana2
     const appliedResolution = resolveAppliedStillResolution(working?.inputs || {});
 
     working.inputs = { ...(working.inputs || {}), ...stillResolutionMeta(appliedResolution) };
     working.meta = {
       ...(working.meta || {}),
       still_lane: stillLane,
-      still_engine: useNano ? "nanobanana" : "seedream",
+      still_engine: stillEngine,
       ...stillResolutionMeta(appliedResolution),
     };
     await updateVars({ supabase, generationId, vars: working });
 
+    const useNanoLike = stillEngine === "nanobanana" || stillEngine === "nanobanana2";
+
     let aspectRatio =
       safeStr(working?.inputs?.aspect_ratio, "") ||
-      (useNano
+      (useNanoLike
         ? process.env.MMA_NANOBANANA_ASPECT_RATIO || cfg?.nanobanana?.aspectRatio
         : cfg?.seadream?.aspectRatio || process.env.MMA_SEADREAM_ASPECT_RATIO) ||
       "match_input_image";
 
-    // tweak always has a parent image, so match_input_image is fine, but keep fallback anyway
     if (String(aspectRatio).toLowerCase().includes("match") && !parentUrl) {
       aspectRatio = "1:1";
     }
 
-    const forcedInput = useNano
-      ? {
-          prompt: usedPrompt,
-          resolution: appliedResolution,
-          aspect_ratio: aspectRatio,
-          output_format: cfg?.nanobanana?.outputFormat || process.env.MMA_NANOBANANA_OUTPUT_FORMAT || "jpg",
-          safety_filter_level:
-            cfg?.nanobanana?.safetyFilterLevel || process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL || "block_only_high",
-          image_input: [parentUrl],
-        }
-      : {
-          prompt: usedPrompt,
-          size: appliedResolution,
-          aspect_ratio: aspectRatio,
-          enhance_prompt: !!cfg?.seadream?.enhancePrompt,
-          sequential_image_generation: "disabled",
-          max_images: 1,
-          image_input: [parentUrl],
-        };
+    const forcedInput =
+      stillEngine === "nanobanana2"
+        ? {
+            prompt: usedPrompt,
+            resolution: appliedResolution,
+            aspect_ratio: aspectRatio,
+            image_input: [parentUrl],
+          }
+        : stillEngine === "nanobanana"
+          ? {
+              prompt: usedPrompt,
+              resolution: appliedResolution,
+              aspect_ratio: aspectRatio,
+              output_format: cfg?.nanobanana?.outputFormat || process.env.MMA_NANOBANANA_OUTPUT_FORMAT || "jpg",
+              safety_filter_level:
+                cfg?.nanobanana?.safetyFilterLevel || process.env.MMA_NANOBANANA_SAFETY_FILTER_LEVEL || "block_only_high",
+              image_input: [parentUrl],
+            }
+          : {
+              prompt: usedPrompt,
+              size: appliedResolution,
+              aspect_ratio: aspectRatio,
+              enhance_prompt: !!cfg?.seadream?.enhancePrompt,
+              sequential_image_generation: "disabled",
+              max_images: 1,
+              image_input: [parentUrl],
+            };
 
     let genRes;
     try {
-      genRes = useNano
-        ? await runNanoBanana({
-            prompt: usedPrompt,
-            aspectRatio,
-            imageInputs: [parentUrl],
-            input: forcedInput,
-          })
-        : await runSeedream({
-            prompt: usedPrompt,
-            aspectRatio,
-            imageInputs: [parentUrl],
-            size: cfg?.seadream?.size,
-            enhancePrompt: cfg?.seadream?.enhancePrompt,
-            input: forcedInput,
-          });
+      genRes =
+        stillEngine === "nanobanana2"
+          ? await runNanoBananaGemini({
+              prompt: usedPrompt,
+              aspectRatio,
+              imageInputs: [parentUrl],
+              input: forcedInput,
+              resolution: appliedResolution,
+              imageSize: process.env.MMA_MAIN_GEMINI_IMAGE_SIZE || appliedResolution,
+              model: process.env.MMA_MAIN_GEMINI_MODEL || "gemini-3.1-flash-image-preview",
+              thinkingLevel: process.env.MMA_MAIN_GEMINI_THINKING_LEVEL || "High",
+              includeThoughts: parseOptionalBool(process.env.MMA_MAIN_GEMINI_INCLUDE_THOUGHTS),
+              useGoogleSearch: parseOptionalBool(process.env.MMA_MAIN_GEMINI_USE_GOOGLE_SEARCH),
+              useImageSearch: parseOptionalBool(process.env.MMA_MAIN_GEMINI_USE_IMAGE_SEARCH),
+              responseModalities: ["IMAGE"],
+            })
+          : stillEngine === "nanobanana"
+            ? await runNanoBanana({
+                prompt: usedPrompt,
+                aspectRatio,
+                imageInputs: [parentUrl],
+                input: forcedInput,
+              })
+            : await runSeedream({
+                prompt: usedPrompt,
+                aspectRatio,
+                imageInputs: [parentUrl],
+                size: cfg?.seadream?.size,
+                enhancePrompt: cfg?.seadream?.enhancePrompt,
+                input: forcedInput,
+              });
     } finally {
       try {
         chatter?.stop?.();
@@ -2880,18 +3002,37 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
       generationId,
       passId,
       stepNo: stepNo++,
-      stepType: useNano ? "nanobanana_generate_tweak" : "seedream_generate_tweak",
+      stepType:
+        stillEngine === "nanobanana2"
+          ? "nanobanana2_generate_tweak"
+          : stillEngine === "nanobanana"
+            ? "nanobanana_generate_tweak"
+            : "seedream_generate_tweak",
       payload: { input, output: out, timing, error: null },
     });
 
     const genUrl = pickFirstUrl(out);
-    if (!genUrl) throw new Error(useNano ? "NANOBANANA_NO_URL_TWEAK" : "SEADREAM_NO_URL_TWEAK");
+    if (!genUrl) {
+      throw new Error(
+        stillEngine === "nanobanana2"
+          ? "NANOBANANA2_NO_URL_TWEAK"
+          : stillEngine === "nanobanana"
+            ? "NANOBANANA_NO_URL_TWEAK"
+            : "SEADREAM_NO_URL_TWEAK"
+      );
+    }
 
     const remoteUrl = await storeRemoteToR2Public(genUrl, `mma/still/${generationId}`);
 
     working.outputs = { ...(working.outputs || {}) };
-    if (useNano) working.outputs.nanobanana_image_url = remoteUrl;
-    else working.outputs.seedream_image_url = remoteUrl;
+    if (stillEngine === "nanobanana2") {
+      working.outputs.nanobanana2_image_url = remoteUrl;
+      working.outputs.nanobanana_image_url = remoteUrl; // compatibility
+    } else if (stillEngine === "nanobanana") {
+      working.outputs.nanobanana_image_url = remoteUrl;
+    } else {
+      working.outputs.seedream_image_url = remoteUrl;
+    }
 
     working.mg_output_url = remoteUrl;
 
@@ -4178,7 +4319,9 @@ export async function fetchGeneration(generationId) {
 
   const stillEngine =
     safeStr(meta.still_engine, "") ||
-    (vOut.nanobanana_image_url || vOut.nanobanana_prediction_id ? "nanobanana" : "seedream");
+    (vOut.nanobanana2_image_url
+      ? "nanobanana2"
+      : (vOut.nanobanana_image_url || vOut.nanobanana_prediction_id ? "nanobanana" : "seedream"));
 
   return {
     generation_id: data.mg_generation_id,
@@ -4192,7 +4335,14 @@ export async function fetchGeneration(generationId) {
       seedream_image_url:
         data.mg_mma_mode === "still" && stillEngine === "seedream" ? data.mg_output_url : null,
       nanobanana_image_url:
-        data.mg_mma_mode === "still" && stillEngine === "nanobanana" ? data.mg_output_url : null,
+        data.mg_mma_mode === "still" &&
+        (stillEngine === "nanobanana" || stillEngine === "nanobanana2")
+          ? data.mg_output_url
+          : null,
+      nanobanana2_image_url:
+        data.mg_mma_mode === "still" && stillEngine === "nanobanana2"
+          ? data.mg_output_url
+          : null,
       kling_video_url: data.mg_mma_mode === "video" ? data.mg_output_url : null,
     },
 

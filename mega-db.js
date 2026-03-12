@@ -210,10 +210,44 @@ export async function megaGetCredits(passId) {
 
   if (error) throw error;
 
-  return {
-    credits: intOr(data?.mg_credits, 0),
-    expiresAt: data?.mg_expires_at ?? null,
-  };
+  const credits = intOr(data?.mg_credits, 0);
+  const expiresAt = data?.mg_expires_at ?? null;
+
+  // If credits have expired, zero them out
+  if (credits > 0 && expiresAt) {
+    const now = Date.now();
+    const expiry = Date.parse(expiresAt);
+    if (Number.isFinite(expiry) && now > expiry) {
+      const ts = nowIso();
+      // Zero out credits in the database
+      await supabase
+        .from("mega_customers")
+        .update({ mg_credits: 0, mg_updated_at: ts })
+        .eq("mg_pass_id", pid);
+
+      // Log the expiration in the ledger
+      await supabase.from("mega_generations").insert({
+        mg_id: `credit_transaction:${crypto.randomUUID()}`,
+        mg_record_type: "credit_transaction",
+        mg_pass_id: pid,
+        mg_delta: -credits,
+        mg_reason: "expired",
+        mg_source: "system",
+        mg_ref_type: "expiration",
+        mg_ref_id: `exp_${pid}_${ts}`,
+        mg_status: "succeeded",
+        mg_meta: { credits_before: credits, credits_after: 0, expires_at: expiresAt },
+        mg_payload: null,
+        mg_event_at: ts,
+        mg_created_at: ts,
+        mg_updated_at: ts,
+      });
+
+      return { credits: 0, expiresAt };
+    }
+  }
+
+  return { credits, expiresAt };
 }
 
 // ---------------------------

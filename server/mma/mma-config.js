@@ -201,6 +201,18 @@ export function getMmaConfig() {
       styleHeroMap,
     },
 
+    nanobanana: {
+      model: pickEnv(
+        ["MMA_NANOBANANA_VERSION", "MMA_NANOBANANA_MODEL", "MMA_MAIN_GEMINI_MODEL"],
+        "gemini-3.1-flash-image-preview"
+      ),
+      aspectRatio: pickEnv(["MMA_NANOBANANA_ASPECT_RATIO"], "match_input_image"),
+      fallbackAspectRatio: pickEnv(["MMA_NANOBANANA_FALLBACK_ASPECT_RATIO"], "1:1"),
+      resolution: pickEnv(["MMA_NANOBANANA_RESOLUTION", "MMA_MAIN_GEMINI_IMAGE_SIZE"], "4K"),
+      outputFormat: pickEnv(["MMA_NANOBANANA_OUTPUT_FORMAT"], "jpg"),
+      safetyFilterLevel: pickEnv(["MMA_NANOBANANA_SAFETY_FILTER_LEVEL"], "block_only_high"),
+    },
+
     kling: {
       model: klingModel,
       mode: klingMode,

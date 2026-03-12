@@ -17,6 +17,7 @@ import { getSupabaseAdmin, sbEnabled, logAdminAction } from "./supabase.js";
 import { requireAdmin } from "./auth.js";
 
 import mmaRouter from "./server/mma/mma-router.js";
+import fingertipsRouter from "./server/fingertips/fingertips-router.js";
 import mmaLogAdminRouter from "./src/routes/admin/mma-logadmin.js";
 import historyRouter from "./server/history-router.js";
 
@@ -895,6 +896,44 @@ app.post("/api/r2/upload-dataurl", async (req, res) => {
 // ======================================================
 app.use("/mma", mmaRouter);
 app.use("/admin/mma", mmaLogAdminRouter);
+
+// ======================================================
+// Fingertips API (image editing tools — fractional matcha billing)
+// ======================================================
+app.use("/fingertips", async (req, res, next) => {
+  try {
+    if (req.method !== "POST" && req.method !== "GET") return next();
+
+    const resolved = resolvePassIdForRequest(req, req.body || {});
+    const passId = normalizeIncomingPassId(resolved);
+    setPassIdHeader(res, passId);
+
+    if (req.method === "POST") {
+      req.body = req.body || {};
+      if (!req.body.passId) req.body.passId = passId;
+      if (!req.body.pass_id) req.body.pass_id = passId;
+    }
+
+    if (sbEnabled()) {
+      const authUser = await getAuthUser(req);
+      await megaEnsureCustomer({
+        passId,
+        userId: authUser?.userId || null,
+        email: authUser?.email || null,
+      });
+    }
+
+    return next();
+  } catch (e) {
+    console.error("[fingertips passId middleware] failed", e);
+    return res.status(500).json({
+      ok: false,
+      error: "FINGERTIPS_PASSID_MW_FAILED",
+      message: e?.message || String(e),
+    });
+  }
+});
+app.use("/fingertips", fingertipsRouter);
 
 // ======================================================
 // Admin API (MEGA)

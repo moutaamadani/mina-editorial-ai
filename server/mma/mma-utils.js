@@ -371,13 +371,21 @@ export function makeInitialVars({
 
     settings: {
       seedream: settings.seedream || {},
+      nanobanana: settings.nanobanana || {},
       kling: settings.kling || {},
     },
 
     outputs: {
       // urls your pipelines write
       seedream_image_url: null,
+      nanobanana_image_url: null,
+      nanobanana2_image_url: null,
       kling_video_url: null,
+
+      // prediction/task ids
+      seedream_prediction_id: null,
+      nanobanana_prediction_id: null,
+      nanobanana2_prediction_id: null,
 
       // legacy ids (optional)
       seedream_image_id: null,

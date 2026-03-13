@@ -14,6 +14,7 @@
 
 import crypto from "node:crypto";
 import Replicate from "replicate";
+import OpenAI from "openai";
 
 import {
   megaEnsureCustomer,
@@ -35,6 +36,43 @@ function getReplicate() {
   if (!process.env.REPLICATE_API_TOKEN) throw new Error("REPLICATE_API_TOKEN_MISSING");
   _replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
   return _replicate;
+}
+
+// ============================================================================
+// OpenAI client (shared singleton — for clarity-upscaler image description)
+// ============================================================================
+let _openai = null;
+function getOpenAI() {
+  if (_openai) return _openai;
+  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY_MISSING");
+  _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
+}
+
+// ============================================================================
+// GPT Vision: describe an image in hyper-detail for clarity-upscaler
+// ============================================================================
+async function describeImageForUpscale(imageUrl) {
+  const openai = getOpenAI();
+
+  const systemPrompt = `You are an expert image analyst. Given an image, produce a single hyper-detailed description of EVERYTHING visible: subjects, materials, textures, lighting, colors, reflections, shadows, depth of field, composition, atmosphere, and fine details. The description will be used as a prompt for an AI upscaler to reconstruct maximum photorealistic detail. Be extremely specific and vivid. Output ONLY the description text, nothing else.`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image in hyper-realistic detail for an AI upscaler:" },
+          { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
+        ],
+      },
+    ],
+    max_tokens: 1024,
+  });
+
+  return (resp.choices?.[0]?.message?.content || "").trim();
 }
 
 // ============================================================================
@@ -347,6 +385,19 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
       mg_created_at: ts,
       mg_updated_at: ts,
     });
+  }
+
+  // 3b. Clarity-upscaler: auto-describe image with GPT vision + inject default prompts
+  if (modelKey === "upscale" && model.variant === "clarity") {
+    try {
+      const gptDescription = await describeImageForUpscale(cleanedInputs.image);
+      const suffix = model.defaultSuffix || "";
+      cleanedInputs.prompt = gptDescription + (suffix ? ", " + suffix : "");
+    } catch (err) {
+      // Fallback: use suffix only if GPT fails
+      cleanedInputs.prompt = model.defaultSuffix || "high quality, detailed";
+    }
+    cleanedInputs.negative_prompt = cleanedInputs.negative_prompt || model.defaultNegative || "";
   }
 
   // 4. Call Replicate

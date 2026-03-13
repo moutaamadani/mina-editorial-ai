@@ -532,7 +532,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     };
   }
 
-  // 6. Success — normalize URL to R2, then finalize
+  // 6. Success — extract output URL, store to R2 (NEVER expose provider URLs)
   const rawOutputUrl = extractOutputUrl(result.output);
 
   if (!rawOutputUrl) {
@@ -540,15 +540,52 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
       "| prediction:", result.predictionId,
       "| output type:", typeof result.output,
       "| output:", JSON.stringify(result.output)?.slice(0, 500));
+
+    // Refund — no usable output
+    const refundResult = await refundFingertips({ passId, generationId, modelKey });
+    if (supabase) {
+      await supabase
+        .from("mega_generations")
+        .update({
+          mg_mma_status: "error",
+          mg_status: "failed",
+          mg_error: { code: "NO_OUTPUT_URL", message: "Provider returned no usable image." },
+          mg_mma_vars: { modelKey, inputs: cleanedInputs, charge: chargeResult, refund: refundResult },
+          mg_updated_at: nowIso(),
+        })
+        .eq("mg_id", `generation:${generationId}`);
+    }
+    throw makeHttpError(502, "FINGERTIPS_GENERATION_FAILED", {
+      generationId, modelKey, refunded: refundResult.refunded,
+      message: "Generation produced no image. You were not charged.",
+    });
   }
 
-  let outputUrl = rawOutputUrl;
+  // Always persist to our own R2 — never return provider URLs to the client
+  let outputUrl;
   try {
-    if (rawOutputUrl) {
-      outputUrl = await storeToR2(rawOutputUrl, `fingertips/${modelKey}/${generationId}`);
-    }
+    outputUrl = await storeToR2(rawOutputUrl, `fingertips/${modelKey}/${generationId}`);
   } catch (e) {
-    console.warn("[fingertips] storeToR2 failed, using raw Replicate URL:", e?.message || e);
+    console.error("[fingertips] storeToR2 failed for model", modelKey, ":", e?.message || e);
+
+    // Refund — we can't serve a provider URL
+    const refundResult = await refundFingertips({ passId, generationId, modelKey });
+    if (supabase) {
+      await supabase
+        .from("mega_generations")
+        .update({
+          mg_mma_status: "error",
+          mg_status: "failed",
+          mg_error: { code: "R2_STORE_FAILED", message: "Failed to store generated image." },
+          mg_mma_vars: { modelKey, inputs: cleanedInputs, charge: chargeResult, refund: refundResult },
+          mg_updated_at: nowIso(),
+        })
+        .eq("mg_id", `generation:${generationId}`);
+    }
+    throw makeHttpError(502, "FINGERTIPS_GENERATION_FAILED", {
+      generationId, modelKey, refunded: refundResult.refunded,
+      message: "Could not save generated image. You were not charged.",
+    });
   }
 
   if (supabase) {
@@ -568,9 +605,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
   return {
     generation_id: generationId,
     status: "done",
-    model: model.replicateModel,
     model_key: modelKey,
-    output: result.output,
     output_url: outputUrl,
     prediction_id: result.predictionId,
     elapsed_ms: result.elapsedMs,

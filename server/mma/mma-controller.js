@@ -3439,13 +3439,7 @@ const usePromptOverride = !!promptOverride;
     const remote = pickFirstUrl(out);
     if (!remote) throw new Error("VIDEO_NO_URL");
 
-    let remoteUrl = remote;
-    try {
-      remoteUrl = await storeRemoteToR2Public(remote, `mma/video/${generationId}`);
-    } catch (e) {
-      console.warn("[mma] storeRemoteToR2Public failed (video), using provider url:", e?.message || e);
-      remoteUrl = remote;
-    }
+    const remoteUrl = await storeRemoteToR2Public(remote, `mma/video/${generationId}`);
 
     working.outputs = { ...(working.outputs || {}) };
     working.outputs.kling_video_url = remoteUrl;

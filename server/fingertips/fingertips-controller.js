@@ -339,9 +339,37 @@ export async function refundFingertips({ passId, generationId, modelKey }) {
 }
 
 // ============================================================================
-// validateInputs — check required inputs against the model's schema
+// Upload data URLs to R2 (mask images from frontend canvas)
 // ============================================================================
-function validateInputs(modelKey, userInputs) {
+async function uploadDataUrlToR2(dataUrl, keyPrefix) {
+  const { enabled, client, bucket, publicBase } = getR2();
+  if (!enabled || !client) throw new Error("R2_NOT_CONFIGURED_FOR_MASK_UPLOAD");
+
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) throw new Error("INVALID_DATA_URL");
+
+  const contentType = match[1];
+  const buf = Buffer.from(match[2], "base64");
+  const ext = contentType.includes("png") ? ".png" : ".jpg";
+  const objKey = `${keyPrefix}${ext}`;
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: objKey,
+      Body: buf,
+      ContentType: contentType,
+    })
+  );
+
+  return `${publicBase.replace(/\/$/, "")}/${objKey}`;
+}
+
+// ============================================================================
+// validateInputs — check required inputs against the model's schema
+// Also uploads any data URL inputs (masks) to R2 for Replicate compatibility
+// ============================================================================
+async function validateInputs(modelKey, userInputs, generationId) {
   const model = getFingertipsModel(modelKey);
   if (!model) throw makeHttpError(400, "UNKNOWN_FINGERTIPS_MODEL", { modelKey });
 
@@ -350,7 +378,7 @@ function validateInputs(modelKey, userInputs) {
   const missing = [];
 
   for (const [param, spec] of Object.entries(schema)) {
-    const value = userInputs?.[param];
+    let value = userInputs?.[param];
 
     if (spec.required && (value === undefined || value === null || value === "")) {
       missing.push(param);
@@ -358,6 +386,10 @@ function validateInputs(modelKey, userInputs) {
     }
 
     if (value !== undefined && value !== null && value !== "") {
+      // Upload data URLs to R2 (canvas mask images from frontend)
+      if (spec.type === "uri" && typeof value === "string" && value.startsWith("data:")) {
+        value = await uploadDataUrlToR2(value, `fingertips/mask/${generationId}_${param}`);
+      }
       cleaned[param] = value;
     } else if (spec.default !== undefined) {
       cleaned[param] = spec.default;
@@ -419,8 +451,8 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
   const generationId = crypto.randomUUID();
   const supabase = getSupabaseAdmin();
 
-  // 1. Validate inputs
-  const cleanedInputs = validateInputs(modelKey, inputs || {});
+  // 1. Validate inputs (async — uploads data URL masks to R2)
+  const cleanedInputs = await validateInputs(modelKey, inputs || {}, generationId);
 
   // 2. Charge (pool-based)
   const chargeResult = await chargeFingertips({ passId, generationId, modelKey });

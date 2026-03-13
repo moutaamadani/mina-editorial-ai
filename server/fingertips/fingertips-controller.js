@@ -448,8 +448,8 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     });
   }
 
-  // 3b. Clarity-upscaler: auto-describe image with GPT vision + inject default prompts
-  if (modelKey === "upscale" && model.variant === "clarity") {
+  // 3b. Upscaler GPT vision: auto-describe image for prompt-based upscalers
+  if (modelKey === "upscale" && (model.variant === "clarity" || model.variant === "magic")) {
     try {
       const gptDescription = await describeImageForUpscale(cleanedInputs.image);
       const suffix = model.defaultSuffix || "";

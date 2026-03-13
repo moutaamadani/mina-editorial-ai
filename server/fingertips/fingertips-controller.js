@@ -56,7 +56,7 @@ function getOpenAI() {
 async function describeImageForUpscale(imageUrl) {
   const openai = getOpenAI();
 
-  const systemPrompt = `You are an expert image analyst. Given an image, produce a single hyper-detailed description of EVERYTHING visible: subjects, materials, textures, lighting, colors, reflections, shadows, depth of field, composition, atmosphere, and fine details. The description will be used as a prompt for an AI upscaler to reconstruct maximum photorealistic detail. Be extremely specific and vivid. Output ONLY the description text, nothing else.`;
+  const systemPrompt = `You are an expert image analyst. Given an image, produce a CONCISE description (maximum 60 words) of what is visible: subject, key materials/textures, lighting, and dominant colors. This will be used as a prompt for an AI upscaler — keep it short and keyword-rich. Output ONLY the description text, nothing else.`;
 
   const resp = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -70,7 +70,7 @@ async function describeImageForUpscale(imageUrl) {
         ],
       },
     ],
-    max_tokens: 1024,
+    max_tokens: 150,
   });
 
   return (resp.choices?.[0]?.message?.content || "").trim();
@@ -459,6 +459,11 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
       cleanedInputs.prompt = model.defaultSuffix || "high quality, detailed";
     }
     cleanedInputs.negative_prompt = cleanedInputs.negative_prompt || model.defaultNegative || "";
+
+    // Force resolution to 1024 to avoid CUDA OOM on large images
+    if (model.variant === "magic") {
+      cleanedInputs.resolution = "1024";
+    }
   }
 
   // 4. Call Replicate

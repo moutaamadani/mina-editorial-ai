@@ -3,7 +3,7 @@
 
 // ============================================================================
 // COST TABLE
-// Each model costs a fraction of 1 matcha per generation.
+// Each model costs a fraction of 1 matcha per generation. except upscaler
 // The billing system deducts 1 whole matcha at a time into a "fingertips pool",
 // then draws down from that pool until exhausted.
 // ============================================================================
@@ -83,7 +83,7 @@ export const FINGERTIPS_MODELS = {
         },
       }
     : {
-        replicateModel: "philz1337x/clarity-upscaler:dfad41707589d68ecdccd1dfa600d55a208f9310748e44bfe35b4a6291453d5e",
+        replicateModel: "philz1337x/clarity-upscaler",
         costPerGeneration: 0.1, // 10 generations = 1 matcha
         label: "Clarity Upscaler",
         description: "Hyper-realistic AI upscale — uses GPT vision to describe the image for maximum detail",

@@ -47,9 +47,16 @@ export async function replicatePredictWithTimeout({
   const callT = Math.max(3000, Number(callTimeoutMs || 0) || 15000);
 
   // 1) create prediction
+  // Detect whether `version` is an "owner/model" string (no colon → use `model` param)
+  // or includes a version hash after ":" (use `version` param).
+  const hasVersionHash = version.includes(":");
+  const createPayload = hasVersionHash
+    ? { version, input }
+    : { model: version, input };
+
   let created;
   created = await withTimeout(
-    replicate.predictions.create({ version, input }),
+    replicate.predictions.create(createPayload),
     callT,
     "REPLICATE_CREATE_TIMEOUT"
   );

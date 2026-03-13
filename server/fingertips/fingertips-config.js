@@ -60,7 +60,7 @@ export const FINGERTIPS_MODELS = {
   },
 
   remove_bg: {
-    replicateModel: "851-labs/background-remover,
+    replicateModel: "851-labs/background-remover",
     costPerGeneration: 0.2, // 5 generations = 1 matcha
     label: "Remove Background",
     description: "Remove backgrounds with 256 levels of transparency",

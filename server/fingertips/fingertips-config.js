@@ -47,16 +47,19 @@ export const FINGERTIPS_MODELS = {
     costPerGeneration: 0.5,
     label: "Image Expand",
     description: "Expand images beyond their borders to a new aspect ratio",
-    // Required: image + (aspect_ratio OR canvas_size combo). Optional: prompt, negative_prompt, seed, content_moderation
+    // Required: image + (aspect_ratio OR canvas_size combo). Optional: prompt, negative_prompt, seed, preserve_alpha, sync, content_moderation
     inputSchema: {
       image: { type: "uri", required: true, description: "Source image URL (JPEG, PNG, WEBP)" },
+      image_url: { type: "uri", required: false, description: "Alias for image. If provided, it will be copied to image." },
       aspect_ratio: { type: "string", required: false, description: "Target aspect ratio (e.g. 16:9, 9:16, 1:1, 4:5). If set, canvas_size/original_image_size/original_image_location are ignored." },
-      canvas_size: { type: "array", required: false, default: [1000, 1000], description: "[width, height] of output canvas. Used when aspect_ratio is not set." },
+      canvas_size: { type: "array", required: false, description: "[width, height] of output canvas. For 4K use [3840, 2160] (16:9) or [2160, 3840] (9:16). Max 5000x5000." },
       original_image_size: { type: "array", required: false, description: "[width, height] of source image within canvas. Required when aspect_ratio is not set." },
       original_image_location: { type: "array", required: false, description: "[x, y] position for source image on canvas. Required when aspect_ratio is not set." },
       prompt: { type: "string", required: false, description: "Text prompt to guide expansion. Auto-generated if empty." },
       negative_prompt: { type: "string", required: false, description: "Elements to exclude from expansion (only when fast=false)" },
       seed: { type: "integer", required: false, description: "Random seed for reproducibility" },
+      preserve_alpha: { type: "boolean", required: false, default: true, description: "Preserve alpha transparency in output." },
+      sync: { type: "boolean", required: false, default: true, description: "Use synchronous mode for the response." },
       content_moderation: { type: "boolean", required: false, description: "Enable content filtering" },
     },
   },

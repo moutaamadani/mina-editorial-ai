@@ -77,6 +77,36 @@ async function describeImageForUpscale(imageUrl) {
 }
 
 // ============================================================================
+// GPT: rewrite flux-fill prompt with explicit KEEP vs CHANGE intent
+// ============================================================================
+async function rewriteFluxFillPrompt(userPrompt) {
+  const openai = getOpenAI();
+
+  const systemPrompt = `You rewrite inpainting prompts for image editing. Produce one compact, highly-detailed prompt that clearly separates:
+1) what must stay unchanged in the original image, and
+2) what should be changed only in the masked area.
+Preserve composition, camera angle, lighting direction, perspective, and identity unless the user explicitly asks otherwise.
+Do not add markdown, labels, or explanations. Output only the final prompt text.`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: `User edit request: ${String(userPrompt || "").trim()}
+
+Return a single detailed inpainting prompt with explicit keep-vs-change context.`,
+      },
+    ],
+    max_tokens: 220,
+    temperature: 0.3,
+  });
+
+  return (resp.choices?.[0]?.message?.content || "").trim();
+}
+
+// ============================================================================
 // R2 storage — normalize Replicate URLs to permanent assets bucket
 // ============================================================================
 let _r2 = null;
@@ -381,6 +411,17 @@ async function validateInputs(modelKey, userInputs, generationId) {
     normalizedInputs.image = normalizedInputs.image_url;
   }
 
+  // Compatibility: Bria eraser clients may use image_url/mask_url while schema uses image/mask_image.
+  if (modelKey === "eraser") {
+    if (!normalizedInputs.image && normalizedInputs.image_url) normalizedInputs.image = normalizedInputs.image_url;
+    if (!normalizedInputs.mask_image && normalizedInputs.mask_url) normalizedInputs.mask_image = normalizedInputs.mask_url;
+  }
+
+  // Quality policy: if a model supports output_format, force PNG for best quality/lossless export.
+  if (Object.prototype.hasOwnProperty.call(schema, "output_format")) {
+    normalizedInputs.output_format = "png";
+  }
+
   const cleaned = {};
   const missing = [];
 
@@ -416,16 +457,42 @@ async function validateInputs(modelKey, userInputs, generationId) {
 }
 
 // ============================================================================
+// normalizeReplicateInputForModel — provider-specific input compatibility
+// ============================================================================
+function normalizeReplicateInputForModel(modelKey, input) {
+  const out = { ...(input || {}) };
+
+  // Bria eraser naming compatibility:
+  // - Frontend sends image + mask_image.
+  // - Provider accepts url/file variants, so provide both URL and file keys.
+  if (modelKey === "eraser") {
+    const mask = out.mask_image || out.mask_url || out.mask_file;
+    const image = out.image || out.image_url || out.image_file;
+
+    if (image && !out.image_url) out.image_url = image;
+    if (image && !out.image_file) out.image_file = image;
+
+    if (mask && !out.mask_url) out.mask_url = mask;
+    if (mask && !out.mask_file) out.mask_file = mask;
+
+    delete out.mask_image;
+  }
+
+  return out;
+}
+
+// ============================================================================
 // runFingertipsModel — call Replicate and return result
 // ============================================================================
 async function runFingertipsModel({ modelKey, input }) {
   const model = getFingertipsModel(modelKey);
   const replicate = getReplicate();
+  const replicateInput = normalizeReplicateInputForModel(modelKey, input);
 
   const { predictionId, prediction, timedOut, elapsedMs } = await replicatePredictWithTimeout({
     replicate,
     version: model.replicateModel,
-    input,
+    input: replicateInput,
     timeoutMs: 180000, // 3 min for image tools
     pollMs: 2000,
   });
@@ -503,6 +570,16 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     // Use original resolution to avoid controlnet dimension mismatches
     if (model.variant === "magic" && !cleanedInputs.resolution) {
       cleanedInputs.resolution = "original";
+    }
+  }
+
+  // 3c. Flux fill: rewrite user prompt via GPT to include explicit keep/change context.
+  if (modelKey === "flux_fill" && cleanedInputs.prompt) {
+    try {
+      const rewrittenPrompt = await rewriteFluxFillPrompt(cleanedInputs.prompt);
+      if (rewrittenPrompt) cleanedInputs.prompt = rewrittenPrompt;
+    } catch (err) {
+      // Fallback: keep original user prompt if GPT rewriting fails.
     }
   }
 

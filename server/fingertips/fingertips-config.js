@@ -33,7 +33,7 @@ export const FINGERTIPS_MODELS = {
       prompt: { type: "string", required: true, description: "Text description of what to generate in masked region" },
       guidance: { type: "number", required: false, default: 30, description: "Prompt adherence vs quality (higher = more prompt-following)" },
       steps: { type: "integer", required: false, default: 50, description: "Diffusion steps (more = more detail, slower)" },
-      output_format: { type: "string", required: false, default: "jpeg", description: "Output format: jpeg, png, webp" },
+      output_format: { type: "string", required: false, default: "jpg", description: "Output format: jpg, png" },
       safety_tolerance: { type: "integer", required: false, default: 2, description: "Safety filter level (0 = strictest, 6 = most permissive)" },
       seed: { type: "integer", required: false, description: "Random seed for reproducibility" },
       prompt_upsampling: { type: "boolean", required: false, default: false, description: "Auto-modify prompt for more creative results" },

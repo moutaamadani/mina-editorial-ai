@@ -381,6 +381,17 @@ async function validateInputs(modelKey, userInputs, generationId) {
     normalizedInputs.image = normalizedInputs.image_url;
   }
 
+  // Replicate flux-fill-pro only accepts output_format: jpg | png.
+  // Frontend/legacy clients may send jpeg/webp, so normalize defensively.
+  if (modelKey === "flux_fill") {
+    const rawFormat = normalizedInputs.output_format;
+    if (typeof rawFormat === "string") {
+      const fmt = rawFormat.toLowerCase();
+      if (fmt === "jpeg") normalizedInputs.output_format = "jpg";
+      else if (fmt === "webp") normalizedInputs.output_format = "png";
+    }
+  }
+
   const cleaned = {};
   const missing = [];
 

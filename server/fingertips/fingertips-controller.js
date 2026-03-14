@@ -492,9 +492,9 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     }
     cleanedInputs.negative_prompt = cleanedInputs.negative_prompt || model.defaultNegative || "";
 
-    // Force resolution to 2048 to get high-quality upscale while avoiding CUDA OOM
-    if (model.variant === "magic") {
-      cleanedInputs.resolution = "2048";
+    // Use original resolution to avoid controlnet dimension mismatches
+    if (model.variant === "magic" && !cleanedInputs.resolution) {
+      cleanedInputs.resolution = "original";
     }
   }
 

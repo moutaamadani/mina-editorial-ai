@@ -76,6 +76,59 @@ async function describeImageForUpscale(imageUrl) {
   return (resp.choices?.[0]?.message?.content || "").trim();
 }
 
+function isCudaOutOfMemoryError(err) {
+  const text = [
+    err?.message,
+    err?.error,
+    err?.provider?.error,
+    err?.provider?.logs,
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  return text.includes("cuda out of memory") || text.includes("outofmemoryerror") || text.includes("oom");
+}
+
+function buildMagicUpscaleFallbackInput(input) {
+  const out = { ...(input || {}) };
+  out.resolution = "2048";
+  out.steps = Math.min(Number(out.steps || 20), 16);
+  out.creativity = Math.min(Number(out.creativity ?? 0.25), 0.2);
+  out.guidance_scale = Math.min(Number(out.guidance_scale || 7), 6);
+  return out;
+}
+
+// ============================================================================
+// GPT: rewrite flux-fill prompt with explicit KEEP vs CHANGE intent
+// ============================================================================
+async function rewriteFluxFillPrompt(userPrompt) {
+  const openai = getOpenAI();
+
+  const systemPrompt = `You rewrite inpainting prompts for image editing. Produce one compact, highly-detailed prompt that clearly separates:
+1) what must stay unchanged in the original image, and
+2) what should be changed only in the masked area.
+Preserve composition, camera angle, lighting direction, perspective, and identity unless the user explicitly asks otherwise.
+Do not add markdown, labels, or explanations. Output only the final prompt text.`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      {
+        role: "user",
+        content: `User edit request: ${String(userPrompt || "").trim()}
+
+Return a single detailed inpainting prompt with explicit keep-vs-change context.`,
+      },
+    ],
+    max_tokens: 220,
+    temperature: 0.3,
+  });
+
+  return (resp.choices?.[0]?.message?.content || "").trim();
+}
+
 // ============================================================================
 // GPT: rewrite flux-fill prompt with explicit KEEP vs CHANGE intent
 // ============================================================================
@@ -567,9 +620,19 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     }
     cleanedInputs.negative_prompt = cleanedInputs.negative_prompt || model.defaultNegative || "";
 
-    // Use original resolution to avoid controlnet dimension mismatches
+    // Avoid OOM on very large source images by defaulting magic upscale to 2048.
     if (model.variant === "magic" && !cleanedInputs.resolution) {
-      cleanedInputs.resolution = "original";
+      cleanedInputs.resolution = "2048";
+    }
+  }
+
+  // 3c. Flux fill: rewrite user prompt via GPT to include explicit keep/change context.
+  if (modelKey === "flux_fill" && cleanedInputs.prompt) {
+    try {
+      const rewrittenPrompt = await rewriteFluxFillPrompt(cleanedInputs.prompt);
+      if (rewrittenPrompt) cleanedInputs.prompt = rewrittenPrompt;
+    } catch (err) {
+      // Fallback: keep original user prompt if GPT rewriting fails.
     }
   }
 
@@ -585,11 +648,26 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
 
   // 4. Call Replicate
   let result;
+  let finalInputsUsed = cleanedInputs;
   try {
-    result = await runFingertipsModel({ modelKey, input: cleanedInputs });
+    result = await runFingertipsModel({ modelKey, input: finalInputsUsed });
   } catch (err) {
-    // Refund on failure
-    const refundResult = await refundFingertips({ passId, generationId, modelKey });
+    // Retry once for magic upscaler on CUDA OOM with safer parameters.
+    const canRetryMagicOom = modelKey === "upscale" && model?.variant === "magic" && isCudaOutOfMemoryError(err);
+    if (canRetryMagicOom) {
+      try {
+        finalInputsUsed = buildMagicUpscaleFallbackInput(cleanedInputs);
+        result = await runFingertipsModel({ modelKey, input: finalInputsUsed });
+      } catch (retryErr) {
+        err = retryErr;
+      }
+    }
+
+    if (result) {
+      // Retry succeeded.
+    } else {
+      // Refund on failure
+      const refundResult = await refundFingertips({ passId, generationId, modelKey });
 
     // Update generation record
     if (supabase) {
@@ -605,7 +683,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
           },
           mg_mma_vars: {
             modelKey,
-            inputs: cleanedInputs,
+            inputs: finalInputsUsed,
             charge: chargeResult,
             refund: refundResult,
           },
@@ -614,12 +692,13 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
         .eq("mg_id", `generation:${generationId}`);
     }
 
-    throw makeHttpError(502, "FINGERTIPS_GENERATION_FAILED", {
-      generationId,
-      modelKey,
-      refunded: refundResult.refunded,
-      message: err?.message || String(err),
-    });
+      throw makeHttpError(502, "FINGERTIPS_GENERATION_FAILED", {
+        generationId,
+        modelKey,
+        refunded: refundResult.refunded,
+        message: err?.message || String(err),
+      });
+    }
   }
 
   // 5. Handle timeout
@@ -667,7 +746,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
           mg_mma_status: "error",
           mg_status: "failed",
           mg_error: { code: "NO_OUTPUT_URL", message: "Provider returned no usable image." },
-          mg_mma_vars: { modelKey, inputs: cleanedInputs, charge: chargeResult, refund: refundResult },
+          mg_mma_vars: { modelKey, inputs: finalInputsUsed, charge: chargeResult, refund: refundResult },
           mg_updated_at: nowIso(),
         })
         .eq("mg_id", `generation:${generationId}`);
@@ -694,7 +773,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
           mg_mma_status: "error",
           mg_status: "failed",
           mg_error: { code: "R2_STORE_FAILED", message: "Failed to store generated image." },
-          mg_mma_vars: { modelKey, inputs: cleanedInputs, charge: chargeResult, refund: refundResult },
+          mg_mma_vars: { modelKey, inputs: finalInputsUsed, charge: chargeResult, refund: refundResult },
           mg_updated_at: nowIso(),
         })
         .eq("mg_id", `generation:${generationId}`);

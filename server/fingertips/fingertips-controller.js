@@ -462,10 +462,19 @@ async function validateInputs(modelKey, userInputs, generationId) {
 function normalizeReplicateInputForModel(modelKey, input) {
   const out = { ...(input || {}) };
 
-  // Bria eraser expects mask_url/mask_file naming. Frontend sends mask_image.
+  // Bria eraser naming compatibility:
+  // - Frontend sends image + mask_image.
+  // - Provider accepts url/file variants, so provide both URL and file keys.
   if (modelKey === "eraser") {
-    if (out.mask_image && !out.mask_url) out.mask_url = out.mask_image;
-    if (out.image && !out.image_url) out.image_url = out.image;
+    const mask = out.mask_image || out.mask_url || out.mask_file;
+    const image = out.image || out.image_url || out.image_file;
+
+    if (image && !out.image_url) out.image_url = image;
+    if (image && !out.image_file) out.image_file = image;
+
+    if (mask && !out.mask_url) out.mask_url = mask;
+    if (mask && !out.mask_file) out.mask_file = mask;
+
     delete out.mask_image;
   }
 

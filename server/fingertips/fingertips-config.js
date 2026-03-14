@@ -22,21 +22,23 @@ export const FINGERTIPS_MODELS = {
   },
 
   flux_fill: {
-    replicateModel: "black-forest-labs/flux-fill-pro",
+    replicateModel: "black-forest-labs/flux-fill-dev",
     costPerGeneration: 0.5,
     label: "AI Fill (Inpaint/Outpaint)",
-    description: "Professional inpainting and outpainting with text-guided generation",
-    // Required: image, mask, prompt. Optional: guidance, steps, output_format, safety_tolerance, seed, prompt_upsampling
+    description: "Dev inpainting and outpainting with text-guided generation",
+    // Required: image, prompt. Optional: mask, seed, guidance, num_inference_steps, megapixels, num_outputs, output_format, output_quality, disable_safety_checker
     inputSchema: {
-      image: { type: "uri", required: true, description: "Source image URL (can contain alpha mask)" },
-      mask: { type: "uri", required: true, description: "Black-and-white mask. White = inpaint area, Black = preserve." },
-      prompt: { type: "string", required: true, description: "Text description of what to generate in masked region" },
-      guidance: { type: "number", required: false, default: 30, description: "Prompt adherence vs quality (higher = more prompt-following)" },
-      steps: { type: "integer", required: false, default: 50, description: "Diffusion steps (more = more detail, slower)" },
-      output_format: { type: "string", required: false, default: "jpeg", description: "Output format: jpeg, png, webp" },
-      safety_tolerance: { type: "integer", required: false, default: 2, description: "Safety filter level (0 = strictest, 6 = most permissive)" },
+      prompt: { type: "string", required: true, description: "Prompt for generated image" },
+      image: { type: "uri", required: true, description: "The image to inpaint. If dimensions don't fit within 1440x1440, it will be scaled down to fit." },
+      mask: { type: "uri", required: false, description: "Black-and-white mask. Black = preserve, White = inpaint area." },
+      num_outputs: { type: "integer", required: false, default: 1, description: "Number of outputs to generate (1-4)" },
+      num_inference_steps: { type: "integer", required: false, default: 50, description: "Denoising steps. 28-50 recommended, higher = better quality (max 50)" },
+      guidance: { type: "number", required: false, default: 30, description: "Guidance for generated image (0-100)" },
       seed: { type: "integer", required: false, description: "Random seed for reproducibility" },
-      prompt_upsampling: { type: "boolean", required: false, default: false, description: "Auto-modify prompt for more creative results" },
+      megapixels: { type: "string", required: false, default: "match_input", description: "Approximate megapixels: 1, 0.25, or match_input (matches input size up to 1440x1440)" },
+      output_format: { type: "string", required: false, default: "png", description: "Output format: webp, jpg, png" },
+      output_quality: { type: "integer", required: false, default: 100, description: "Output quality 0-100 (not relevant for png)" },
+      disable_safety_checker: { type: "boolean", required: false, default: false, description: "Disable safety checker for generated images" },
     },
   },
 

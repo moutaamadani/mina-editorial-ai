@@ -374,11 +374,19 @@ async function validateInputs(modelKey, userInputs, generationId) {
   if (!model) throw makeHttpError(400, "UNKNOWN_FINGERTIPS_MODEL", { modelKey });
 
   const schema = model.inputSchema;
+  const normalizedInputs = { ...(userInputs || {}) };
+
+  // Compatibility: Bria expand supports both `image` and `image_url`.
+  if (modelKey === "expand" && !normalizedInputs.image && normalizedInputs.image_url) {
+    normalizedInputs.image = normalizedInputs.image_url;
+  }
+
   const cleaned = {};
   const missing = [];
 
   for (const [param, spec] of Object.entries(schema)) {
-    let value = userInputs?.[param];
+    if (modelKey === "expand" && param === "image_url") continue;
+    let value = normalizedInputs?.[param];
 
     if (spec.required && (value === undefined || value === null || value === "")) {
       missing.push(param);

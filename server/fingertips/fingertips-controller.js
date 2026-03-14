@@ -130,36 +130,6 @@ Return a single detailed inpainting prompt with explicit keep-vs-change context.
 }
 
 // ============================================================================
-// GPT: rewrite flux-fill prompt with explicit KEEP vs CHANGE intent
-// ============================================================================
-async function rewriteFluxFillPrompt(userPrompt) {
-  const openai = getOpenAI();
-
-  const systemPrompt = `You rewrite inpainting prompts for image editing. Produce one compact, highly-detailed prompt that clearly separates:
-1) what must stay unchanged in the original image, and
-2) what should be changed only in the masked area.
-Preserve composition, camera angle, lighting direction, perspective, and identity unless the user explicitly asks otherwise.
-Do not add markdown, labels, or explanations. Output only the final prompt text.`;
-
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `User edit request: ${String(userPrompt || "").trim()}
-
-Return a single detailed inpainting prompt with explicit keep-vs-change context.`,
-      },
-    ],
-    max_tokens: 220,
-    temperature: 0.3,
-  });
-
-  return (resp.choices?.[0]?.message?.content || "").trim();
-}
-
-// ============================================================================
 // R2 storage — normalize Replicate URLs to permanent assets bucket
 // ============================================================================
 let _r2 = null;
@@ -623,16 +593,6 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
     // Avoid OOM on very large source images by defaulting magic upscale to 2048.
     if (model.variant === "magic" && !cleanedInputs.resolution) {
       cleanedInputs.resolution = "2048";
-    }
-  }
-
-  // 3c. Flux fill: rewrite user prompt via GPT to include explicit keep/change context.
-  if (modelKey === "flux_fill" && cleanedInputs.prompt) {
-    try {
-      const rewrittenPrompt = await rewriteFluxFillPrompt(cleanedInputs.prompt);
-      if (rewrittenPrompt) cleanedInputs.prompt = rewrittenPrompt;
-    } catch (err) {
-      // Fallback: keep original user prompt if GPT rewriting fails.
     }
   }
 

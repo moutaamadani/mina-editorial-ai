@@ -40,10 +40,23 @@ router.post("/generate", async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("[fingertips] generate error", err);
+
+    // Never expose provider internals (Replicate logs, model IDs, stack traces) to the client.
+    const code = err?.code || "FINGERTIPS_FAILED";
+    const isProviderError =
+      code === "REPLICATE_FAILED" ||
+      code === "REPLICATE_CANCELED" ||
+      code === "REPLICATE_ERROR" ||
+      code === "FINGERTIPS_GENERATION_FAILED";
+
+    const userMessage = isProviderError
+      ? "Edit failed. Please try again."
+      : err?.message || "Something went wrong. Please try again.";
+
     res.status(err?.statusCode || 500).json({
-      error: err?.code || "FINGERTIPS_FAILED",
-      message: err?.message,
-      details: err?.details || undefined,
+      error: code,
+      message: userMessage,
+      refunded: err?.refunded ?? undefined,
       modelKey: err?.modelKey || undefined,
       missing: err?.missing || undefined,
       availableModels: err?.availableModels || undefined,

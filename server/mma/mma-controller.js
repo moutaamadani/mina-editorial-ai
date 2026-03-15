@@ -503,30 +503,32 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     motion_one_shot: [
-      "understand the user brief and give one line prompt describing video",
-      "",
+      "You are an expert video director and prompt engineer. Your role is to understand the user's creative brief and turn it into a production-ready prompt for an AI video generator. Adapt your directing style to the content type — whether it's a brand film, UGC-style clip, motion design, product showcase, talking head, or narrative scene.",
+      "Follow this prompt structure in order: Scene/environment (location, setting, lighting, atmosphere); Subjects (use specific consistent descriptors like 'the woman in a red coat', 'the man with glasses'); Action (break movement into sequential steps, never stack actions); Camera (use precise language: tracking shot, dolly-in, close-up, POV, low-angle, static, handheld, pan, tilt — match the camera style to the content type); Audio and style (dialogue with speaker tags, tone directions, ambient sound, music mood).",
+      "For multi-shot sequences (up to 6 shots): label each shot explicitly ('Shot 1:', 'Shot 2:'), describe framing, subject, and motion per shot. You can assign durations per shot. Define core subjects at the start and reuse the exact same descriptor across all shots for consistency.",
+      "For dialogue: tag each speaker directly before their line with tone in parentheses, e.g. Woman (casually, smiling): 'line here'. Specify language and accent if needed (supports Chinese, English, Japanese, Korean, Spanish, plus dialects). For multilingual scenes, write each character's lines in their target language.",
+      "Be explicit about motion — never assume the model adds it. Describe what moves, how it moves, and the physics: debris, fabric drape, liquid splash, hair in wind, graphic elements animating in. Describe camera behavior over time. For long takes, define the camera's relationship to the subject throughout.",
+      "If the user provides a start frame image, treat it as an anchor — preserve its identity, layout, and any visible text. If element references are used, do not re-describe bound traits already locked by the element. Focus the prompt on action, camera, and scene context instead.",
+      "For text appearing in video (signs, logos, captions, titles): describe text content and placement explicitly. The model has native text rendering and preserves lettering from reference images.",
+      "Duration can be 3 to 15 seconds. Match prompt complexity to duration: simple single action for 5s, layered sequences with progression for 10-15s. Use timestamps when directing longer shots (e.g. 'At the 4th second, the camera pushes in').",
+      "Adapt tone and energy to the content type: raw and handheld for UGC, smooth and controlled for product, bold and graphic for motion design, naturalistic for narrative. Write one cohesive prompt using precise, sensory language. No buzzwords, no emojis, no meta commentary. The prompt should read like clear production notes.",
       "OUTPUT FORMAT:",
-      'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
-      "",
-      "OVERIDE",
-      'if user brief has madani in it overide and just give back the prompt as the user brief directly',
-      'if audio or video in the input just type sync image with video or audio',
-      "",
-      "SAFETY:",
-      "- follow user idea",
+      'Return STRICT JSON only (no markdown): {"video_prompt": string, "negative_prompt": string, "duration": number, "multi_shot": boolean, "audio": boolean}',
+      "NEGATIVE PROMPT RULES:",
+      "Always include a negative prompt. Default: 'morphing, distorted hands, extra fingers, flickering textures, blurry text, cartoonish, low resolution'. Adapt negatives to the brief — add 'smiling, laughing' for serious tone, add 'shaky, unstable' for clean motion design, etc.",
+      "OVERRIDE RULES:",
+      "If the brief is simple (single subject, single action), keep the prompt concise — do not over-describe. If the user provides inspiration video or reference, analyze its camera work, pacing, color grade, energy, and movement style, then replicate that direction in the prompt. If the user specifies 'no audio', set audio to false and omit all dialogue and sound directions. If element references are mentioned, focus the prompt on scene and action only.",
     ].join("\n"),
 
     motion_tweak_one_shot: [
-      "understand the user brief and give one line prompt describing the tweaked video",
-      "",
+      "You are an expert video director refining an existing AI video. You will receive the previous video prompt and the user's tweak request.",
+      "Understand what the user wants changed — it could be camera angle, movement speed, subject action, lighting, duration, audio, or tone. Apply the tweak precisely while preserving everything else from the original prompt.",
+      "Keep the same prompt structure: Scene/environment; Subjects (reuse exact descriptors); Action; Camera; Audio and style. Only modify the specific elements the user mentions.",
+      "If the tweak is about timing, adjust duration or add timestamps. If it's about camera, change only the camera direction. If it's about mood, adjust tone and grading only.",
       "OUTPUT FORMAT:",
-      'Return STRICT JSON only (no markdown): {"motion_prompt": string}',
-      "",
-      "OVERIDE",
-      'if user brief has madani in it overide and just give back the prompt as the user brief directly',
-      "",
-      "SAFETY:",
-      "- follow user idea",
+      'Return STRICT JSON only (no markdown): {"video_prompt": string, "negative_prompt": string, "duration": number, "multi_shot": boolean, "audio": boolean}',
+      "OVERRIDE RULES:",
+      "If the user brief contains 'madani' or 'mina', return the user brief verbatim as video_prompt. For simple tweaks (slow down, speed up, change angle), keep the response concise.",
     ].join("\n"),
 
     output_scan: [
@@ -545,26 +547,34 @@ async function getMmaCtxConfig(supabase) {
     ].join("\n"),
 
     motion_suggestion: [
-      "You are motion prompt writer for Image to Video AI.",
+      "You are an expert video director suggesting motion direction for a still image.",
       "You will receive: start still image (and maybe end frame) + still_crt + motion_user_brief + selected_movement_style.",
+      "Analyze the image composition, subject, lighting, and mood. Then suggest a motion direction that feels natural and cinematic for this specific image.",
       'Output STRICT JSON only (no markdown): {"sugg_prompt":string,"userMessage":string}',
-      "sugg_prompt: a simple, short 3 lines prompt to describe the main subject, what the subject looks like, the action or movement, the environment, and the visual style. Adding camera instructions (like pan, tracking shot, or zoom), lighting, and mood helps Kling produce more cinematic and stable results. Prompts should avoid vagueness or too many simultaneous actions—one main action, precise motion words, and clear visual intent lead to the most reliable videos.",
+      "sugg_prompt: production-ready video prompt following this structure — Subject (reuse exact descriptors from the image); Action (one clear movement, broken into steps); Camera (precise language: tracking shot, dolly-in, pan, tilt, static, handheld); Environment and atmosphere. Match the camera style to the content type. Keep it concise — one main action with precise motion words.",
+      "Adapt tone to content type: raw and handheld for UGC, smooth and controlled for product, bold for motion design, naturalistic for narrative.",
       MMA_UI.userMessageRules,
     ].join("\n"),
 
     motion_reader2: [
-      "You are Mina Motion Reader — prompt builder for Kling (image-to-video).",
+      "You are an expert video director and prompt engineer building production-ready video prompts from image + brief.",
       "You will receive: start still image (and maybe end frame) + still_crt + motion_user_brief + selected_movement_style.",
+      "Treat the start frame as an anchor — preserve its identity, layout, and any visible text. Focus the prompt on action, camera, and scene context.",
+      "Follow this structure: Scene/environment (from the image); Subjects (use specific consistent descriptors); Action (sequential steps, never stack); Camera (tracking shot, dolly-in, close-up, POV, low-angle, static, handheld, pan, tilt); Audio and style.",
+      "Be explicit about motion — describe what moves, how it moves, and the physics. Describe camera behavior over time.",
+      "Match prompt complexity to duration: simple single action for 5s, layered sequences for 10-15s.",
       'Output STRICT JSON only (no markdown): {"motion_prompt":string,"userMessage":string}',
-      "motion_prompt: a simple, short 3 lines prompt to describe the main subject, what the subject looks like, the action or movement, the environment, and the visual style. Adding camera instructions (like pan, tracking shot, or zoom), lighting, and mood helps Kling produce more cinematic and stable results. Prompts should avoid vagueness or too many simultaneous actions—one main action, precise motion words, and clear visual intent lead to the most reliable videos.",
+      "Adapt tone to content type: raw for UGC, smooth for product, bold for motion design. Write clear production notes, no buzzwords.",
       MMA_UI.userMessageRules,
     ].join("\n"),
 
     motion_feedback2: [
-      "You are Mina Motion Feedback Fixer for Kling (image-to-video).",
+      "You are an expert video director applying feedback to refine a video prompt.",
       "You will receive: base motion input + feedback_motion + previous motion prompt.",
-      'Output STRICT JSON only (no markdown): {"motion_prompt":string}',
-      "motion_prompt must keep what's good, fix what's bad, and apply feedback precisely.",
+      "Understand what went wrong in the previous generation. Apply the feedback precisely while preserving everything that worked — subject identity, scene, camera style, and tone.",
+      "If feedback is about motion (too fast, too shaky, wrong direction), adjust only action and camera. If feedback is about mood or style, adjust tone and grading. If feedback is about subject behavior, adjust action steps only.",
+      "Always include an adapted negative prompt to prevent the issue from recurring.",
+      'Output STRICT JSON only (no markdown): {"motion_prompt":string, "negative_prompt":string}',
     ].join("\n"),
   };
 
@@ -776,8 +786,11 @@ async function gptMotionOneShotAnimate({ cfg, ctx, input, labeledImages }) {
     labeledImages: safeArray(labeledImages).slice(0, 6),
   });
 
-  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "");
-  return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+  const p = out?.parsed || {};
+  const motion_prompt = safeStr(p.video_prompt, "") || safeStr(p.motion_prompt, "") || safeStr(p.prompt, "");
+  const negative_prompt = safeStr(p.negative_prompt, "");
+  const duration = Number.isFinite(p.duration) ? p.duration : null;
+  return { motion_prompt, negative_prompt, duration, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
 }
 
 async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
@@ -788,8 +801,11 @@ async function gptMotionOneShotTweak({ cfg, ctx, input, labeledImages }) {
     labeledImages: safeArray(labeledImages).slice(0, 6),
   });
 
-  const motion_prompt = safeStr(out?.parsed?.motion_prompt, "") || safeStr(out?.parsed?.prompt, "");
-  return { motion_prompt, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
+  const p = out?.parsed || {};
+  const motion_prompt = safeStr(p.video_prompt, "") || safeStr(p.motion_prompt, "") || safeStr(p.prompt, "");
+  const negative_prompt = safeStr(p.negative_prompt, "");
+  const duration = Number.isFinite(p.duration) ? p.duration : null;
+  return { motion_prompt, negative_prompt, duration, raw: out.raw, request: out.request, parsed_ok: !!out.parsed };
 }
 
 // ============================================================================
@@ -3275,8 +3291,12 @@ const usePromptOverride = !!promptOverride;
       safeStr(working?.inputs?.motion_prompt, "") ||
       safeStr(working?.inputs?.prompt, "") ||
       safeStr(working?.prompts?.motion_prompt, "");
+
+    // Carry GPT-suggested negative_prompt and duration into working vars
+    if (one.negative_prompt) working.prompts = { ...(working.prompts || {}), gpt_negative_prompt: one.negative_prompt };
+    if (one.duration) working.prompts = { ...(working.prompts || {}), gpt_duration: one.duration };
   }
-  
+
   // If GPT returns empty, do a safe fallback so Fabric never fails because of prompt
   if (!finalMotionPrompt) {
     finalMotionPrompt =
@@ -3284,12 +3304,12 @@ const usePromptOverride = !!promptOverride;
       safeStr(working?.inputs?.brief, "") ||
       safeStr(working?.inputs?.prompt, "");
   }
-  
+
   // Only REQUIRE prompt for Kling and motion-control (Fabric doesn’t need it)
   if (!finalMotionPrompt && flow !== "fabric_audio") {
     throw new Error("EMPTY_MOTION_PROMPT");
   }
-  
+
   working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
   await updateVars({ supabase, generationId, vars: working });
 
@@ -3334,7 +3354,7 @@ const usePromptOverride = !!promptOverride;
     });
 
     const duration =
-      Number(working?.inputs?.duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
+      Number(working?.inputs?.duration ?? working?.prompts?.gpt_duration ?? cfg?.kling?.duration ?? process.env.MMA_KLING_DURATION ?? 5) || 5;
 
     const mode =
       safeStr(working?.inputs?.kling_mode || working?.inputs?.mode, "") ||
@@ -3344,6 +3364,7 @@ const usePromptOverride = !!promptOverride;
 
     const neg =
       safeStr(working?.inputs?.negative_prompt || working?.inputs?.negativePrompt, "") ||
+      safeStr(working?.prompts?.gpt_negative_prompt, "") ||
       cfg?.kling?.negativePrompt ||
       process.env.NEGATIVE_PROMPT_KLING ||
       process.env.MMA_NEGATIVE_PROMPT_KLING ||
@@ -3628,11 +3649,14 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
       // safe fallback (so Fabric tweak won’t fail just because GPT output is empty)
       finalMotionPrompt = safeStr(feedbackMotion, "") || safeStr(prevMotionPrompt, "");
     }
-    
+
     if (!finalMotionPrompt && pricing.flow !== "fabric_audio") {
       throw new Error("EMPTY_MOTION_TWEAK_PROMPT_ONE_SHOT");
     }
 
+    // Carry GPT-suggested negative_prompt and duration into working vars
+    if (one.negative_prompt) working.prompts = { ...(working.prompts || {}), gpt_negative_prompt: one.negative_prompt };
+    if (one.duration) working.prompts = { ...(working.prompts || {}), gpt_duration: one.duration };
 
     working.prompts = { ...(working.prompts || {}), motion_prompt: finalMotionPrompt };
     working.inputs = { ...(working.inputs || {}), start_image_url: startImage };
@@ -3657,6 +3681,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     const duration =
       Number(
         working?.inputs?.duration ??
+          working?.prompts?.gpt_duration ??
           parentVars?.inputs?.duration ??
           cfg?.kling?.duration ??
           process.env.MMA_KLING_DURATION ??
@@ -3672,6 +3697,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
 
     const neg =
       safeStr(working?.inputs?.negative_prompt || working?.inputs?.negativePrompt, "") ||
+      safeStr(working?.prompts?.gpt_negative_prompt, "") ||
       safeStr(parentVars?.inputs?.negative_prompt || parentVars?.inputs?.negativePrompt, "") ||
       cfg?.kling?.negativePrompt ||
       process.env.NEGATIVE_PROMPT_KLING ||

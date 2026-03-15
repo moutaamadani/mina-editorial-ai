@@ -52,17 +52,17 @@ const FABRIC_COSTS = {
 const SEEDREAM_COST_PER_IMAGE = 0.03;
 
 // --- Nanobanana / Gemini Flash Image (still image via Google Gemini API) ---
-// Source: Google AI pricing - $60/1M output tokens
+// Source: Real usage costs - main lane ~$0.15/image, niche lane ~$0.22/image
 const GEMINI_IMAGE_COSTS = {
   "gemini-3.1-flash-image-preview": {
     "1K": 0.067,  // ~1120 output tokens
     "2K": 0.101,  // ~1680 output tokens
-    "4K": 0.151,  // ~2520 output tokens
+    "4K": 0.15,   // main lane real cost
   },
   "gemini-3-pro-image-preview": {
     "1K": 0.134,
-    "2K": 0.134,
-    "4K": 0.240,
+    "2K": 0.22,   // niche lane real cost
+    "4K": 0.22,   // niche lane real cost
   },
 };
 
@@ -89,23 +89,24 @@ const FINGERTIPS_API_COSTS = {
 // FIXED MONTHLY COSTS (infrastructure + subscriptions, USD)
 // ============================================================================
 const FIXED_MONTHLY_COSTS = {
-  // --- Infrastructure ---
-  render_frontend:    0,       // static site (free tier)
-  render_backend:     7,       // Starter plan
-  cloudflare_r2:      0,       // free tier for small storage
-  supabase:           25,      // Pro plan
+  // --- Infrastructure (from Render receipt March 2026) ---
+  render_static_sites: 0,      // 2 instances (free)
+  render_servers:      7,      // 2 instances
+  render_postgres:     6.30,   // 2 instances
+  render_pro_plan:     38,     // Pro plan (2 users)
+  cloudflare_r2:       0,      // free tier for small storage
+  supabase:            25,     // Pro plan
 
   // --- AI Subscriptions (development & prompt engineering) ---
-  chatgpt_pro:        200,     // ChatGPT Pro ($200/mo)
-  claude_max:         200,     // Claude Max 20x ($200/mo)
-  github_copilot:     10,      // Copilot Pro ($10/mo)
+  chatgpt_pro:         200,    // ChatGPT Pro ($200/mo)
+  claude_max:          200,    // Claude Max 20x ($200/mo)
+  github_copilot:      10,     // Copilot Pro ($10/mo)
 
-  // --- AI API subscriptions ---
-  google_ai_pro:      19.99,   // Gemini Pro consumer plan ($19.99/mo)
-  kling_package:      97.99,   // Trial-Video-1000Units ($97.99/mo)
+  // --- API packages ---
+  kling_package:       97.99,  // Trial-Video-1000Units ($97.99/mo)
 
   // --- Pay-as-you-go (estimated monthly spend) ---
-  replicate:          40,      // ~$40/mo estimated (Seedream, Bria, birefnet, etc.)
+  replicate:           40,     // ~$40/mo estimated (Seedream, Bria, birefnet, etc.)
 };
 
 const TOTAL_FIXED_MONTHLY = Object.values(FIXED_MONTHLY_COSTS).reduce((a, b) => a + b, 0);

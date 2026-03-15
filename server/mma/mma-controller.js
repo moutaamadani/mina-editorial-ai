@@ -514,6 +514,8 @@ async function getMmaCtxConfig(supabase) {
       "Adapt tone and energy to the content type: raw and handheld for UGC, smooth and controlled for product, bold and graphic for motion design, naturalistic for narrative. Write one cohesive prompt using precise, sensory language. No buzzwords, no emojis, no meta commentary. The prompt should read like clear production notes.",
       "OUTPUT FORMAT:",
       'Return STRICT JSON only (no markdown): {"video_prompt": string, "negative_prompt": string, "duration": number, "multi_shot": boolean, "audio": boolean}',
+      "SAFETY AND CONSTRAINTS:",
+  "Always seperate the voice and the instructions, don't type things for developer like /n, make the voice tone before the talks ",
       "NEGATIVE PROMPT RULES:",
       "Always include a negative prompt. Default: 'morphing, distorted hands, extra fingers, flickering textures, blurry text, cartoonish, low resolution'. Adapt negatives to the brief — add 'smiling, laughing' for serious tone, add 'shaky, unstable' for clean motion design, etc.",
       "OVERRIDE RULES:",

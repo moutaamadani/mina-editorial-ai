@@ -538,6 +538,63 @@ app.get("/public/download", async (req, res) => {
 });
 
 // ======================================================
+// Checkout: create a Shopify draft order with passId baked in
+// This guarantees credits go to the right Mina account even
+// when the customer pays with Apple Pay / Google Pay (which
+// may use a different or hidden email).
+// ======================================================
+const MATCHA_VARIANT_ID = ENV.MATCHA_VARIANT_ID || "43328351928403";
+const MATCHA_5000_VARIANT_ID = ENV.MATCHA_5000_VARIANT_ID || "44184397283411";
+
+app.post("/api/checkout/create", async (req, res) => {
+  try {
+    const qty = Math.max(1, Math.min(100, Math.floor(Number(req.body?.qty || 1))));
+
+    // Resolve passId from header, body, or auth token
+    const resolved = resolvePassIdForRequest(req, req.body || {});
+    const passId = normalizeIncomingPassId(resolved);
+    if (!passId) return res.status(400).json({ ok: false, error: "MISSING_PASS_ID" });
+
+    // Get user email if authenticated
+    const authUser = await getAuthUser(req);
+    const email = authUser?.email || req.body?.email || null;
+
+    // Pick variant: 5000-pack if qty=100, otherwise standard MINA-50
+    const is5000 = qty === 100 && MATCHA_5000_VARIANT_ID;
+    const variantId = is5000 ? MATCHA_5000_VARIANT_ID : MATCHA_VARIANT_ID;
+    const lineQty = is5000 ? 1 : qty;
+
+    const draftOrder = {
+      draft_order: {
+        line_items: [{ variant_id: Number(variantId), quantity: lineQty }],
+        note_attributes: [{ name: "mina_pass_id", value: passId }],
+        use_customer_default_address: true,
+      },
+    };
+
+    // Attach customer email so Shopify pre-fills it
+    if (email) draftOrder.draft_order.email = email;
+
+    const created = await shopifyAdminFetch("draft_orders.json", {
+      method: "POST",
+      body: draftOrder,
+    });
+
+    const invoiceUrl = created?.draft_order?.invoice_url;
+    const draftId = created?.draft_order?.id;
+    if (!invoiceUrl) {
+      console.error("[checkout] draft order created but no invoice_url", created);
+      return res.status(500).json({ ok: false, error: "NO_INVOICE_URL" });
+    }
+
+    return res.json({ ok: true, checkoutUrl: invoiceUrl, draftOrderId: draftId });
+  } catch (e) {
+    console.error("[checkout/create] failed", e);
+    return res.status(500).json({ ok: false, error: "CHECKOUT_FAILED", message: e?.message || String(e) });
+  }
+});
+
+// ======================================================
 // History router (must be AFTER CORS + body parsers)
 // ======================================================
 app.use(historyRouter);

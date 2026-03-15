@@ -70,10 +70,10 @@ const GPT_CALL_COSTS = {
 
 // --- Fingertips (Replicate) ---
 const FINGERTIPS_API_COSTS = {
-  eraser:     0.015,   // bria/eraser ~$0.01-0.02/run
-  flux_fill:  0.015,   // bria/genfill ~$0.01-0.02/run
-  expand:     0.015,   // bria/expand-image ~$0.01-0.02/run
-  remove_bg:  0.0075,  // men1scus/birefnet ~$0.0075/run
+  eraser:     0.04,    // bria/eraser ~$0.04/run
+  flux_fill:  0.03,    // bria/genfill ~$0.02-0.04/run
+  expand:     0.04,    // bria/expand-image ~$0.04/run
+  remove_bg:  0.0015,  // men1scus/birefnet ~$0.0015/run
   upscale:    0.03,    // crystal or magic upscaler ~$0.02-0.04/run
   vectorize:  0.01,    // recraft-vectorize ~$0.01/run
 };

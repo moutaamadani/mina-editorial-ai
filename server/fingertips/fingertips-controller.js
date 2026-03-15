@@ -27,6 +27,7 @@ import {
 import { getSupabaseAdmin } from "../../supabase.js";
 import { replicatePredictWithTimeout } from "../mma/replicate-poll.js";
 import { FINGERTIPS_MODELS, getFingertipsModel, FINGERTIPS_MODEL_KEYS } from "./fingertips-config.js";
+import { estimateGenerationCost } from "../mma/mma-cost-calculator.js";
 
 // ============================================================================
 // Replicate client (shared singleton)
@@ -841,6 +842,15 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
   }
 
   if (supabase) {
+    let costData = null;
+    try {
+      costData = estimateGenerationCost({
+        mode: "fingertips",
+        fingertipsKey: modelKey,
+        matchasCharged: chargeResult.cost || 0,
+      });
+    } catch {}
+
     await supabase
       .from("mega_generations")
       .update({
@@ -849,6 +859,7 @@ export async function handleFingertipsGenerate({ passId, modelKey, inputs }) {
         mg_output_url: outputUrl,
         mg_latency_ms: result.elapsedMs,
         mg_meta: { predictionId: result.predictionId },
+        ...(costData ? { mg_cost_data: costData } : {}),
         mg_updated_at: nowIso(),
       })
       .eq("mg_id", `generation:${generationId}`);

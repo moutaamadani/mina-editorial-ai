@@ -30,6 +30,7 @@ import {
 import { addSseClient, sendDone, sendScanLine, sendStatus } from "./mma-sse.js";
 import { getMmaConfig } from "./mma-config.js";
 import { replicatePredictWithTimeout } from "./replicate-poll.js";
+import { estimateGenerationCost, costParamsFromVars } from "./mma-cost-calculator.js";
 
 // ============================================================================
 // USER-FACING TEXT (EDIT THESE)
@@ -2485,16 +2486,28 @@ async function writeStep({ supabase, generationId, passId, stepNo, stepType, pay
   });
 }
 
-async function finalizeGeneration({ supabase, generationId, url, prompt }) {
+async function finalizeGeneration({ supabase, generationId, url, prompt, vars, mode, matchasCharged }) {
+  const updateFields = {
+    mg_status: "done",
+    mg_mma_status: "done",
+    mg_output_url: url,
+    mg_prompt: prompt,
+    mg_updated_at: nowIso(),
+  };
+
+  // Compute real API cost and profit
+  try {
+    const costParams = costParamsFromVars(vars, mode);
+    costParams.matchasCharged = matchasCharged || 0;
+    const costData = estimateGenerationCost(costParams);
+    updateFields.mg_cost_data = costData;
+  } catch (e) {
+    console.warn("[cost-calc] failed to estimate cost", e?.message);
+  }
+
   await supabase
     .from("mega_generations")
-    .update({
-      mg_status: "done",
-      mg_mma_status: "done",
-      mg_output_url: url,
-      mg_prompt: prompt,
-      mg_updated_at: nowIso(),
-    })
+    .update(updateFields)
     .eq("mg_generation_id", generationId)
     .eq("mg_record_type", "generation");
 }
@@ -2811,7 +2824,7 @@ async function runStillCreatePipeline({ supabase, generationId, passId, vars, pr
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
-    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt, vars: working, mode: "still", matchasCharged: stillCost });
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
@@ -3086,7 +3099,7 @@ async function runStillTweakPipeline({ supabase, generationId, passId, parent, v
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
-    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt });
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: usedPrompt, vars: working, mode: "still", matchasCharged: stillCost });
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
@@ -3504,7 +3517,7 @@ const usePromptOverride = !!promptOverride;
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
-    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: finalMotionPrompt });
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: finalMotionPrompt, vars: working, mode: "video", matchasCharged: videoCost });
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");
@@ -3803,7 +3816,7 @@ async function runVideoTweakPipeline({ supabase, generationId, passId, parent, v
     await updateVars({ supabase, generationId, vars: working });
     emitLine(generationId, working);
 
-    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: finalMotionPrompt });
+    await finalizeGeneration({ supabase, generationId, url: remoteUrl, prompt: finalMotionPrompt, vars: working, mode: "video", matchasCharged: videoCost });
 
     await updateStatus({ supabase, generationId, status: "done" });
     emitStatus(generationId, "done");

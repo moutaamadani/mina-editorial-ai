@@ -490,6 +490,15 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
 });
 
 // ======================================================
+// Checkout return — Shopify thank-you page redirects here
+// ======================================================
+const FRONTEND_URL = ENV.FRONTEND_URL || "https://mina.faltastudio.com";
+
+app.get("/checkout/return", (_req, res) => {
+  res.redirect(302, `${FRONTEND_URL}?checkout=complete`);
+});
+
+// ======================================================
 // Standard body parsers
 // ======================================================
 app.use(express.json({ limit: "30mb" }));

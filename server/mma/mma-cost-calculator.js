@@ -80,7 +80,7 @@ const FINGERTIPS_API_COSTS = {
 // ============================================================================
 // SELL PRICE (what we charge users in USD per matcha)
 // ============================================================================
-const MATCHA_SELL_PRICE_USD = Number(process.env.MINA_MATCHA_SELL_PRICE_USD || 0.33);
+const MATCHA_SELL_PRICE_USD = Number(process.env.MINA_MATCHA_SELL_PRICE_USD || 0.035);
 
 // ============================================================================
 // COST CALCULATOR FUNCTIONS

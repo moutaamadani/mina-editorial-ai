@@ -427,15 +427,22 @@ app.post("/api/credits/shopify-order", express.raw({ type: "application/json" })
     const shopifyCustomerId = order?.customer?.id != null ? String(order.customer.id) : null;
     const email = safeString(order?.email || order?.customer?.email || "").toLowerCase() || null;
 
+    // ✅ Read mina_pass_id from cart/note attributes (set by the Mina frontend)
+    // This ensures credits go to the right account even when the customer
+    // pays with Apple Pay / Google Pay using a different email.
+    const noteAttrs = Array.isArray(order?.note_attributes) ? order.note_attributes : [];
+    const minaPassIdAttr = noteAttrs.find((a) => a?.name === "mina_pass_id")?.value || null;
+    const minaPassId = minaPassIdAttr ? safeString(minaPassIdAttr, "") : "";
+
     const supabase = getSupabaseAdmin();
-    
-    // ✅ Try to credit the SAME passId the app already uses (pass:user:*), if it exists.
-    const existingPassId = await findExistingPassIdForShopify({
+
+    // Priority: 1) passId from cart attributes  2) existing DB match  3) generate new
+    const existingPassId = minaPassId || await findExistingPassIdForShopify({
       supabase,
       shopifyCustomerId,
       email,
     });
-    
+
     const passId =
       existingPassId ||
       (shopifyCustomerId
